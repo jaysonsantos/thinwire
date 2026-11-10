@@ -27,6 +27,11 @@ enum Msg {
     Cancel {
         events: EventTx,
     },
+    /// The user unlinks the account: ask Signal to remove this device, then
+    /// delete the live session.
+    Unlink {
+        events: EventTx,
+    },
     /// Read the session key again. This is not a new link.
     RetryKey {
         events: EventTx,
@@ -48,6 +53,15 @@ enum Msg {
 
 type StartFn = Box<dyn Fn(&Arc<Session>, &EventTx) -> Option<SignalWorker> + Send>;
 
+/// Deletes the live session files. `false` when a file is still there. It
+/// blocks, so the owner runs it off the async threads.
+type DeleteFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Longest wait of an unlink for the answer of the worker. It is longer
+/// than the wait of the worker for Signal. With no answer the unlink
+/// continues: this computer forgets the device in each case.
+const UNLINK_WAIT: std::time::Duration = std::time::Duration::from_secs(7);
+
 /// Adapter side. Every method only sends a message.
 pub(super) struct Handle {
     tx: mpsc::UnboundedSender<Msg>,
@@ -55,10 +69,20 @@ pub(super) struct Handle {
 
 impl Handle {
     pub(super) fn spawn(session: Arc<Session>, start: StartFn) -> Self {
+        Self::spawn_with_delete(session, start, Arc::new(super::live::delete_live_session))
+    }
+
+    /// [`Self::spawn`] with another delete of the live session files.
+    pub(super) fn spawn_with_delete(
+        session: Arc<Session>,
+        start: StartFn,
+        delete: DeleteFn,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let owner = Owner {
             session,
             start,
+            delete,
             worker: None,
             generation: 0,
         };
@@ -82,6 +106,14 @@ impl Handle {
 
     pub(super) fn cancel(&self, events: &EventTx) {
         let _ = self.tx.send(Msg::Cancel {
+            events: events.clone(),
+        });
+    }
+
+    /// The user unlinks the account. The owner asks Signal to remove this
+    /// device, deletes the live session, and sends `Unlinked`.
+    pub(super) fn unlink(&self, events: &EventTx) {
+        let _ = self.tx.send(Msg::Unlink {
             events: events.clone(),
         });
     }
@@ -118,6 +150,7 @@ impl Handle {
 struct Owner {
     session: Arc<Session>,
     start: StartFn,
+    delete: DeleteFn,
     worker: Option<SignalWorker>,
     generation: u64,
 }
@@ -130,6 +163,7 @@ impl Owner {
                 Msg::Resume { events } => self.resume(&events).await,
                 Msg::RetryKey { events } => self.retry_key(&events).await,
                 Msg::Cancel { events } => self.cancel(&events).await,
+                Msg::Unlink { events } => self.unlink(&events).await,
                 Msg::Shutdown { events, done } => {
                     self.shutdown(&events).await;
                     let _ = done.send(());
@@ -214,6 +248,47 @@ impl Owner {
             AdapterStatus::Stubbed,
             "Signal linking cancelled. No session is running.",
         );
+    }
+
+    /// The user unlinks the account. While the receive stream is open, the
+    /// worker asks Signal to remove this device. This is best effort: with
+    /// no connection, only this computer forgets the device, and the phone
+    /// still lists it. Then the worker ends and the live session is
+    /// deleted. The previous accounts under `retained/` stay.
+    async fn unlink(&mut self, events: &EventTx) {
+        if self.worker.is_some() {
+            let (done, answer) = oneshot::channel();
+            let confirmed = self.session.request_unlink(done)
+                && matches!(
+                    tokio::time::timeout(UNLINK_WAIT, answer).await,
+                    Ok(Ok(true))
+                );
+            if !confirmed {
+                tracing::warn!("signal did not confirm the unlink of this device");
+            }
+        }
+        // The worker has the store open. It ends before the delete.
+        self.cleanup().await;
+        let delete = Arc::clone(&self.delete);
+        let deleted = tokio::task::spawn_blocking(move || delete())
+            .await
+            .unwrap_or(false);
+        emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
+        if deleted {
+            emit_status(
+                events,
+                ProtocolId::Signal,
+                AdapterStatus::Stubbed,
+                super::live::UNLINKED,
+            );
+        } else {
+            emit_status(
+                events,
+                ProtocolId::Signal,
+                AdapterStatus::Error,
+                super::live::UNLINK_FILES_LEFT,
+            );
+        }
     }
 
     async fn shutdown(&mut self, events: &EventTx) {
@@ -324,6 +399,132 @@ mod tests {
             }
         }
         assert!(saw_unlinked && saw_connecting);
+    }
+
+    fn idle_worker() -> SignalWorker {
+        let thread = std::thread::spawn(|| {});
+        let abort = tokio::spawn(async {}).abort_handle();
+        SignalWorker { thread, abort }
+    }
+
+    fn counting_delete(calls: &Arc<AtomicUsize>, result: bool) -> DeleteFn {
+        let calls = Arc::clone(calls);
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            result
+        })
+    }
+
+    /// The user unlinks a linked account: the worker gets the request for
+    /// Signal, the live session is deleted after the worker ended, and the
+    /// row leaves the linked state with a normal status line. No
+    /// `AccountEnded` goes out: the phone did not remove the device.
+    #[tokio::test]
+    async fn an_unlink_asks_the_worker_and_deletes_the_session() {
+        let session = Arc::new(Session::new());
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let handle = Handle::spawn_with_delete(
+            Arc::clone(&session),
+            Box::new(|session, _events| {
+                let (_token, _wake) = session.begin_attempt();
+                session.mark_active();
+                Some(idle_worker())
+            }),
+            counting_delete(&deletes, true),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.begin(1, &tx);
+        handle.flush().await;
+        // The worker of this test only records the job and confirms it.
+        let mut jobs = session.install_jobs_for_test();
+        let asked = Arc::new(AtomicBool::new(false));
+        let asked_by_worker = Arc::clone(&asked);
+        tokio::spawn(async move {
+            if let Some(super::super::live::WorkerJob::Unlink(done)) = jobs.recv().await {
+                asked_by_worker.store(true, Ordering::SeqCst);
+                let _ = done.send(true);
+            }
+        });
+        while rx.try_recv().is_ok() {}
+
+        handle.unlink(&tx);
+        handle.flush().await;
+        assert!(asked.load(Ordering::SeqCst), "the worker asked Signal");
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        assert!(!session.is_active());
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    AdapterEvent::Account {
+                        protocol: ProtocolId::Signal,
+                        state: AccountState::Unlinked,
+                    },
+                    AdapterEvent::Status {
+                        status: AdapterStatus::Stubbed,
+                        detail,
+                        ..
+                    },
+                ] if detail == super::super::live::UNLINKED
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// No worker runs (for example after a denied key read): nothing can
+    /// ask Signal, and the saved session is deleted.
+    #[tokio::test]
+    async fn an_unlink_with_no_worker_deletes_the_saved_session() {
+        let session = Arc::new(Session::new());
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let handle = Handle::spawn_with_delete(
+            Arc::clone(&session),
+            Box::new(|_session, _events| None),
+            counting_delete(&deletes, true),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.unlink(&tx);
+        handle.flush().await;
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Account {
+                state: AccountState::Unlinked,
+                ..
+            })
+        ));
+    }
+
+    /// Files that do not go: the row still leaves the linked state, and
+    /// the status line says that the files are still there.
+    #[tokio::test]
+    async fn an_unlink_that_cannot_delete_says_so() {
+        let session = Arc::new(Session::new());
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let handle = Handle::spawn_with_delete(
+            Arc::clone(&session),
+            Box::new(|_session, _events| None),
+            counting_delete(&deletes, false),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.unlink(&tx);
+        handle.flush().await;
+        let mut details = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } = event
+            {
+                details.push(detail);
+            }
+        }
+        assert_eq!(details, [super::super::live::UNLINK_FILES_LEFT]);
     }
 
     #[tokio::test]

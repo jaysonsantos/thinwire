@@ -80,6 +80,8 @@ pub(crate) struct MessageSummary {
     pub reactions: Vec<crate::Reaction>,
     /// The message that this one replies to.
     pub reply_to: Option<u64>,
+    /// The author changed the text after the send.
+    pub edited: bool,
 }
 
 /// An image attachment of a message. `Debug` shows no URL.
@@ -195,6 +197,15 @@ pub(crate) trait DiscordApi: Send + Sync {
     ) -> ApiFuture<'_, MessageSummary>;
     /// One message, with its reactions now.
     fn message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, MessageSummary>;
+    /// Put `body` in the place of the text of one message of the bot (#521).
+    fn edit_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        body: String,
+    ) -> ApiFuture<'_, MessageSummary>;
+    /// Show the bot as typing in the channel for about 10 s (#526).
+    fn typing(&self, channel_id: u64) -> ApiFuture<'_, ()>;
     /// Delete one message. The bot deletes its own messages.
     fn delete_message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, ()>;
     /// Add or remove the Unicode reaction `emoji` of the bot.

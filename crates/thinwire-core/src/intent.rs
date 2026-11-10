@@ -27,6 +27,11 @@ pub enum Intent {
     /// Remove an account after account 0 that is not linked. Its keychain
     /// values and files stay.
     RemoveAccount(ProtocolId),
+    /// Unlink a linked account: log out where the protocol has a log out,
+    /// and remove the saved session or the saved token. A frontend asks the
+    /// user first. Account 0 stays as a row that is not linked. An account
+    /// after account 0 leaves the sidebar and the settings.
+    UnlinkAccount(ProtocolId),
     /// Show one previous Signal account. The slot is not an account id.
     /// Sending stays off. The history stays.
     SelectRetainedSignal(u32),
@@ -116,6 +121,9 @@ pub enum Intent {
     /// Collapse the account sidebar to its icons, or expand it. Disk I/O
     /// runs off the caller thread.
     SetRailCollapsed(bool),
+    /// Move one account one place up or down in the account sidebar. The
+    /// order is saved. Disk I/O runs off the caller thread.
+    MoveAccount { account: ProtocolId, up: bool },
     /// Settings: tell the other people of a chat when the user types
     /// (#510). Off also stops a typing state that still shows. Disk I/O
     /// runs off the caller thread.

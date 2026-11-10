@@ -85,6 +85,9 @@ const DETAIL_TIMED_OUT: &str = "The Slack install timed out. Connect again to re
 const DETAIL_DECLINED: &str = "The Slack install was cancelled in the browser.";
 const DETAIL_ENDED: &str =
     "Slack workspace access ended (token revoked or app removed). Connect to install again.";
+/// The status line after the user unlinked the workspace.
+const DETAIL_UNLINKED: &str =
+    "Slack is unlinked. The workspace tokens were removed from the keychain.";
 const DETAIL_DISCONNECTED: &str =
     "Slack disconnected. The workspace install stays saved. Connect to resume.";
 const DETAIL_NOT_IN_CHANNEL: &str =
@@ -454,6 +457,13 @@ where
                 self.account(AccountState::Unlinked);
                 self.status(AdapterStatus::Stubbed, DETAIL_DISCONNECTED);
             }
+            AdapterCommand::Unlink {
+                protocol: ProtocolId::Slack,
+            } => {
+                self.cancel_install();
+                self.drop_install(AdapterStatus::Stubbed, DETAIL_UNLINKED)
+                    .await;
+            }
             AdapterCommand::LoadChats {
                 protocol: ProtocolId::Slack,
             } => {
@@ -778,6 +788,13 @@ where
 
     /// The bot token no longer works. Stop Socket Mode and drop the install.
     async fn end_access(&mut self) {
+        self.drop_install(AdapterStatus::Error, DETAIL_ENDED).await;
+    }
+
+    /// Stop Socket Mode and remove the workspace tokens of this account:
+    /// from the vault now, and from the keychain at the flush. The keys of
+    /// the Slack app (client id, client secret, app token) stay.
+    async fn drop_install(&mut self, status: AdapterStatus, detail: &'static str) {
         self.stop_live().await;
         self.voice_epoch = self.voice_epoch.wrapping_add(1);
         let pending = std::mem::take(&mut self.downloads);
@@ -794,7 +811,7 @@ where
         self.deps.vault.set_secret(SlackSecretKey::AppId, "");
         emit_flush_secrets(&self.events);
         self.account(AccountState::Unlinked);
-        self.status(AdapterStatus::Error, DETAIL_ENDED);
+        self.status(status, detail);
     }
 
     async fn api_failed(&mut self, error: &SlackApiError) {

@@ -24,8 +24,9 @@ use crate::SecretText;
 /// `reply_to` on [`WireCommand::SendText`], [`WireCommand::DeleteMessage`],
 /// [`WireCommand::React`], [`WireMessage::reactions`],
 /// [`WireMessage::reply_to`], and [`WireEvent::Reactions`]. Version 7 adds
-/// [`WireMessage::mentions`]. An older peer cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// [`WireMessage::mentions`]. Version 8 adds [`WireCommand::Unlink`]. An
+/// older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// One unreadable stretch on a history page.
 ///
@@ -124,8 +125,12 @@ pub enum HelperRefusal {
 #[serde(tag = "name", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireCommand {
     Connect,
-    /// A log out: the helper ends the session and deletes its session store.
+    /// End the session of this run. The session store stays on disk.
     Disconnect,
+    /// The user unlinks the account. The helper asks the service to remove
+    /// this device, ends the session, and deletes its session store. It
+    /// answers with the account state `Unlinked`.
+    Unlink,
     LoadChats,
     OpenChat {
         conversation_id: String,
@@ -203,6 +208,7 @@ impl WireCommand {
         match self {
             Self::Connect => "connect",
             Self::Disconnect => "disconnect",
+            Self::Unlink => "unlink",
             Self::LoadChats => "load_chats",
             Self::OpenChat { .. } => "open_chat",
             Self::LoadOlderMessages { .. } => "load_older_messages",
@@ -1011,6 +1017,7 @@ mod tests {
         for command in [
             WireCommand::Connect,
             WireCommand::Disconnect,
+            WireCommand::Unlink,
             WireCommand::AcknowledgeGate,
             WireCommand::CancelLink,
             WireCommand::LoadChats,
@@ -1019,5 +1026,25 @@ mod tests {
         }
         assert!(WireCommand::AcknowledgeGate.wakes_helper());
         assert!(!WireCommand::Connect.wakes_helper());
+        // An unlink of a helper that does not run must not start a link.
+        assert!(!WireCommand::Unlink.wakes_helper());
+    }
+
+    /// The unlink line of wire version 8: one name, no field, and no user
+    /// data in `Debug`.
+    #[test]
+    fn an_unlink_request_survives_the_wire() {
+        let line = AppLine::Request {
+            id: 9,
+            protocol: WireProtocol::WhatsApp,
+            command: WireCommand::Unlink,
+        };
+        let encoded = encode(&line).expect("encode");
+        assert_eq!(
+            encoded.trim_end(),
+            r#"{"type":"request","id":9,"protocol":"whatsapp","command":{"name":"unlink"}}"#
+        );
+        assert_eq!(decode::<AppLine>(encoded.trim_end()).expect("decode"), line);
+        assert_eq!(format!("{:?}", WireCommand::Unlink), "WireCommand(unlink)");
     }
 }

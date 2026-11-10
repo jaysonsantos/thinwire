@@ -268,6 +268,26 @@ impl SignalAdapter {
         Ok(())
     }
 
+    /// The user unlinks the account. The link owner asks Signal to remove
+    /// this device, deletes the live session, and sends `Unlinked`. The
+    /// previous accounts under `retained/` stay.
+    fn unlink(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        self.notice_accepted = false;
+        #[cfg(feature = "signal-local")]
+        if matches!(self.engine, Engine::Live(_)) {
+            self.owner_handle().unlink(events);
+            return Ok(());
+        }
+        emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
+        emit_status(
+            events,
+            ProtocolId::Signal,
+            AdapterStatus::Stubbed,
+            "Signal is unlinked. No session is running.",
+        );
+        Ok(())
+    }
+
     fn load_chats(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         match &mut self.engine {
             Engine::Sync(device) => {
@@ -697,6 +717,9 @@ impl ProtocolAdapter for SignalAdapter {
                 protocol: ProtocolId::Signal,
             }
             | AdapterCommand::SignalCancelLink => self.cancel_link(events),
+            AdapterCommand::Unlink {
+                protocol: ProtocolId::Signal,
+            } => self.unlink(events),
             AdapterCommand::SignalAcknowledgeNotice => self.acknowledge(events),
             AdapterCommand::SignalBeginLink { generation } => self.begin_link(events, generation),
             AdapterCommand::RetryStoreKey {

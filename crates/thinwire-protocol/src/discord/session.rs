@@ -275,6 +275,10 @@ async fn send_files(
 const DELETE_FAILED: &str =
     "Discord did not delete the message. The bot deletes only its own messages.";
 
+/// The edit of a message did not go through.
+const EDIT_FAILED: &str =
+    "Discord did not change the message. The bot edits only its own messages.";
+
 /// A reaction did not go through.
 const REACT_FAILED: &str = "Discord did not take the reaction. The bot needs Add Reactions.";
 
@@ -314,6 +318,16 @@ enum Msg {
         message_id: u64,
         emoji: String,
         add: bool,
+    },
+    /// Change the text of one message of the bot.
+    Edit {
+        conversation_id: String,
+        message_id: u64,
+        body: String,
+    },
+    /// Show the bot as typing in the channel.
+    Typing {
+        conversation_id: String,
     },
     View {
         conversation_id: Option<String>,
@@ -582,6 +596,30 @@ impl Session {
             conversation_id,
             message_id,
         });
+        Ok(())
+    }
+
+    /// Changes the text of one message of the bot. `MessageBody` and
+    /// `MessageEdited` answer, or `CommandFailed`.
+    pub(crate) fn edit(
+        &self,
+        conversation_id: String,
+        message_id: u64,
+        body: String,
+    ) -> Result<(), AdapterError> {
+        self.check_ready()?;
+        let _ = self.tx.send(Msg::Edit {
+            conversation_id,
+            message_id,
+            body,
+        });
+        Ok(())
+    }
+
+    /// Shows the bot as typing in the channel for about 10 s. No answer.
+    pub(crate) fn typing(&self, conversation_id: String) -> Result<(), AdapterError> {
+        self.check_ready()?;
+        let _ = self.tx.send(Msg::Typing { conversation_id });
         Ok(())
     }
 
@@ -1115,6 +1153,62 @@ impl Owner {
         });
     }
 
+    /// Change the text of one message of the bot. Success sends the text
+    /// that Discord has now, and "edited".
+    fn edit(&mut self, conversation_id: String, message_id: u64, body: String) {
+        let events = self.events.clone();
+        let access = self.carried.channels.get(&conversation_id).copied();
+        let (Some(access), false) = (access, body.trim().is_empty()) else {
+            emit_command_failed(
+                &events,
+                ProtocolId::Discord,
+                Some(conversation_id),
+                EDIT_FAILED,
+            );
+            return;
+        };
+        let api = Arc::clone(&self.api);
+        tokio::spawn(async move {
+            match api.edit_message(access.channel_id, message_id, body).await {
+                Ok(message) => {
+                    let message_id = format!("{CONVERSATION_PREFIX}{message_id}");
+                    let _ = events.send(AdapterEvent::MessageBody {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: conversation_id.clone(),
+                        message_id: message_id.clone(),
+                        body: message.content,
+                    });
+                    let _ = events.send(AdapterEvent::MessageEdited {
+                        protocol: ProtocolId::Discord,
+                        conversation_id,
+                        message_id,
+                    });
+                }
+                Err(_) => {
+                    emit_command_failed(
+                        &events,
+                        ProtocolId::Discord,
+                        Some(conversation_id),
+                        EDIT_FAILED,
+                    );
+                }
+            }
+        });
+    }
+
+    /// Show the bot as typing. Discord ends the state after about 10 s, or
+    /// when a message of the bot arrives. A failure shows nothing: the
+    /// typing state is not important enough for an error line.
+    fn typing(&self, conversation_id: &str) {
+        let Some(access) = self.carried.channels.get(conversation_id).copied() else {
+            return;
+        };
+        let api = Arc::clone(&self.api);
+        tokio::spawn(async move {
+            let _ = api.typing(access.channel_id).await;
+        });
+    }
+
     /// Add or remove a reaction of the bot, then read the counts of the
     /// message again. They also undo the change of the row after a failure.
     fn react(&mut self, conversation_id: String, message_id: u64, emoji: String, add: bool) {
@@ -1246,6 +1340,12 @@ impl Owner {
                 emoji,
                 add,
             } => self.react(conversation_id, message_id, emoji, add),
+            Msg::Edit {
+                conversation_id,
+                message_id,
+                body,
+            } => self.edit(conversation_id, message_id, body),
+            Msg::Typing { conversation_id } => self.typing(&conversation_id),
             Msg::View { conversation_id } => {
                 if let Some(error) = self.ending_error() {
                     emit_command_failed(

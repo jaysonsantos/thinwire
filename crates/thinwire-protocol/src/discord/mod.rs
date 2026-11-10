@@ -69,6 +69,9 @@ const NOT_READY_DETAIL: &str = "Discord bot inbox is not ready in this build. En
 
 const NOT_READY_REASON: &str = "Discord bot inbox is not ready in this build";
 
+/// The status line after the user unlinked the account.
+const UNLINKED_DETAIL: &str = "Discord is unlinked. The bot token was removed from the keychain.";
+
 #[cfg(any(test, feature = "discord-bot"))]
 const NOT_CONNECTED_REASON: &str =
     "Discord bot inbox is not connected. Store a bot token, then connect";
@@ -97,19 +100,20 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: cfg!(feature = "discord-bot"),
     pages_history: true,
     sends_media: cfg!(feature = "discord-bot"),
-    // The bot replies, reacts, and deletes its own messages. Discord has no
-    // delete for one account only.
+    // The bot replies, reacts, edits, and deletes its own messages. Discord
+    // has no delete for one account only.
     message_actions: crate::MessageActions {
         reply: cfg!(feature = "discord-bot"),
         react: cfg!(feature = "discord-bot"),
         delete_for_me: false,
         delete_for_everyone: cfg!(feature = "discord-bot"),
         one_reaction: false,
-        edit: false,
+        edit: cfg!(feature = "discord-bot"),
         forward: false,
     },
-    // The bot has no typing yet (#526).
-    typing: false,
+    // The bot shows that it types. A member who types does not show yet: it
+    // needs the gateway (#487, #526).
+    typing: cfg!(feature = "discord-bot"),
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.
@@ -494,6 +498,43 @@ impl DiscordAdapter {
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
+    fn edit_message(
+        &mut self,
+        conversation_id: String,
+        message_id: &str,
+        body: String,
+    ) -> Result<(), AdapterError> {
+        let Some(id) = inbox::message_snowflake(message_id) else {
+            return Ok(());
+        };
+        self.session_mut()?.edit(conversation_id, id, body)
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn edit_message(
+        &mut self,
+        _conversation_id: String,
+        _message_id: &str,
+        _body: String,
+    ) -> Result<(), AdapterError> {
+        Err(not_ready())
+    }
+
+    /// Discord has no "stopped typing" call: the state ends by itself.
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn set_typing(&mut self, conversation_id: String, typing: bool) -> Result<(), AdapterError> {
+        if !typing {
+            return Ok(());
+        }
+        self.session_mut()?.typing(conversation_id)
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn set_typing(&mut self, _conversation_id: String, _typing: bool) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "discord-bot"))]
     fn react(
         &mut self,
         conversation_id: String,
@@ -729,10 +770,22 @@ impl ProtocolAdapter for DiscordAdapter {
             | AdapterCommand::Connect {
                 protocol: ProtocolId::Discord,
             } => self.connect_bot_inbox(events),
-            AdapterCommand::Disconnect {
+            command @ (AdapterCommand::Disconnect {
                 protocol: ProtocolId::Discord,
-            } => {
-                let detail = if Self::bot_inbox_compiled() {
+            }
+            | AdapterCommand::Unlink {
+                protocol: ProtocolId::Discord,
+            }) => {
+                // An unlink is a disconnect that also removes the bot token:
+                // from the vault now, and from the keychain at the flush.
+                let unlink = matches!(command, AdapterCommand::Unlink { .. });
+                if unlink {
+                    self.secrets.set_bot_token("");
+                    crate::adapter::emit_flush_secrets(events);
+                }
+                let detail = if unlink {
+                    UNLINKED_DETAIL
+                } else if Self::bot_inbox_compiled() {
                     "Discord bot inbox disconnected."
                 } else {
                     NOT_READY_DETAIL
@@ -806,6 +859,22 @@ impl ProtocolAdapter for DiscordAdapter {
                 emoji,
                 add,
             } => self.react(conversation_id, &message_id, emoji, add),
+            AdapterCommand::EditMessage {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                message_id,
+                body,
+            } => self.edit_message(conversation_id, &message_id, body),
+            // A typing state that does not go out is not an error.
+            AdapterCommand::SetTyping {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                typing,
+                ..
+            } => {
+                let _ = self.set_typing(conversation_id, typing);
+                Ok(())
+            }
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Discord,
                 conversation_id,
@@ -1204,6 +1273,7 @@ mod tests {
                 image: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             }],
         );
         // A 500 is `Rejected`, not Forbidden or NotFound.
@@ -2306,6 +2376,69 @@ mod tests {
                 if message_ids == &vec!["discord:777".to_string()]
         ));
         assert_eq!(api.state().deleted, vec![(GENERAL, 777)]);
+    }
+
+    /// #521, #526: an edit changes the text of a message of the bot and
+    /// marks it as edited. A failed edit says so. "Typing" goes out, and a
+    /// stop sends nothing.
+    #[tokio::test]
+    async fn the_bot_edits_its_message_and_shows_that_it_types() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        let edit = |body: &str| AdapterCommand::EditMessage {
+            protocol: ProtocolId::Discord,
+            conversation_id: id.clone(),
+            message_id: "discord:777".into(),
+            body: body.into(),
+        };
+        adapter.handle(edit("new text"), &tx).expect("edit");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageEdited { .. })
+        })
+        .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageBody { message_id, body, .. }
+                if message_id == "discord:777" && body == "new text"
+        )));
+        assert_eq!(
+            api.state().edited,
+            vec![(GENERAL, 777, "new text".to_string())]
+        );
+
+        api.state().next_error = Some(super::api::DiscordApiError::Rejected);
+        adapter.handle(edit("more"), &tx).expect("edit");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::CommandFailed { .. })
+        })
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::MessageEdited { .. }))
+        );
+
+        for typing in [true, false] {
+            adapter
+                .handle(
+                    AdapterCommand::SetTyping {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: id.clone(),
+                        topic: None,
+                        typing,
+                    },
+                    &tx,
+                )
+                .expect("typing");
+        }
+        for _ in 0..50 {
+            if !api.state().typed.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(api.state().typed, vec![GENERAL]);
     }
 
     /// Twelve photos go out as two messages of 10 and 2 files. The text goes
@@ -5800,6 +5933,70 @@ mod tests {
             "queued history published after Unlinked: {:?}",
             &events[unlinked + 1..]
         );
+    }
+
+    /// An unlink ends the session as a disconnect does, and it removes the
+    /// bot token from the vault. The flush event lets the shell remove it
+    /// from the keychain. The next connect finds no token.
+    #[tokio::test]
+    async fn unlink_removes_the_bot_token_and_ends_the_session() {
+        let (mut adapter, vault) = fake_adapter(
+            Arc::new(FakeDiscordApi::guild_fixture()),
+            Some(FIXTURE_TOKEN),
+        );
+        let (tx, mut rx) = unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::ConnectDiscord {
+                    mode: DiscordAuthMode::Bot,
+                },
+                &tx,
+            )
+            .expect("connect");
+        inbox_loaded(&mut rx).await;
+        adapter
+            .handle(
+                AdapterCommand::Unlink {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("unlink");
+        assert_eq!(vault.bot_token(), None);
+        let events = until(&mut rx, is_unlinked).await;
+        assert!(events.contains(&AdapterEvent::FlushSecrets), "{events:?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Stubbed,
+                    detail,
+                    ..
+                } if detail == UNLINKED_DETAIL
+            )),
+            "{events:?}"
+        );
+        for event in &events {
+            assert!(!format!("{event:?}").contains(FIXTURE_TOKEN));
+        }
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("connect with no token");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail.contains(BOT_TOKEN_MISSING)
+            )),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(is_ready));
     }
 
     #[tokio::test]

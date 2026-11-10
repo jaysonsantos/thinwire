@@ -49,6 +49,7 @@ pub(crate) fn command_to_wire(
     Some(match command {
         AdapterCommand::Connect { .. } => WireCommand::Connect,
         AdapterCommand::Disconnect { .. } => WireCommand::Disconnect,
+        AdapterCommand::Unlink { .. } => WireCommand::Unlink,
         AdapterCommand::LoadChats { .. } => WireCommand::LoadChats,
         AdapterCommand::OpenChat {
             conversation_id, ..
@@ -188,6 +189,7 @@ pub(crate) fn command_from_wire(
     let command = match command {
         WireCommand::Connect => AdapterCommand::Connect { protocol },
         WireCommand::Disconnect => AdapterCommand::Disconnect { protocol },
+        WireCommand::Unlink => AdapterCommand::Unlink { protocol },
         WireCommand::LoadChats => AdapterCommand::LoadChats { protocol },
         WireCommand::OpenChat { conversation_id } => AdapterCommand::OpenChat {
             protocol,
@@ -1421,6 +1423,7 @@ mod tests {
         let commands = [
             AdapterCommand::Connect { protocol },
             AdapterCommand::Disconnect { protocol },
+            AdapterCommand::Unlink { protocol },
             AdapterCommand::LoadChats { protocol },
             AdapterCommand::OpenChat {
                 protocol,

@@ -213,6 +213,7 @@ pub(crate) fn draw(
     super::photos::overlay(ui, snapshot.selected_messages());
     player.video_overlay(ui, snapshot.selected_messages());
     super::message_menu::delete_dialog(ui.ctx(), out);
+    super::unlink::dialog(ui.ctx(), out);
     super::forward::picker(ui.ctx(), snapshot, out);
 }
 
@@ -977,6 +978,7 @@ fn account_icon(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::Role::Button, enabled, selected, caps.id.label())
     });
+    super::unlink::attach(&response, account);
     let response = response.on_hover_text(tip);
     enabled && response.clicked()
 }
@@ -1293,6 +1295,7 @@ fn account_chip(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::Role::Button, enabled, selected, caps.id.label())
     });
+    super::unlink::attach(&response, account);
     if let Some(note) = account_footnote(caps.id, account.linked()) {
         ui.label(RichText::new(note).small().weak());
     }
@@ -2341,6 +2344,7 @@ fn center_panel(
         });
         if escape {
             let closed = super::message_menu::take_escape(ui.ctx())
+                || super::unlink::take_escape(ui.ctx())
                 || player.take_video_escape()
                 || super::photos::take_escape(ui.ctx())
                 || super::links::take_escape(ui.ctx())
@@ -3622,17 +3626,27 @@ fn bubble(
                     }
                     // A tap on the thumbnail of a video plays the video, not
                     // the still picture.
-                    let tapped = message.photo.is_some_and(|photo| {
-                        super::photos::show(
-                            ui,
-                            message.protocol,
-                            message.conversation_id,
-                            message.id,
-                            photo,
-                            message.video.is_none(),
-                            out,
-                        )
-                    });
+                    // A video message that plays has its frame in the place
+                    // of the thumbnail.
+                    let inline = player.show_video_inline(
+                        ui,
+                        message.protocol,
+                        message.conversation_id,
+                        message.id,
+                        message.video,
+                    );
+                    let tapped = !inline
+                        && message.photo.is_some_and(|photo| {
+                            super::photos::show(
+                                ui,
+                                message.protocol,
+                                message.conversation_id,
+                                message.id,
+                                photo,
+                                message.video.is_none(),
+                                out,
+                            )
+                        });
                     player.show_video(
                         ui,
                         message.protocol,

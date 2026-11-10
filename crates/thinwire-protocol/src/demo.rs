@@ -532,13 +532,14 @@ impl DemoAdapter {
                 ..
             } => self.resend(conversation_id, message_id, request, events),
             AdapterCommand::TelegramAuth { step, epoch } => self.login(step, epoch, events),
-            AdapterCommand::Disconnect { protocol } => self.send(
-                events,
-                AdapterEvent::Account {
-                    protocol,
-                    state: AccountState::Unlinked,
-                },
-            ),
+            AdapterCommand::Disconnect { protocol } | AdapterCommand::Unlink { protocol } => self
+                .send(
+                    events,
+                    AdapterEvent::Account {
+                        protocol,
+                        state: AccountState::Unlinked,
+                    },
+                ),
             // Connect and the pairing commands have no demo script.
             _ => {}
         }

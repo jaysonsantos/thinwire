@@ -49,6 +49,9 @@ const CAPABILITY_DETAIL: &str =
 #[cfg(not(feature = "telegram-tdlib"))]
 const CAPABILITY_DETAIL: &str = "Official TDLib via Rust bindings (tdlib-rs). Supported goal. TDLib unavailable in this build; enable feature telegram-tdlib after a local TDLib install.";
 
+/// The status line after the user unlinked the account.
+const UNLINKED_DETAIL: &str = "Telegram is unlinked. This computer is logged out.";
+
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Telegram,
     support: SupportClass::Supported,
@@ -130,6 +133,31 @@ impl TelegramAdapter {
         } else {
             "TDLib unavailable — enable feature telegram-tdlib after a local TDLib install; never put api_id/api_hash in the repo"
         }
+    }
+
+    /// The user unlinked this account. The session marker goes first, so
+    /// the next start does not resume. With TDLib, the worker then logs out:
+    /// Telegram ends the session and TDLib deletes its local data. The
+    /// database key stays for the next login. The next login step starts a
+    /// new client, with no app restart.
+    fn unlink(&mut self, events: &EventTx) {
+        self.engine.reset();
+        self.secrets
+            .set_secret(super::secrets::TelegramSecretKey::Session, "");
+        request_secret_flush(events);
+        #[cfg(feature = "telegram-tdlib")]
+        self.tdlib.log_out();
+        super::adapter::emit_account(
+            events,
+            ProtocolId::Telegram,
+            super::adapter::AccountState::Unlinked,
+        );
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Stubbed,
+            UNLINKED_DETAIL,
+        );
     }
 
     fn handle_auth(
@@ -285,6 +313,12 @@ impl ProtocolAdapter for TelegramAdapter {
                     AdapterStatus::Stubbed,
                     "Telegram disconnected.",
                 );
+                Ok(())
+            }
+            AdapterCommand::Unlink {
+                protocol: ProtocolId::Telegram,
+            } => {
+                self.unlink(events);
                 Ok(())
             }
             AdapterCommand::LoadChats {
@@ -1789,6 +1823,14 @@ mod tests {
             mark < close,
             "no login event after Cancel, even before Close is read"
         );
+        // `stop` and `log_out` end the client in `end_client`: the mark
+        // comes before the last command is queued.
+        let end = fn_body(src, "fn end_client");
+        let mark = end.find("closing.mark()").expect("end_client marks");
+        let queue = end.find("commands.send(last)").expect("then queues");
+        assert!(mark < queue);
+        assert!(stop.contains("self.end_client(TdlibCommand::Close { cancel })"));
+        assert!(stop.contains("self.end_client(TdlibCommand::LogOut)"));
         let auth = fn_body(src, "async fn apply_authorization");
         assert!(
             !auth.contains("emit_telegram_auth("),
@@ -2049,6 +2091,76 @@ mod tests {
 
     // A runtime for the live build's `tokio::spawn` (qa R44). The body never
     // awaits, so the worker is never polled and no TDLib client starts.
+    /// An unlink drops the session marker, asks for a keychain flush, and
+    /// reports the account as unlinked. The API credentials and the
+    /// database key stay for the next login. No event has a secret.
+    #[tokio::test]
+    async fn unlink_drops_the_session_marker_and_reports_unlinked() {
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "11111");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        vault.set_secret(TelegramSecretKey::Session, "session-marker");
+        vault.set_secret(TelegramSecretKey::DbEncryption, "db-key-value");
+        let mut adapter = TelegramAdapter::new(Arc::clone(&vault) as Arc<dyn TelegramSecretVault>);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::Unlink {
+                    protocol: ProtocolId::Telegram,
+                },
+                &tx,
+            )
+            .expect("unlink");
+        assert_eq!(vault.get_secret(TelegramSecretKey::Session), None);
+        assert!(vault.get_secret(TelegramSecretKey::ApiId).is_some());
+        assert!(vault.get_secret(TelegramSecretKey::DbEncryption).is_some());
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            let debug = format!("{event:?}");
+            for secret in ["11111", "hash-value", "session-marker", "db-key-value"] {
+                assert!(!debug.contains(secret), "{debug}");
+            }
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            [
+                AdapterEvent::FlushSecrets,
+                AdapterEvent::Account {
+                    protocol: ProtocolId::Telegram,
+                    state: crate::AccountState::Unlinked,
+                },
+                AdapterEvent::Status {
+                    protocol: ProtocolId::Telegram,
+                    status: AdapterStatus::Stubbed,
+                    detail: UNLINKED_DETAIL.into(),
+                },
+            ]
+        );
+    }
+
+    /// The TDLib worker logs out for an unlink, and only closes a client
+    /// that is not signed in. The runtime lets go of that worker, so the
+    /// next login step starts a new client with no app restart.
+    #[test]
+    fn the_tdlib_worker_logs_out_for_an_unlink() {
+        let src = include_str!("tdlib.rs");
+        let arm = &src[src.find("TdlibCommand::LogOut => {").expect("arm")..];
+        let arm = &arm[..arm.find("TdlibCommand::Step(step)").expect("next arm")];
+        assert!(arm.contains("if live.authorized || live.late_ready {"));
+        assert!(arm.contains("set_secret(TelegramSecretKey::Session, \"\")"));
+        assert!(arm.contains("request_log_out(client_id).await"));
+        assert!(arm.contains("request_close(client_id).await"));
+        assert!(arm.contains("live.closing.mark()"));
+        let log_out = &src[src.find("pub fn log_out(&mut self)").expect("log_out")..];
+        let log_out = &log_out[..log_out.find("\n    }\n").expect("end")];
+        assert!(log_out.contains("self.end_client(TdlibCommand::LogOut)"));
+        let end = &src[src.find("fn end_client(").expect("end_client")..];
+        let end = &end[..end.find("\n    }\n").expect("end")];
+        assert!(end.contains("closing.mark()"));
+        assert!(end.contains("self.slots.retire_current()"));
+    }
+
     #[tokio::test]
     async fn disconnect_resets_engine_and_does_not_emit_ready() {
         let vault = Arc::new(MemorySecretVault::new());

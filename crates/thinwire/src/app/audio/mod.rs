@@ -280,6 +280,27 @@ impl<B: Backend> Player<B> {
         let _ = (ui, messages);
     }
 
+    /// The frame of a video message that plays in its row. `false`: the row
+    /// does not play now, and the caller draws the thumbnail.
+    pub(crate) fn show_video_inline(
+        &mut self,
+        ui: &mut egui::Ui,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        video: Option<&MessageVideo>,
+    ) -> bool {
+        #[cfg(feature = "video")]
+        if let Some(video) = video.filter(|video| video.is_note()) {
+            return self
+                .video
+                .show_inline(ui, protocol, conversation_id, message_id, video);
+        }
+        #[cfg(not(feature = "video"))]
+        let _ = (ui, protocol, conversation_id, message_id, video);
+        false
+    }
+
     /// The controls of a video in its row. `tapped` is a tap on its
     /// thumbnail. A build with no `video` feature draws nothing: the row
     /// keeps its thumbnail and its label.

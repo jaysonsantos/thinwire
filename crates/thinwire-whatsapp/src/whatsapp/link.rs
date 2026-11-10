@@ -56,6 +56,12 @@ const STOP_ENDED: &str =
 const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
 const NOT_PAIRED: &str = "WhatsApp has no linked device.";
+/// The status line after the user unlinked the account.
+pub(super) const UNLINKED: &str = "WhatsApp is unlinked. The session on this computer was deleted.";
+
+/// Longest wait of an unlink for the answer of WhatsApp to the log out.
+/// The unlink then continues: this computer forgets the device in each case.
+const LOG_OUT_WAIT: Duration = Duration::from_secs(5);
 
 /// Pairing id of a resume at app start. The shell has no pairing with this
 /// id, so it drops any QR code or pair code of a resume.
@@ -169,6 +175,11 @@ pub(super) trait LinkBackend: Clone + Send + Sync + 'static {
     /// Stop a client and close its store.
     fn stop(&self, bot: Self::Bot) -> impl Future<Output = ()> + Send;
 
+    /// Ask WhatsApp to remove this device from the account. `true` when
+    /// WhatsApp confirmed it. The client is not usable after this call:
+    /// [`Self::stop`] follows.
+    fn log_out(&self, bot: &Self::Bot) -> impl Future<Output = bool> + Send;
+
     /// Delete the device store, its SQLite side files, and the revoked mark.
     fn delete_store(&self) -> impl Future<Output = Result<(), ()>> + Send;
 
@@ -199,6 +210,8 @@ enum Msg {
         event: LinkEvent,
     },
     Cancel,
+    /// The user unlinks the account: log out, stop, and delete the store.
+    Unlink,
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -295,6 +308,12 @@ impl LinkHandle {
         let _ = self.tx.send(Msg::Cancel);
     }
 
+    /// The user unlinks the account. The owner logs the device out, stops
+    /// the client, deletes the device store, and sends `Unlinked`.
+    pub(super) fn unlink(&self) {
+        let _ = self.tx.send(Msg::Unlink);
+    }
+
     /// A sender for client events of `generation`, for code outside the
     /// client (for example a send result that shows a revoked device).
     pub(super) fn callbacks(&self, generation: u64) -> Callbacks {
@@ -376,6 +395,7 @@ impl<B: LinkBackend> Owner<B> {
                     self.last_pairing = None;
                     self.last_resume = false;
                 }
+                Msg::Unlink => self.unlink().await,
                 Msg::Shutdown { done } => {
                     // The chat list goes to disk before the client stops.
                     flush_cache(self.cache.clone(), self.session.clone()).await;
@@ -545,6 +565,51 @@ impl<B: LinkBackend> Owner<B> {
         if self.stale && !marked {
             self.status(AdapterStatus::Error, REVOKE_NOT_SAVED);
         }
+    }
+
+    /// The user unlinks the account. Ask WhatsApp to remove this device,
+    /// end the session, and delete the device store, as after a logout on
+    /// the phone. The log out is best effort: with no connection, only this
+    /// computer forgets the device, and the phone still lists it.
+    async fn unlink(&mut self) {
+        // `true` also with no client: there is no device to log out.
+        let confirmed = match self.bot.as_ref().map(|bot| self.backend.log_out(bot)) {
+            Some(asking) => matches!(tokio::time::timeout(LOG_OUT_WAIT, asking).await, Ok(true)),
+            None => true,
+        };
+        if !confirmed {
+            tracing::warn!("whatsapp did not confirm the log out of this device");
+        }
+        // Later callbacks of this link are stale, also the logout event
+        // that the client sends for its own log out.
+        self.generation += 1;
+        self.cache = None;
+        self.last_phone = None;
+        self.last_pairing = None;
+        self.last_resume = false;
+        for event in self.session.reset() {
+            let _ = self.events.send(event);
+        }
+        // The store is not valid any more. The mark covers a delete that
+        // fails, and a restart before the delete.
+        self.stale = true;
+        let marked = self.backend.mark_revoked().await.is_ok();
+        let stopped = match self.bot.take() {
+            Some(bot) => self.stop_bot(bot).await,
+            None => !self.still_stopping(),
+        };
+        self.active.store(false, Ordering::SeqCst);
+        if stopped && self.backend.delete_store().await.is_ok() {
+            self.stale = false;
+        }
+        let _ = self.events.send(account(AccountState::Unlinked));
+        if self.stale && !marked {
+            self.status(AdapterStatus::Error, REVOKE_NOT_SAVED);
+        } else if stopped {
+            self.status(AdapterStatus::Stubbed, UNLINKED);
+        }
+        // A slow stop shows [`STOP_PENDING`]. `stop_ended` deletes the
+        // store when that stop ends.
     }
 
     /// Stop the current client. `false` if it did not stop in time.
@@ -732,6 +797,8 @@ pub(super) mod tests {
         pub revoked: AtomicBool,
         /// `mark_revoked` fails (a read-only app-data folder).
         pub mark_fails: bool,
+        /// WhatsApp does not confirm a log out (no connection).
+        pub log_out_fails: bool,
         /// No device store file is on disk.
         pub no_store: bool,
         /// The store has no paired device. A resume start refuses it.
@@ -813,6 +880,15 @@ pub(super) mod tests {
                     .expect("log")
                     .push(format!("stopped {bot}"));
             }
+        }
+
+        async fn log_out(&self, bot: &u64) -> bool {
+            self.0
+                .log
+                .lock()
+                .expect("log")
+                .push(format!("log out {bot}"));
+            !self.0.log_out_fails
         }
 
         async fn delete_store(&self) -> Result<(), ()> {
@@ -1156,6 +1232,116 @@ pub(super) mod tests {
         assert_eq!(
             fake.log(),
             vec!["start 1", "mark revoked", "stop 1", "delete", "start 3"]
+        );
+    }
+
+    /// The user unlinks a linked account: the device is logged out, the
+    /// client stops, the store is deleted, and the row leaves the linked
+    /// state with a normal status line. The logout event that the client
+    /// sends for its own log out does nothing more.
+    #[tokio::test]
+    async fn an_unlink_logs_out_and_deletes_the_store() {
+        let (fake, handle, session, mut rx) = owner(Fake::default());
+        handle.begin(None, 7);
+        handle.flush().await;
+        fake.callback(1).send(LinkEvent::Connected);
+        handle.flush().await;
+        assert!(session.is_connected());
+        drain(&mut rx);
+
+        handle.unlink();
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "log out 1", "mark revoked", "stop 1", "delete"]
+        );
+        assert!(!handle.is_active());
+        assert!(!session.is_connected());
+        let events = drain(&mut rx);
+        assert!(events.contains(&account(AccountState::Unlinked)));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Stubbed,
+                    detail,
+                    ..
+                } if detail == UNLINKED
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    ..
+                }
+            )),
+            "an unlink of the user is not an error: {events:?}"
+        );
+
+        // The next pairing starts on an empty store, with no second delete.
+        handle.begin(None, 8);
+        handle.flush().await;
+        assert_eq!(fake.log().last().map(String::as_str), Some("start 3"));
+    }
+
+    /// With no connection WhatsApp does not confirm the log out. This
+    /// computer forgets the device in that case too.
+    #[tokio::test]
+    async fn an_unlink_with_no_answer_still_deletes_the_store() {
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            log_out_fails: true,
+            ..Fake::default()
+        });
+        handle.begin(None, 7);
+        handle.flush().await;
+        handle.unlink();
+        handle.flush().await;
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "log out 1", "mark revoked", "stop 1", "delete"]
+        );
+        assert!(drain(&mut rx).contains(&account(AccountState::Unlinked)));
+    }
+
+    /// A saved store with no client (for example after a denied key read)
+    /// is deleted too. No client exists, so no log out goes out.
+    #[tokio::test]
+    async fn an_unlink_with_no_client_deletes_the_saved_store() {
+        let (fake, handle, _session, mut rx) = owner(Fake::default());
+        handle.unlink();
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["mark revoked", "delete"]);
+        assert!(drain(&mut rx).contains(&account(AccountState::Unlinked)));
+    }
+
+    /// A delete that fails leaves the revoked mark. The next pairing deletes
+    /// the store before it starts.
+    #[tokio::test]
+    async fn an_unlink_whose_delete_fails_deletes_at_the_next_pairing() {
+        let (fake, handle, _session, _rx) = owner(Fake {
+            delete_failures: AtomicUsize::new(1),
+            ..Fake::default()
+        });
+        handle.begin(None, 7);
+        handle.flush().await;
+        handle.unlink();
+        handle.begin(None, 8);
+        handle.flush().await;
+        assert_eq!(
+            fake.log(),
+            vec![
+                "start 1",
+                "log out 1",
+                "mark revoked",
+                "stop 1",
+                "delete failed",
+                "delete",
+                "start 3"
+            ]
         );
     }
 

@@ -118,10 +118,10 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 state.snapshot.select_conversation(id);
             }
             Intent::RestartHelper(protocol) => state.restarts.push(protocol),
-            intent
-            @ (Intent::AddAccount(_) | Intent::LinkAccount(_) | Intent::RemoveAccount(_)) => {
-                state.account_intents.push(intent)
-            }
+            intent @ (Intent::AddAccount(_)
+            | Intent::LinkAccount(_)
+            | Intent::RemoveAccount(_)
+            | Intent::UnlinkAccount(_)) => state.account_intents.push(intent),
             intent @ (Intent::React { .. }
             | Intent::ReplyTo { .. }
             | Intent::DeleteMessage { .. }
@@ -153,6 +153,13 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::SetRailCollapsed(collapsed) => state.settings.set_rail_collapsed(collapsed),
             Intent::SetSendTyping(on) => state.settings.set_send_typing(on),
             Intent::SetPersonColors(on) => state.settings.set_person_colors(on),
+            Intent::MoveAccount { account, up } => {
+                if state.snapshot.move_account(account, up) {
+                    state
+                        .settings
+                        .set_account_order(state.snapshot.account_order());
+                }
+            }
             Intent::AddAttachments {
                 protocol,
                 conversation_id,
@@ -440,6 +447,111 @@ fn add_account_lists_the_services_and_a_second_row_has_link_and_remove() {
             Intent::RemoveAccount(second),
         ]
     );
+}
+
+/// A right click on an account row offers "Move up" and "Move down". A
+/// linked account row also offers "Unlink…", with the account in its name. The item opens a question that says what the unlink does.
+/// Cancel and Esc send nothing. Only Unlink sends the intent. A row that is
+/// not linked has no "Unlink…". The Menu key opens the same menu for the row
+/// that has the keyboard focus.
+#[test]
+fn a_linked_account_row_unlinks_after_a_question() {
+    let mut state = InboxUi::ready();
+    let second = ProtocolId::account(thinwire_protocol::ProtocolKind::Telegram, 1).expect("slot");
+    assert!(state.snapshot.add_account_row(second));
+    let mut harness = harness(state);
+    harness.run();
+    let row = |harness: &Harness<'static, InboxUi>, label: &str| {
+        harness
+            .query_all(By::new().role(egui::accesskit::Role::Button).label(label))
+            .map(|node| node.rect())
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("the account row")
+            .center()
+    };
+    let right_click = |harness: &mut Harness<'static, InboxUi>, pos: egui::Pos2| {
+        harness.hover_at(pos);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+    };
+
+    // The second account is not linked: its menu has no "Unlink…". The
+    // menu moves the account up, and the order is saved.
+    let pos = row(&harness, "Telegram 2");
+    right_click(&mut harness, pos);
+    assert!(harness.query_by_label("Unlink Telegram 2").is_none());
+    harness.get_by_label("Move up: Telegram 2").click();
+    harness.run();
+    harness.run();
+    let order = harness.state().snapshot.account_order();
+    let place = |account: ProtocolId| order.iter().position(|known| *known == account);
+    assert!(place(second) < place(ProtocolId::Telegram), "{order:?}");
+    assert_eq!(harness.state().settings.account_order(), order);
+    assert!(row(&harness, "Telegram 2").y < row(&harness, "Telegram").y);
+
+    let pos = row(&harness, "Telegram");
+    right_click(&mut harness, pos);
+    harness.get_by_label("Unlink Telegram").click();
+    harness.run();
+    harness.get_by_label("Unlink Telegram?");
+    harness.get_by_label(thinwire_core::state::unlink_notice(
+        thinwire_protocol::ProtocolKind::Telegram,
+    ));
+    harness.get_by_label("Cancel").click();
+    harness.run();
+    assert!(harness.query_by_label("Unlink Telegram?").is_none());
+    assert!(
+        harness.state().account_intents.is_empty(),
+        "Cancel sends nothing"
+    );
+
+    right_click(&mut harness, pos);
+    harness.get_by_label("Unlink Telegram").click();
+    harness.run();
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.query_by_label("Unlink Telegram?").is_none());
+    assert!(
+        harness.state().account_intents.is_empty(),
+        "Esc sends nothing"
+    );
+
+    right_click(&mut harness, pos);
+    harness.get_by_label("Unlink Telegram").click();
+    harness.run();
+    harness.get_by_label("Unlink").click();
+    harness.run();
+    assert!(harness.query_by_label("Unlink Telegram?").is_none());
+    assert_eq!(
+        harness.state().account_intents,
+        vec![Intent::UnlinkAccount(ProtocolId::Telegram)]
+    );
+
+    // The keyboard: the Menu key on the row that has the focus.
+    harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label("Telegram"),
+        )
+        .min_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+        .expect("the account row")
+        .focus();
+    harness.run();
+    harness.key_press(egui::Key::Menu);
+    harness.run();
+    harness.get_by_label("Unlink Telegram");
 }
 
 /// An open topic shows Back, and the chat name in the header is a link.

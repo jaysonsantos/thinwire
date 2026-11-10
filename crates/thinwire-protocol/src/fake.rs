@@ -117,6 +117,9 @@ impl ProtocolAdapter for FakeAdapter {
             }
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::Telegram,
+            }
+            | AdapterCommand::Unlink {
+                protocol: ProtocolId::Telegram,
             } => {
                 emit_status(
                     events,

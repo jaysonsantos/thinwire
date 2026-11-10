@@ -133,6 +133,19 @@ impl LinkBackend for LiveBackend {
         note_shutdown(bot.shutdown().await);
     }
 
+    fn log_out(&self, bot: &BotHandle) -> impl Future<Output = bool> + Send {
+        // The client is taken here, so the future holds no borrow of the
+        // handle. `logout` sends the "remove companion device" request and
+        // then shuts the client down. It does not delete the store.
+        let client = bot.client();
+        async move {
+            matches!(
+                client.logout().await.deregistration,
+                whatsapp_rust::DeregistrationOutcome::Confirmed
+            )
+        }
+    }
+
     async fn delete_store(&self) -> Result<(), ()> {
         let path = whatsapp_device_store_path()?;
         tokio::task::spawn_blocking(move || {

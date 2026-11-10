@@ -1878,6 +1878,50 @@ impl Snapshot {
         true
     }
 
+    /// The accounts in the order of their rows, one time each.
+    #[must_use]
+    pub fn account_order(&self) -> Vec<ProtocolId> {
+        let mut order = Vec::new();
+        for row in &self.accounts {
+            if !order.contains(&row.caps.id) {
+                order.push(row.caps.id);
+            }
+        }
+        order
+    }
+
+    /// Put the rows in the saved order of the user. An account that is not
+    /// in `order` goes after the others, in the order of the build. The
+    /// rows of one account stay together.
+    pub fn apply_account_order(&mut self, order: &[ProtocolId]) {
+        self.accounts.sort_by_key(|row| {
+            order
+                .iter()
+                .position(|account| *account == row.caps.id)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    /// Move `account` one place up or down in the sidebar, past the next
+    /// account that the sidebar shows. `false`: it is at the end already,
+    /// or the sidebar does not show it.
+    pub fn move_account(&mut self, account: ProtocolId, up: bool) -> bool {
+        let mut order = self.account_order();
+        let shown: Vec<usize> = (0..order.len())
+            .filter(|at| self.shows_in_switcher(order[*at]))
+            .collect();
+        let Some(at) = shown.iter().position(|index| order[*index] == account) else {
+            return false;
+        };
+        let to = if up { at.checked_sub(1) } else { Some(at + 1) };
+        let Some(to) = to.filter(|to| *to < shown.len()) else {
+            return false;
+        };
+        order.swap(shown[at], shown[to]);
+        self.apply_account_order(&order);
+        true
+    }
+
     /// Remove the row of `account` and its chats. Account 0 stays. The
     /// keychain values and the files of the account stay too.
     pub fn remove_account_row(&mut self, account: ProtocolId) {
@@ -1891,6 +1935,43 @@ impl Snapshot {
             self.selected_protocol = account.first_account();
             self.set_selected_conversation(None);
         }
+    }
+
+    /// The user unlinks `account`: queue the unlink for its adapter. The
+    /// row stays linked until the adapter reports the end. `false` for an
+    /// account that is not linked: nothing is queued.
+    pub(crate) fn unlink_account(&mut self, account: ProtocolId) -> bool {
+        if !self.protocol_linked(account) {
+            return false;
+        }
+        self.status_text = format!("Unlinking {}…", account.label());
+        self.pending
+            .push(AdapterCommand::Unlink { protocol: account });
+        true
+    }
+
+    /// `account` left the linked state after an unlink of the user. The
+    /// gate acceptance of its pairing ends in memory. `forget_gate` also
+    /// drops the saved acceptance of the Signal notice. A Telegram account
+    /// of the login screens is not signed in any more.
+    pub(crate) fn finish_unlink(&mut self, account: ProtocolId, forget_gate: bool) {
+        if self.telegram_login_account == account {
+            self.telegram_authorized = false;
+            self.resume = Resume::Settled;
+        }
+        #[cfg(feature = "whatsapp-web")]
+        if self.whatsapp_screen_of(account) && !self.whatsapp_gate_open() {
+            self.whatsapp_risk_acknowledged = false;
+            self.whatsapp_started = false;
+        }
+        #[cfg(feature = "signal-local")]
+        if account.is(ProtocolKind::Signal) && forget_gate {
+            self.signal_notice_acknowledged = false;
+            self.signal_notice_forget = true;
+        }
+        #[cfg(not(feature = "signal-local"))]
+        let _ = forget_gate;
+        self.status_text = format!("{} is unlinked.", account.label());
     }
 
     /// The lowest free account number of `kind` after account 0. `None`
@@ -7688,6 +7769,29 @@ impl Snapshot {
         self.status_text = "Signal linking cancelled.".into();
         self.push(AdapterCommand::SignalCancelLink);
         self.signal_link_account = ProtocolId::Signal;
+    }
+}
+
+/// What an unlink does for an account of `kind`, in one line. A frontend
+/// shows it in the question before the unlink.
+#[must_use]
+pub const fn unlink_notice(kind: ProtocolKind) -> &'static str {
+    match kind {
+        ProtocolKind::Telegram => {
+            "thinwire logs this computer out of Telegram. Telegram deletes its data on this computer. Your Telegram account and your other devices stay."
+        }
+        ProtocolKind::WhatsApp => {
+            "thinwire asks WhatsApp to remove this linked device. It deletes the session and the saved chats on this computer. Your WhatsApp account stays."
+        }
+        ProtocolKind::Signal => {
+            "thinwire asks Signal to remove this linked device. It deletes the session on this computer. If your phone still shows the device, remove it there: Settings > Linked devices."
+        }
+        ProtocolKind::Discord => {
+            "thinwire removes the bot token from the keychain. The bot stays in its servers."
+        }
+        ProtocolKind::Slack => {
+            "thinwire removes the workspace tokens from the keychain. The Slack app stays installed in the workspace."
+        }
     }
 }
 
@@ -17072,6 +17176,28 @@ mod tests {
                 })
         );
         assert_eq!(snapshot.inbox_state(), InboxState::Rows);
+    }
+
+    /// The question before an unlink says what happens, for each protocol.
+    /// Signal names the place on the phone, because the request to Signal
+    /// can fail. No line makes a promise about an unofficial client.
+    #[test]
+    fn each_protocol_has_an_unlink_notice() {
+        let kinds = [
+            ProtocolKind::Telegram,
+            ProtocolKind::WhatsApp,
+            ProtocolKind::Signal,
+            ProtocolKind::Discord,
+            ProtocolKind::Slack,
+        ];
+        for kind in kinds {
+            let line = unlink_notice(kind);
+            assert!(line.ends_with('.'), "{line}");
+            assert!(!line.to_ascii_lowercase().contains("reliable"), "{line}");
+        }
+        assert!(unlink_notice(ProtocolKind::Signal).contains("Settings > Linked devices"));
+        assert!(unlink_notice(ProtocolKind::Discord).contains("bot token"));
+        assert!(unlink_notice(ProtocolKind::Slack).contains("workspace tokens"));
     }
 
     #[test]

@@ -395,6 +395,9 @@ pub struct MessageVideo {
     file_id: i32,
     file: Option<AudioPath>,
     failed: bool,
+    /// A video message: a short clip that a person records in the chat, as a
+    /// voice note with a picture. It plays in its row, not over the window.
+    note: bool,
 }
 
 impl MessageVideo {
@@ -415,7 +418,21 @@ impl MessageVideo {
             file_id,
             file,
             failed: false,
+            note: false,
         })
+    }
+
+    /// The same clip as a video message. It plays in its row.
+    #[must_use]
+    pub fn into_note(mut self) -> Self {
+        self.note = true;
+        self
+    }
+
+    /// A video message, not a video file. It plays in its row.
+    #[must_use]
+    pub fn is_note(&self) -> bool {
+        self.note
     }
 
     #[must_use]
@@ -467,6 +484,7 @@ impl fmt::Debug for MessageVideo {
             .field("file_id", &self.file_id)
             .field("file", &self.file)
             .field("failed", &self.failed)
+            .field("note", &self.note)
             .finish()
     }
 }

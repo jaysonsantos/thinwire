@@ -138,6 +138,8 @@ struct Lab {
     release: Notify,
     /// The adapter of the last helper saw `shutdown`.
     adapter_shut_down: AtomicBool,
+    /// Unlink commands that the fake adapter got.
+    unlinks: AtomicU32,
 }
 
 impl Lab {
@@ -155,6 +157,7 @@ impl Lab {
             crash: Notify::new(),
             release: Notify::new(),
             adapter_shut_down: AtomicBool::new(false),
+            unlinks: AtomicU32::new(0),
         })
     }
 
@@ -496,6 +499,12 @@ impl ProtocolAdapter for GatedFake {
                 None,
                 None,
             ),
+            AdapterCommand::Unlink { .. } => {
+                self.lab.unlinks.fetch_add(1, Ordering::SeqCst);
+                self.acknowledged = false;
+                self.linked = false;
+                emit_account(events, PROTOCOL, AccountState::Unlinked);
+            }
             AdapterCommand::Disconnect { .. } | AdapterCommand::WhatsAppCancelLink => {
                 if self.lab.die_on_cancel.load(Ordering::SeqCst) {
                     self.lab.crash.notify_one();
@@ -1294,6 +1303,57 @@ async fn an_account_that_ended_is_not_paired_again_after_a_crash() {
 /// PR #256 review: the user cancels a linked account, and the helper ends
 /// before it confirms the cancel. The account still unlinks. Else the row
 /// stays linked with no helper behind it and no Restart.
+/// An unlink of the user crosses the pipe to the helper, and the account
+/// leaves the linked state. The gate is not accepted any more: a helper
+/// that ends after that does not start again by itself.
+#[tokio::test]
+async fn an_unlink_reaches_the_helper_and_ends_the_link() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.pair(1);
+    probe.until_account(AccountState::Linked).await;
+    probe.send(AdapterCommand::Unlink { protocol: PROTOCOL });
+    probe.until_account(AccountState::Unlinked).await;
+    assert_eq!(probe.lab.unlinks.load(Ordering::SeqCst), 1);
+    probe.lab.crash.notify_one();
+    probe.until_helper(HelperState::Idle).await;
+    tokio::time::sleep(NO_START_WAIT).await;
+    assert_eq!(
+        probe.lab.launches(),
+        1,
+        "no restart for an unlinked account"
+    );
+}
+
+/// Only a helper can delete the session store. With no helper process, an
+/// unlink fails as a command: no helper starts for it, and the account
+/// state does not change.
+#[tokio::test]
+async fn an_unlink_with_no_helper_fails_and_changes_nothing() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.send(AdapterCommand::Unlink { protocol: PROTOCOL });
+    let failed = probe
+        .until("CommandFailed", |event| {
+            matches!(event, AdapterEvent::CommandFailed { .. })
+        })
+        .await;
+    let AdapterEvent::CommandFailed {
+        conversation_id,
+        detail,
+        ..
+    } = failed
+    else {
+        unreachable!();
+    };
+    assert_eq!(conversation_id, None);
+    assert!(detail.contains("did not unlink"), "{detail}");
+    probe.settle().await;
+    assert_eq!(probe.lab.launches(), 0, "an unlink starts no helper");
+    assert!(
+        !probe.saw(|event| matches!(event, AdapterEvent::Account { .. })),
+        "the account state does not change"
+    );
+}
+
 #[tokio::test]
 async fn a_cancel_that_the_helper_did_not_confirm_still_unlinks_the_account() {
     let mut probe = Probe::start(Mode::Serve);

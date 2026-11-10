@@ -54,6 +54,35 @@ const DELETE_FAILED: &str = "Signal did not delete the message.";
 const DISCONNECTED: &str = "Signal disconnected. The receive stream ended.";
 const LINKED_READY: &str = "Signal is linked. Experimental client: expect breakage.";
 
+/// The status line after the user unlinked the account.
+pub(super) const UNLINKED: &str = "Signal is unlinked. The session on this computer was deleted.";
+/// The status line when the files of an unlinked session did not go.
+pub(super) const UNLINK_FILES_LEFT: &str = "Signal is unlinked, but thinwire could not delete the session files on this computer. Check that the app-data folder is writable.";
+
+/// Longest wait of the worker for the answer of Signal to an unlink.
+const UNLINK_SELF_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Delete the live session of this account: `session.sqlite`, a pending
+/// link file, their SQLite side files, and the audio files of the player.
+/// The previous accounts under `retained/` stay. Call it only when no
+/// worker has the store open. `false` when a file is still there.
+///
+/// This call blocks: run it off the async threads.
+pub(super) fn delete_live_session() -> bool {
+    let Ok(dir) = signal_session_path() else {
+        return false;
+    };
+    let deleted = delete_live_session_in(&dir);
+    super::path::clear_voice_files();
+    deleted
+}
+
+fn delete_live_session_in(dir: &Path) -> bool {
+    let live = remove_sqlite_files(&sqlite_store_path(dir)).is_ok();
+    let pending = remove_sqlite_files(&pending_store_path(dir)).is_ok();
+    live && pending
+}
+
 /// How `run` finishes a generation.
 enum LinkedEnd {
     /// The phone removed this device.
@@ -148,6 +177,10 @@ pub(super) enum WorkerJob {
         conversation_id: String,
         message_id: String,
     },
+    /// The user unlinks the account: ask Signal to remove this device. The
+    /// answer is `true` when Signal confirmed it. The worker then leaves the
+    /// receive loop. The link owner deletes the session.
+    Unlink(tokio::sync::oneshot::Sender<bool>),
 }
 
 pub(super) struct Session {
@@ -393,6 +426,12 @@ impl Session {
             conversation_id,
             message_id,
         })
+    }
+
+    /// Queue the request to Signal to remove this device. `false`: no
+    /// worker reads jobs, so nothing can ask Signal.
+    pub(super) fn request_unlink(&self, done: tokio::sync::oneshot::Sender<bool>) -> bool {
+        self.enqueue(WorkerJob::Unlink(done))
     }
 
     pub(super) fn media(&self) -> &super::media::MediaBook {
@@ -2284,6 +2323,18 @@ async fn run_linked(
             }
             Some(WorkerJob::Voice(file_id)) => {
                 download_voice(&manager, &session, token, &events, file_id);
+            }
+            Some(WorkerJob::Unlink(done)) => {
+                // Presage sends the delete of this device on the identified
+                // connection. The wait has a bound: the unlink of the user
+                // must end with no network too.
+                let asked = tokio::time::timeout(UNLINK_SELF_WAIT, manager.unlink_self()).await;
+                let _ = done.send(matches!(asked, Ok(Ok(()))));
+                // The owner ends this generation, deletes the session, and
+                // sends `Unlinked`. No new receive open comes before that:
+                // it would look like a device that the phone removed.
+                ended = LinkedEnd::Superseded;
+                break;
             }
             None => {}
         }
@@ -4773,6 +4824,39 @@ mod tests {
 
     /// After a new link, the phone sends its contacts. The chat list shows
     /// them at once, not at the next start.
+    /// An unlink of the user deletes the live session and a pending link
+    /// file, with their SQLite side files. The previous accounts stay.
+    #[test]
+    fn an_unlink_deletes_the_live_session_and_keeps_retained() {
+        let dir = std::env::temp_dir().join(format!(
+            "thinwire-signal-unlink-{}-{}",
+            std::process::id(),
+            unix_now_millis().unwrap_or_default()
+        ));
+        let root = dir.as_path();
+        let live = sqlite_store_path(root);
+        let pending = pending_store_path(root);
+        let retained = root.join(RETAINED_DIR).join("old");
+        std::fs::create_dir_all(&retained).expect("retained");
+        let kept = sqlite_store_path(&retained);
+        let mut files = vec![live.clone(), pending.clone()];
+        for base in [&live, &pending] {
+            files.push(sqlite_sidecar(base, "-wal"));
+            files.push(sqlite_sidecar(base, "-shm"));
+        }
+        for file in files.iter().chain([&kept]) {
+            std::fs::write(file, b"x").expect("write");
+        }
+        assert!(delete_live_session_in(root));
+        for file in &files {
+            assert!(!file.exists(), "{}", file.display());
+        }
+        assert!(kept.exists(), "a previous account stays");
+        // Nothing is left to delete: the call still succeeds.
+        assert!(delete_live_session_in(root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_contacts_sync_refreshes_the_chat_list() {
         let src = include_str!("live.rs");

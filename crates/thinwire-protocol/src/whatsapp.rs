@@ -316,6 +316,9 @@ impl ProtocolAdapter for WhatsAppAdapter {
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::WhatsApp,
             }
+            | AdapterCommand::Unlink {
+                protocol: ProtocolId::WhatsApp,
+            }
             | AdapterCommand::WhatsAppCancelLink => self.cancel_link(events),
             AdapterCommand::WhatsAppAcknowledgeRisk => self.acknowledge(events),
             AdapterCommand::WhatsAppBeginLink { .. } => self.begin_link(),

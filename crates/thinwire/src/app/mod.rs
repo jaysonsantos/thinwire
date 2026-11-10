@@ -32,6 +32,7 @@ mod ui;
 mod ui_snapshots;
 #[cfg(test)]
 mod ui_tests;
+mod unlink;
 mod update_prompt;
 #[cfg(feature = "video")]
 mod video;

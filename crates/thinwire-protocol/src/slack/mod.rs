@@ -212,6 +212,9 @@ impl ProtocolAdapter for SlackAdapter {
             }
             | AdapterCommand::Disconnect {
                 protocol: ProtocolId::Slack,
+            }
+            | AdapterCommand::Unlink {
+                protocol: ProtocolId::Slack,
             } => {
                 emit_status(
                     events,

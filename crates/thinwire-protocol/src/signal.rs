@@ -312,6 +312,9 @@ impl ProtocolAdapter for SignalAdapter {
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::Signal,
             }
+            | AdapterCommand::Unlink {
+                protocol: ProtocolId::Signal,
+            }
             | AdapterCommand::SignalCancelLink => self.cancel_link(events),
             AdapterCommand::SignalAcknowledgeNotice => self.acknowledge(events),
             AdapterCommand::SignalBeginLink { .. } => self.begin_link(events),

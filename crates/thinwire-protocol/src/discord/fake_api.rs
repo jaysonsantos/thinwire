@@ -32,6 +32,10 @@ pub(crate) struct FakeState {
     pub sent_replies: Vec<Option<u64>>,
     /// Each delete: the channel and the message.
     pub deleted: Vec<(u64, u64)>,
+    /// Each edit: the channel, the message, and the new text.
+    pub edited: Vec<(u64, u64, String)>,
+    /// Each typing call: the channel.
+    pub typed: Vec<u64>,
     /// Each reaction call: the channel, the message, the emoji, and add.
     pub reacted: Vec<(u64, u64, String, bool)>,
     /// Each file send: the channel, the text, and the file names.
@@ -116,6 +120,7 @@ pub(crate) fn message(id: u64, author_id: u64, author: &str, content: &str) -> M
         image: None,
         reactions: Vec::new(),
         reply_to: None,
+        edited: false,
     }
 }
 
@@ -356,6 +361,33 @@ impl DiscordApi for FakeDiscordApi {
                 crate::Reaction::toggle(&mut found.reactions, emoji, *add, false);
             }
             Ok(found)
+        })
+    }
+
+    fn edit_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        body: String,
+    ) -> ApiFuture<'_, MessageSummary> {
+        Box::pin(async move {
+            self.check_token()?;
+            let mut state = self.state();
+            if let Some(error) = state.next_error.take() {
+                return Err(error);
+            }
+            state.edited.push((channel_id, message_id, body.clone()));
+            let mut row = message(message_id, BOT_ID, "thinwire-bot", &body);
+            row.edited = true;
+            Ok(row)
+        })
+    }
+
+    fn typing(&self, channel_id: u64) -> ApiFuture<'_, ()> {
+        Box::pin(async move {
+            self.check_token()?;
+            self.state().typed.push(channel_id);
+            Ok(())
         })
     }
 

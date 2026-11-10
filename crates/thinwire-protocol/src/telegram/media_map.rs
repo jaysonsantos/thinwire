@@ -68,6 +68,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 file: &message.video.video,
                 secret: message.is_secret,
                 spoiler: message.has_spoiler,
+                note: false,
             },
             Some(&message.caption),
         ),
@@ -82,6 +83,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 file: &message.animation.animation,
                 secret: message.is_secret,
                 spoiler: message.has_spoiler,
+                note: false,
             },
             Some(&message.caption),
         ),
@@ -96,6 +98,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 file: &message.video_note.video,
                 secret: message.is_secret,
                 spoiler: false,
+                note: true,
             },
             None,
         ),
@@ -165,6 +168,8 @@ struct Clip<'a> {
     file: &'a tdlib_rs::types::File,
     secret: bool,
     spoiler: bool,
+    /// A video message (TDLib "video note"). It plays in its row.
+    note: bool,
 }
 
 /// A clip: its thumbnail is the photo of the row, and the file plays in the
@@ -224,7 +229,8 @@ fn map_clip(clip: &Clip<'_>, caption: Option<&tdlib_rs::types::FormattedText>) -
         .is_downloading_completed
         .then(|| AudioPath::new(clip.file.local.path.clone()))
         .flatten();
-    mapped.video = MessageVideo::new(size(clip.duration), width, height, clip.file.id, local);
+    mapped.video = MessageVideo::new(size(clip.duration), width, height, clip.file.id, local)
+        .map(|video| if clip.note { video.into_note() } else { video });
     mapped
 }
 
@@ -504,6 +510,14 @@ mod tests {
                 is_viewed: false,
                 is_secret: true,
             });
+        // A video message plays in its row: its clip is a note.
+        let mut open_note = note.clone();
+        if let tdlib_rs::enums::MessageContent::MessageVideoNote(message) = &mut open_note {
+            message.is_secret = false;
+        }
+        let clip = map_content(&open_note).video.expect("clip");
+        assert!(clip.is_note());
+        assert_eq!((clip.file_id(), clip.size()), (8, (240, 240)));
         // A secret video note keeps its label: no file plays in the app.
         let note = map_content(&note);
         assert!(note.audio.is_none());
@@ -568,6 +582,7 @@ mod tests {
             (31, 12, (1280, 720))
         );
         assert!(video.file().is_none());
+        assert!(!video.is_note(), "a video file plays over the window");
         let photo = mapped.photo.expect("thumbnail");
         assert_eq!((photo.width, photo.height), (1280, 720));
         assert_eq!(photo.sizes.len(), 1);

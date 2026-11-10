@@ -2740,6 +2740,48 @@ async fn socket_mode_messages_update_preview_and_unread_and_stop_on_disconnect()
     );
 }
 
+/// An unlink stops Socket Mode and removes the workspace tokens of the
+/// account. The flush event lets the shell remove them from the keychain.
+/// The keys of the Slack app stay, so the user can install again.
+#[tokio::test]
+async fn unlink_removes_the_workspace_tokens_and_keeps_the_app_keys() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    vault.set_secret(SlackSecretKey::AppId, "A1");
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    assert!(h.socket.connected());
+
+    h.send(AdapterCommand::Unlink {
+        protocol: ProtocolId::Slack,
+    });
+    assert!(h.status(AdapterStatus::Stubbed).await.contains("unlinked"));
+    assert!(h.socket.stopped.load(Ordering::SeqCst));
+    for key in [
+        SlackSecretKey::BotToken,
+        SlackSecretKey::TeamId,
+        SlackSecretKey::AppId,
+    ] {
+        assert_eq!(h.vault.get_secret(key), None, "{key:?}");
+    }
+    assert_eq!(
+        h.vault.get_secret(SlackSecretKey::AppToken).as_deref(),
+        Some(APP_TOKEN),
+        "the app keys stay"
+    );
+    assert!(h.seen.contains(&AdapterEvent::FlushSecrets));
+    assert_eq!(h.account_states().last(), Some(&AccountState::Unlinked));
+    assert!(
+        h.seen.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if id == "slack:C1"
+        )),
+        "the channel rows leave the inbox"
+    );
+}
+
 #[tokio::test]
 async fn same_second_messages_order_by_microseconds() {
     let vault = installed_vault();

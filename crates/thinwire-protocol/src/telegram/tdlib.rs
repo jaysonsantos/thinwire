@@ -126,6 +126,11 @@ pub(super) enum TdlibCommand {
     Close {
         cancel: bool,
     },
+    /// The user unlinked this account. Ask TDLib to log out: Telegram ends
+    /// the session, and TDLib deletes its local data. A client that is not
+    /// signed in only closes. The worker exits after
+    /// `authorizationStateClosed`.
+    LogOut,
     /// Download one photo. `secret` deletes the file after the bytes are read.
     DownloadFile {
         file_id: i32,
@@ -174,6 +179,7 @@ impl TdlibCommand {
             Self::ViewChat { .. } => "view_chat",
             Self::ViewTopic { .. } => "view_topic",
             Self::Close { .. } => "close",
+            Self::LogOut => "log_out",
             Self::DownloadFile { .. } => "download_file",
             Self::DownloadVoice { .. } => "download_voice",
             Self::DownloadVideo { .. } => "download_video",
@@ -340,9 +346,9 @@ impl TdlibRuntime {
         self.stop_client(true);
     }
 
-    /// `cancel`: a Cancel rolls back a client that already became Ready; app
-    /// shutdown keeps the session.
-    fn stop_client(&mut self, cancel: bool) {
+    /// Send `last` (`Close` or `LogOut`) to the current worker and let go
+    /// of it.
+    fn end_client(&mut self, last: TdlibCommand) {
         // Mark first: from now on the old client sends no login events, even
         // before its worker reads `Close` (issue #42). The viewed chat goes
         // with it, so a message that arrives while closing is not marked read.
@@ -351,9 +357,22 @@ impl TdlibRuntime {
         }
         self.viewed.clear();
         if let Some(commands) = self.commands.take() {
-            let _ = commands.send(TdlibCommand::Close { cancel });
+            let _ = commands.send(last);
         }
         self.slots.retire_current();
+    }
+
+    /// `cancel`: a Cancel rolls back a client that already became Ready; app
+    /// shutdown keeps the session.
+    fn stop_client(&mut self, cancel: bool) {
+        self.end_client(TdlibCommand::Close { cancel });
+    }
+
+    /// Log the current client out of Telegram, then close it. The next
+    /// command starts a new worker, which waits until this one released the
+    /// database. With no worker, there is no client to log out.
+    pub fn log_out(&mut self) {
+        self.end_client(TdlibCommand::LogOut);
     }
 
     /// Close every TDLib client, then emit `Stopped` once all workers exited.
@@ -903,7 +922,9 @@ fn spawn_tdlib_worker(
                         commands = None;
                         TdlibCommand::Close { cancel: false }
                     });
-                    if live.closing.is_set() && !matches!(command, TdlibCommand::Close { .. }) {
+                    if live.closing.is_set()
+                        && !matches!(command, TdlibCommand::Close { .. } | TdlibCommand::LogOut)
+                    {
                         continue;
                     }
                     let kind = command.kind();
@@ -929,6 +950,26 @@ fn spawn_tdlib_worker(
                                     request_log_out(client_id).await;
                                 }
                                 CloseKind::Close => request_close(client_id).await,
+                            }
+                        }
+                        TdlibCommand::LogOut => {
+                            if live.close_requested {
+                                continue;
+                            }
+                            live.close_requested = true;
+                            live.close_cancel = Some(true);
+                            live.closing.mark();
+                            live.viewed.clear();
+                            live.open_chat = None;
+                            live.open_topic = None;
+                            if live.authorized || live.late_ready {
+                                // The user unlinked the account. The next
+                                // start must not resume this session.
+                                secrets.set_secret(TelegramSecretKey::Session, "");
+                                super::request_secret_flush(&events);
+                                request_log_out(client_id).await;
+                            } else {
+                                request_close(client_id).await;
                             }
                         }
                         TdlibCommand::Step(step) => {

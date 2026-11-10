@@ -168,6 +168,11 @@ pub struct Core {
     memory_secrets: bool,
     /// Accounts after account 0 whose saved session was resumed at start.
     resumed: std::collections::HashSet<ProtocolId>,
+    /// Accounts that the user unlinked, and when, until their row leaves
+    /// the linked state. An entry goes after [`UNLINK_WAIT`]: an unlink that
+    /// failed must not end the account when it leaves the linked state
+    /// later for another reason.
+    unlinking: std::collections::HashMap<ProtocolId, Instant>,
     whatsapp_phone: Arc<WhatsAppPhoneVault>,
     notifier: ChangeNotifier,
     closing: bool,
@@ -216,6 +221,10 @@ fn log_send_answer_at_close(event: &AdapterEvent) {
         _ => {}
     }
 }
+
+/// How long the core waits for the adapter to end an account after the
+/// user unlinked it. The helpers wait 5 s for the service.
+const UNLINK_WAIT: Duration = Duration::from_secs(30);
 
 impl Core {
     /// Start the adapter host and the keychain attach on `runtime`.
@@ -324,6 +333,7 @@ impl Core {
             account_stores: AccountStores::default(),
             memory_secrets: config.memory_secrets,
             resumed: std::collections::HashSet::new(),
+            unlinking: std::collections::HashMap::new(),
             settings: config.settings,
             clock: config.clock,
             commands_sent: std::sync::atomic::AtomicU64::new(0),
@@ -349,6 +359,16 @@ impl Core {
         for account in saved {
             self.register_account(account);
             self.resume_helper_account(account);
+        }
+        self.state
+            .apply_account_order(self.settings.account_order());
+    }
+
+    /// Keep the saved order of the sidebar complete after an account came
+    /// or went. With no saved order, the sidebar keeps the order of the build.
+    fn save_account_order(&mut self) {
+        if !self.settings.account_order().is_empty() {
+            self.settings.set_account_order(self.state.account_order());
         }
     }
 
@@ -471,6 +491,7 @@ impl Core {
             };
             self.register_account(next);
             self.settings.add_extra_account(next);
+            self.save_account_order();
             next
         };
         self.link_account(account);
@@ -496,6 +517,56 @@ impl Core {
             .remove(&account);
         self.resumed.remove(&account);
         self.settings.remove_extra_account(account);
+        self.save_account_order();
+    }
+
+    /// The user unlinks `account`. The adapter logs out and removes what
+    /// is saved. [`Self::finish_unlinks`] runs when the row leaves the
+    /// linked state.
+    fn unlink_account(&mut self, account: ProtocolId) {
+        if self.state.unlink_account(account) {
+            self.unlinking.insert(account, Instant::now());
+        }
+    }
+
+    /// End each unlink whose row left the linked state. The thinwire mutes
+    /// of the account go: the next account must not get them. An account
+    /// after account 0 leaves the sidebar and the settings, as Remove does.
+    /// Account 0 stays as a row that is not linked. When no other account
+    /// of its protocol is linked, the saved gate acceptance goes too, so
+    /// the next start does not start the helper by itself.
+    fn finish_unlinks(&mut self) {
+        self.unlinking
+            .retain(|_, since| since.elapsed() < UNLINK_WAIT);
+        let done: Vec<ProtocolId> = self
+            .unlinking
+            .keys()
+            .copied()
+            .filter(|account| !self.state.protocol_is_linked(*account))
+            .collect();
+        for account in done {
+            self.unlinking.remove(&account);
+            let last = !self.state.account_ids().into_iter().any(|other| {
+                other != account
+                    && other.same_protocol(account)
+                    && self.state.protocol_is_linked(other)
+            });
+            let forget_gate = account.slot() == 0 && last;
+            self.state.finish_unlink(account, forget_gate);
+            self.settings.forget_chat_mutes(account);
+            self.drop_held_topic_notices(account);
+            if forget_gate && account.is(ProtocolKind::WhatsApp) {
+                self.settings.set_whatsapp_gate_version(0);
+            }
+            if account.slot() != 0 {
+                // The adapter removed the saved session or token from the
+                // store of the account. Write that to the keychain before
+                // the store leaves the map: the flush of the pump does not
+                // see it after that.
+                self.store_of(account).spawn_os_flush(&self.runtime);
+                self.remove_account(account);
+            }
+        }
     }
 
     /// Resume the saved Telegram session of an account after account 0 once
@@ -650,6 +721,7 @@ impl Core {
                 applied = true;
             }
         }
+        self.finish_unlinks();
         for protocol in self.state.take_ended_accounts() {
             // The next account must not get these mutes (#153 review).
             self.settings.forget_chat_mutes(protocol);
@@ -869,6 +941,7 @@ impl Core {
             Intent::AddAccount(kind) => self.add_account(kind),
             Intent::LinkAccount(account) => self.link_account(account),
             Intent::RemoveAccount(account) => self.remove_account(account),
+            Intent::UnlinkAccount(account) => self.unlink_account(account),
             Intent::SelectRetainedSignal(slot) => self.state.select_retained_signal(slot),
             Intent::SelectConversation { id } => self.state.select_conversation(id),
             Intent::SelectTopic {
@@ -987,6 +1060,11 @@ impl Core {
                 }
             }
             Intent::SetRailCollapsed(collapsed) => self.settings.set_rail_collapsed(collapsed),
+            Intent::MoveAccount { account, up } => {
+                if self.state.move_account(account, up) {
+                    self.settings.set_account_order(self.state.account_order());
+                }
+            }
             Intent::SetSendTyping(on) => {
                 self.settings.set_send_typing(on);
                 if !on {
@@ -1729,6 +1807,225 @@ mod tests {
         core.dispatch(Intent::Shutdown);
         pump_until(&mut core, Core::stopped).await;
         assert!(core.state.stopped_contains(second));
+    }
+
+    /// A moved account keeps its place: in the view, in the settings, and
+    /// after a restart. An account at the end does not move past it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_moved_account_keeps_its_place_after_a_restart() {
+        let second = ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot");
+        let mut settings = temp_settings();
+        settings.add_extra_account(second);
+        let path_settings = settings.clone();
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        let shown = |core: &Core| -> Vec<ProtocolId> {
+            let view = core.view();
+            view.account_ids()
+                .into_iter()
+                .filter(|account| view.shows_in_switcher(*account))
+                .collect()
+        };
+        let before = shown(&core);
+        let at = before
+            .iter()
+            .position(|account| *account == second)
+            .expect("the second account shows");
+        assert!(at > 0, "account 0 of Telegram is before it");
+        core.dispatch(Intent::MoveAccount {
+            account: second,
+            up: true,
+        });
+        let after = shown(&core);
+        assert_eq!(after[at - 1], second);
+        assert_eq!(after[at], before[at - 1]);
+        assert_eq!(core.settings.account_order(), core.view().account_ids());
+
+        let first = after[0];
+        core.dispatch(Intent::MoveAccount {
+            account: first,
+            up: true,
+        });
+        assert_eq!(shown(&core), after, "the first account stays first");
+
+        let mut saved = path_settings;
+        saved.set_account_order(core.settings.account_order().to_vec());
+        let restarted = Core::new(
+            &Handle::current(),
+            CoreConfig::new(saved).with_memory_secrets(),
+        );
+        assert_eq!(shown(&restarted), after);
+    }
+
+    /// Unlink sends one command to the adapter of the account. The row
+    /// stays until the adapter reports the end. Then an account after
+    /// account 0 leaves the sidebar and the settings, and account 0 stays
+    /// as a row that is not linked. An account that is not linked gets no
+    /// command.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unlink_sends_the_command_and_ends_the_account() {
+        use thinwire_protocol::AccountState;
+        let first = ProtocolId::Telegram;
+        let second = ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot");
+        let mut settings = temp_settings();
+        settings.add_extra_account(second);
+        settings.set_chat_muted(second, "telegram:7", true);
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let link = |core: &mut Core, protocol, state| {
+            core.state.apply(AdapterEvent::Account { protocol, state });
+        };
+
+        core.dispatch(Intent::UnlinkAccount(second));
+        assert!(sent.try_recv().is_err(), "the account is not linked");
+
+        link(&mut core, first, AccountState::Linked);
+        link(&mut core, second, AccountState::Linked);
+        core.dispatch(Intent::UnlinkAccount(second));
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(AdapterCommand::Unlink { protocol: second })
+        );
+        core.pump();
+        assert!(
+            core.view().account_ids().contains(&second),
+            "the row stays until the adapter reports the end"
+        );
+        assert_eq!(core.settings.extra_accounts(), [second]);
+
+        link(&mut core, second, AccountState::Unlinked);
+        core.pump();
+        assert!(!core.view().account_ids().contains(&second));
+        assert!(core.settings.extra_accounts().is_empty());
+        assert!(!core.settings.chat_mutes().contains(second, "telegram:7"));
+        assert!(
+            !core
+                .account_stores
+                .lock()
+                .expect("stores")
+                .contains_key(&second)
+        );
+        let mut later = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            later.push(command);
+        }
+        assert!(
+            later.contains(&AdapterCommand::RemoveAccount { protocol: second }),
+            "{later:?}"
+        );
+        assert!(
+            core.state.protocol_is_linked(first),
+            "account 0 is not touched"
+        );
+
+        core.dispatch(Intent::UnlinkAccount(first));
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(AdapterCommand::Unlink { protocol: first })
+        );
+        link(&mut core, first, AccountState::Unlinked);
+        core.pump();
+        assert!(
+            core.view().account_ids().contains(&first),
+            "account 0 stays"
+        );
+        assert!(!core.state.protocol_is_linked(first));
+        while let Ok(command) = sent.try_recv() {
+            assert!(
+                !matches!(command, AdapterCommand::RemoveAccount { .. }),
+                "account 0 has no remove"
+            );
+        }
+    }
+
+    /// The unlink of account 0 drops the saved WhatsApp gate acceptance, so
+    /// the next start does not start the helper by itself. While another
+    /// WhatsApp account is linked, the acceptance stays: that account still
+    /// needs it at the next start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unlink_of_the_last_account_forgets_the_saved_gate() {
+        use thinwire_protocol::AccountState;
+        const SAVED: u64 = 7;
+        let first = ProtocolId::WhatsApp;
+        let second = ProtocolId::account(ProtocolKind::WhatsApp, 1).expect("slot");
+        let unlink_first = |core: &mut Core| {
+            core.state.apply(AdapterEvent::Account {
+                protocol: first,
+                state: AccountState::Linked,
+            });
+            core.dispatch(Intent::UnlinkAccount(first));
+            core.state.apply(AdapterEvent::Account {
+                protocol: first,
+                state: AccountState::Unlinked,
+            });
+            core.pump();
+        };
+
+        let mut settings = temp_settings();
+        settings.set_whatsapp_gate_version(SAVED);
+        settings.add_extra_account(second);
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        core.state.apply(AdapterEvent::Account {
+            protocol: second,
+            state: AccountState::Linked,
+        });
+        assert!(core.state.protocol_is_linked(second));
+        unlink_first(&mut core);
+        assert!(!core.state.protocol_is_linked(first));
+        assert_eq!(
+            core.settings.whatsapp_gate_version(),
+            SAVED,
+            "another linked account keeps the acceptance"
+        );
+
+        let mut settings = temp_settings();
+        settings.set_whatsapp_gate_version(SAVED);
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        unlink_first(&mut core);
+        assert_eq!(core.settings.whatsapp_gate_version(), 0);
+        assert!(
+            core.view().account_ids().contains(&first),
+            "account 0 stays"
+        );
+    }
+
+    /// The unlink of Signal account 0 drops the saved notice acceptance.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unlink_of_signal_forgets_the_saved_notice() {
+        use thinwire_protocol::AccountState;
+        let mut settings = temp_settings();
+        settings.set_signal_notice_version(crate::signal_notice::SIGNAL_NOTICE_VERSION);
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        core.state.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        core.pump();
+        assert_ne!(core.settings.signal_notice_version(), 0);
+        core.dispatch(Intent::UnlinkAccount(ProtocolId::Signal));
+        core.state.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        core.pump();
+        assert_eq!(core.settings.signal_notice_version(), 0);
+        assert!(!core.state.protocol_is_linked(ProtocolId::Signal));
     }
 
     /// Add account uses account 0 when it is free. With account 0 linked,

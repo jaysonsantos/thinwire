@@ -269,7 +269,7 @@ pub(crate) fn chat_message(
         reply_to: message
             .reply_to
             .map(|id| format!("{CONVERSATION_PREFIX}{id}")),
-        edited: false,
+        edited: message.edited,
     }
 }
 
@@ -325,6 +325,7 @@ mod tests {
                 image: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         );
         assert_eq!(row.sent_at, 1_700_000_000);
@@ -360,6 +361,7 @@ mod tests {
             image: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         assert_eq!(message_body(&row), "hello");
         row.content.clear();

@@ -219,6 +219,7 @@ fn message_summary(message: Message) -> MessageSummary {
         image,
         reactions,
         reply_to,
+        edited: message.edited_timestamp.is_some(),
     }
 }
 
@@ -394,6 +395,37 @@ impl DiscordApi for TwilightApi {
                 .await
                 .map_err(|_| DiscordApiError::Transport)?;
             Ok(message_summary(message))
+        })
+    }
+
+    fn edit_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        body: String,
+    ) -> ApiFuture<'_, MessageSummary> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .update_message(id(channel_id)?, id(message_id)?)
+                .content(Some(&body))
+                .await
+                .map_err(|e| map_error(&e))?;
+            let message = response
+                .model()
+                .await
+                .map_err(|_| DiscordApiError::Transport)?;
+            Ok(message_summary(message))
+        })
+    }
+
+    fn typing(&self, channel_id: u64) -> ApiFuture<'_, ()> {
+        Box::pin(async move {
+            self.client
+                .create_typing_trigger(id(channel_id)?)
+                .await
+                .map_err(|e| map_error(&e))?;
+            Ok(())
         })
     }
 

@@ -1,9 +1,11 @@
 //! In-app video (feature `video`, ADR 0015).
 //!
-//! One video plays at a time, over the whole window. Play, or a tap on the
-//! thumbnail, on a clip with no file asks the core for the download, and the
-//! clip starts when its path comes. Esc, Close, and a click outside the
-//! frame close the view.
+//! One video plays at a time. A video file plays over the whole window. A
+//! video message (`MessageVideo::is_note`) plays in its row, in the place of
+//! its thumbnail. Play, or a tap on the thumbnail, on a clip with no file
+//! asks the core for the download, and the clip starts when its path comes.
+//! Esc, Close, and a click outside the frame close the view over the
+//! window. A click on a video message pauses it, and Esc or Stop ends it.
 
 mod player;
 
@@ -32,6 +34,8 @@ enum Slot {
         key: VideoKey,
         player: VideoPlayer,
         texture: Option<egui::TextureHandle>,
+        /// The clip plays in its row, not over the window.
+        inline: bool,
     },
     Failed(VideoKey),
 }
@@ -99,10 +103,19 @@ impl VideoSlot {
         };
         let palette = theme::palette(ui);
         let mut press = tapped;
+        let mut stop = false;
         ui.push_id((conversation_id, message_id, "video"), |ui| {
             match &self.slot {
-                Slot::Playing { key: playing, .. } if *playing == key => {
-                    ui.label(RichText::new("Playing…").small().color(palette.text2));
+                Slot::Playing {
+                    key: playing,
+                    inline,
+                    ..
+                } if *playing == key => {
+                    if *inline {
+                        stop = small_button(ui, "Stop");
+                    } else {
+                        ui.label(RichText::new("Playing…").small().color(palette.text2));
+                    }
                     press = false;
                 }
                 Slot::Waiting(waiting) if *waiting == key => {
@@ -135,9 +148,61 @@ impl VideoSlot {
                 }
             }
         });
-        if press {
+        if stop {
+            self.slot = Slot::Idle;
+        } else if press {
             self.press(ui.ctx(), key, video, out);
         }
+    }
+
+    /// The frame of a video message that plays in its row. It has the place
+    /// and the size of the thumbnail, so the row does not move. A click
+    /// pauses the clip, plays it again, or starts it again after its end.
+    /// `false`: this row does not play, and the caller draws the thumbnail.
+    pub(crate) fn show_inline(
+        &mut self,
+        ui: &mut egui::Ui,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        video: &MessageVideo,
+    ) -> bool {
+        let Slot::Playing {
+            key,
+            player,
+            texture: Some(texture),
+            inline: true,
+        } = &mut self.slot
+        else {
+            return false;
+        };
+        if key.protocol != protocol
+            || key.conversation_id != conversation_id
+            || key.message_id != message_id
+        {
+            return false;
+        }
+        let size = match video.size() {
+            (0, _) | (_, 0) => {
+                let [width, height] = texture.size();
+                super::photos::photo_box(width as u32, height as u32)
+            }
+            (width, height) => super::photos::photo_box(width, height),
+        };
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        egui::Image::from_texture(&*texture)
+            .corner_radius(theme::radius::ROW)
+            .paint_at(ui, rect);
+        let state = player.poll();
+        let name = match state {
+            PlayState::Playing => "Pause video message",
+            PlayState::Paused | PlayState::Ended | PlayState::Failed => "Play video message",
+        };
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
+        if response.clicked() {
+            player.toggle();
+        }
+        true
     }
 
     /// The playing clip over the whole window. A waiting clip starts here
@@ -156,7 +221,10 @@ impl VideoSlot {
             }
         }
         let Slot::Playing {
-            player, texture, ..
+            player,
+            texture,
+            inline: false,
+            ..
         } = &mut self.slot
         else {
             return;
@@ -247,7 +315,7 @@ impl VideoSlot {
         out: &mut Vec<Intent>,
     ) {
         if let Some(path) = video.file() {
-            self.open(ctx, key, path.as_path());
+            self.open(ctx, key, path.as_path(), video.is_note());
             return;
         }
         out.push(Intent::PlayVideo {
@@ -266,7 +334,7 @@ impl VideoSlot {
             Slot::Waiting(waiting) if waiting == key => {
                 if let Some(path) = video.file() {
                     let path = path.as_path().to_path_buf();
-                    self.open(ctx, key.clone(), &path);
+                    self.open(ctx, key.clone(), &path, video.is_note());
                 } else if video.failed() {
                     self.slot = Slot::Failed(key.clone());
                 }
@@ -275,6 +343,7 @@ impl VideoSlot {
                 key: playing,
                 player,
                 texture,
+                ..
             } if playing == key => {
                 if let Some(frame) = player.take_frame() {
                     let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -300,13 +369,14 @@ impl VideoSlot {
         }
     }
 
-    fn open(&mut self, ctx: &egui::Context, key: VideoKey, path: &std::path::Path) {
+    fn open(&mut self, ctx: &egui::Context, key: VideoKey, path: &std::path::Path, inline: bool) {
         let repaint = ctx.clone();
         self.slot = match VideoPlayer::open(path, move || repaint.request_repaint()) {
             Ok(player) => Slot::Playing {
                 key,
                 player,
                 texture: None,
+                inline,
             },
             Err(_) => {
                 tracing::warn!("a video could not start");
@@ -410,5 +480,72 @@ mod tests {
         );
         slot.sync(&[row(None)]);
         assert!(matches!(slot.slot, Slot::Idle), "the clip left the chat");
+    }
+
+    /// A video message that plays has its frame in its row. Another row,
+    /// and a video file, keep the thumbnail: a video file plays over the
+    /// window.
+    #[test]
+    fn a_video_message_plays_in_its_row() {
+        let dir = std::env::temp_dir()
+            .join("thinwire-video-tests")
+            .join(format!("{}-inline", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("clip.mp4");
+        std::fs::write(&path, include_bytes!("fixtures/clip.mp4")).expect("write");
+        let note = MessageVideo::new(1, 64, 36, 31, None)
+            .expect("clip")
+            .into_note();
+        let ctx = egui::Context::default();
+        let mut slot = VideoSlot::default();
+        let drawn = |slot: &mut VideoSlot, message_id: &str| {
+            let mut drawn = false;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    drawn =
+                        slot.show_inline(ui, ProtocolId::Telegram, "telegram:1", message_id, &note);
+                });
+            });
+            output.textures_delta.clear();
+            drawn
+        };
+        assert!(!drawn(&mut slot, "telegram:1:5"), "nothing plays");
+
+        for inline in [true, false] {
+            slot.slot = Slot::Playing {
+                key: key(),
+                player: VideoPlayer::open_with(&path, Some("fakesink"), || {})
+                    .expect("the clip starts"),
+                texture: None,
+                inline,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline
+                && !matches!(
+                    &slot.slot,
+                    Slot::Playing {
+                        texture: Some(_),
+                        ..
+                    }
+                )
+            {
+                slot.advance(&ctx, &key(), &note);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                matches!(
+                    &slot.slot,
+                    Slot::Playing {
+                        texture: Some(_),
+                        ..
+                    }
+                ),
+                "a frame came"
+            );
+            assert_eq!(drawn(&mut slot, "telegram:1:5"), inline);
+            assert!(!drawn(&mut slot, "telegram:1:6"), "another row");
+        }
+        slot.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

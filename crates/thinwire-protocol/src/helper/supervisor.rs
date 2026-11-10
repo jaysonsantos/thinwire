@@ -325,7 +325,9 @@ impl Replay {
         match command {
             WireCommand::AcknowledgeGate => self.acknowledged = true,
             WireCommand::BeginLink { generation, .. } => self.link = Some(*generation),
-            WireCommand::CancelLink | WireCommand::Disconnect => *self = Self::default(),
+            WireCommand::CancelLink | WireCommand::Disconnect | WireCommand::Unlink => {
+                *self = Self::default();
+            }
             _ => {}
         }
     }
@@ -587,7 +589,10 @@ impl Supervisor {
             return;
         };
         if !link.greeted {
-            if matches!(command, WireCommand::CancelLink | WireCommand::Disconnect) {
+            if matches!(
+                command,
+                WireCommand::CancelLink | WireCommand::Disconnect | WireCommand::Unlink
+            ) {
                 // The user gave the pairing up before the helper got it.
                 // The pairing start, with its phone, must not cross the
                 // pipe at all. The cancel still goes, for its answer.
@@ -712,6 +717,11 @@ impl Supervisor {
                 emit_account(events, protocol, AccountState::Unlinked);
                 self.send_idle_status();
             }
+            // Only a helper can delete the session store. The account stays
+            // as it is, and the user tries again when the helper runs.
+            WireCommand::Unlink => {
+                emit_command_failed(events, protocol, None, self.unlink_needs_helper());
+            }
             WireCommand::ViewChat { .. } => {}
             WireCommand::DeleteMessage {
                 conversation_id, ..
@@ -748,6 +758,14 @@ impl Supervisor {
                 });
             }
         }
+    }
+
+    /// Why an unlink did nothing: no helper runs, so nothing was deleted.
+    fn unlink_needs_helper(&self) -> String {
+        format!(
+            "The {} helper does not run, so thinwire did not unlink the account. Start the helper again, then unlink.",
+            self.protocol
+        )
     }
 
     fn send_idle_status(&self) {
@@ -1050,7 +1068,10 @@ impl Supervisor {
         let last = unsent.iter().rev().find(|command| {
             matches!(
                 command,
-                WireCommand::BeginLink { .. } | WireCommand::CancelLink | WireCommand::Disconnect
+                WireCommand::BeginLink { .. }
+                    | WireCommand::CancelLink
+                    | WireCommand::Disconnect
+                    | WireCommand::Unlink
             )
         });
         if let Some(command @ WireCommand::BeginLink { generation, .. }) = last {

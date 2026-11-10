@@ -558,6 +558,14 @@ pub enum AdapterCommand {
     Disconnect {
         protocol: ProtocolId,
     },
+    /// The user unlinks this account: log out where the protocol has a log
+    /// out, then remove the saved session or the saved token. The adapter
+    /// answers with `Account { Unlinked }`, or with `CommandFailed` when it
+    /// cannot unlink now. `Disconnect` is different: it keeps what is saved.
+    /// No secret is a field of this command.
+    Unlink {
+        protocol: ProtocolId,
+    },
     ConnectDiscord {
         mode: DiscordAuthMode,
     },
@@ -791,6 +799,7 @@ impl AdapterCommand {
         match *self {
             Self::Connect { protocol }
             | Self::Disconnect { protocol }
+            | Self::Unlink { protocol }
             | Self::LoadChats { protocol }
             | Self::OpenChat { protocol, .. }
             | Self::OpenTopic { protocol, .. }
@@ -861,6 +870,7 @@ impl AdapterCommand {
         match self {
             Self::Connect { protocol }
             | Self::Disconnect { protocol }
+            | Self::Unlink { protocol }
             | Self::LoadChats { protocol }
             | Self::OpenChat { protocol, .. }
             | Self::OpenTopic { protocol, .. }

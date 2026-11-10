@@ -323,6 +323,29 @@ impl WhatsAppAdapter {
 }
 
 impl WhatsAppAdapter {
+    /// The user unlinks the account. The link owner logs the device out,
+    /// stops the client, deletes the device store and the chat cache, and
+    /// sends `Unlinked`. With no owner, no client ran in this process and
+    /// no session is open: the row only leaves the linked state.
+    fn unlink(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        self.risk_acknowledged = false;
+        if let Some(link) = &self.link {
+            link.unlink();
+            return Ok(());
+        }
+        for event in self.session.reset() {
+            let _ = events.send(event);
+        }
+        let _ = events.send(session::account(AccountState::Unlinked));
+        emit_status(
+            events,
+            ProtocolId::WhatsApp,
+            AdapterStatus::Stubbed,
+            link::UNLINKED,
+        );
+        Ok(())
+    }
+
     /// `Stopped` means that no WhatsApp client runs (#44). The owner stops
     /// the client after any start in progress, and the wait has its own bound
     /// below the app close limit. If that bound runs out, the client may
@@ -1029,6 +1052,9 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 protocol: ProtocolId::WhatsApp,
             }
             | AdapterCommand::WhatsAppCancelLink => self.cancel_link(events),
+            AdapterCommand::Unlink {
+                protocol: ProtocolId::WhatsApp,
+            } => self.unlink(events),
             AdapterCommand::WhatsAppAcknowledgeRisk => self.acknowledge(events),
             AdapterCommand::WhatsAppBeginLink { generation } => self.begin_link(generation, events),
             AdapterCommand::RetryStoreKey {

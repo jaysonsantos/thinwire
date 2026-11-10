@@ -132,10 +132,16 @@ pub struct Settings {
     /// The accounts after account 0 of each protocol (ADR 0014), in the
     /// order the user added them.
     extra_accounts: Vec<thinwire_protocol::ProtocolId>,
+    /// The accounts in the order of the sidebar, after the user moved one.
+    /// Empty: the order of the build.
+    account_order: Vec<thinwire_protocol::ProtocolId>,
 }
 
 /// Settings key of the accounts after account 0.
 const ACCOUNTS_KEY: &str = "accounts";
+
+/// Settings key of the order of the accounts in the sidebar.
+const ACCOUNT_ORDER_KEY: &str = "account_order";
 
 /// Settings key of the collapsed account sidebar.
 const RAIL_COLLAPSED_KEY: &str = "rail_collapsed";
@@ -178,7 +184,8 @@ impl Settings {
         let signal_helper = read_path(&path, SIGNAL_HELPER_KEY);
         let signal_notice_version = read_u64(&path, SIGNAL_NOTICE_VERSION_KEY).unwrap_or(0);
         let whatsapp_gate_version = read_u64(&path, WHATSAPP_GATE_VERSION_KEY).unwrap_or(0);
-        let extra_accounts = read_accounts(&path);
+        let extra_accounts = read_accounts(&path, ACCOUNTS_KEY, false);
+        let account_order = read_accounts(&path, ACCOUNT_ORDER_KEY, true);
         Self {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
@@ -198,6 +205,7 @@ impl Settings {
             signal_notice_version,
             whatsapp_gate_version,
             extra_accounts,
+            account_order,
         }
     }
 
@@ -224,6 +232,7 @@ impl Settings {
             signal_notice_version: 0,
             whatsapp_gate_version: 0,
             extra_accounts: Vec::new(),
+            account_order: Vec::new(),
         }
     }
 
@@ -247,6 +256,21 @@ impl Settings {
     #[must_use]
     pub fn extra_accounts(&self) -> &[thinwire_protocol::ProtocolId] {
         &self.extra_accounts
+    }
+
+    /// The accounts in the order of the sidebar. Empty: the user moved no
+    /// account, and the sidebar has the order of the build.
+    #[must_use]
+    pub fn account_order(&self) -> &[thinwire_protocol::ProtocolId] {
+        &self.account_order
+    }
+
+    /// Remember the order of the sidebar. Disk persist is queued.
+    pub fn set_account_order(&mut self, order: Vec<thinwire_protocol::ProtocolId>) {
+        if self.account_order != order {
+            self.account_order = order;
+            self.persist_pending = true;
+        }
     }
 
     /// Remember one more account. Account 0 and a known account change
@@ -474,6 +498,14 @@ impl Settings {
                 .collect();
             text.push_str(&format!("{ACCOUNTS_KEY} = \"{}\"\n", keys.join(",")));
         }
+        if !self.account_order.is_empty() {
+            let keys: Vec<String> = self
+                .account_order
+                .iter()
+                .map(|account| account.key())
+                .collect();
+            text.push_str(&format!("{ACCOUNT_ORDER_KEY} = \"{}\"\n", keys.join(",")));
+        }
         // Keep the helper paths of the user when another setting changes.
         for (key, path) in [
             (WHATSAPP_HELPER_KEY, &self.whatsapp_helper),
@@ -511,20 +543,26 @@ fn read_u64(path: &std::path::Path, wanted: &str) -> Option<u64> {
 
 /// The `accounts = "telegram#1,whatsapp#2"` line. A name that is not an
 /// account after account 0 is skipped.
-fn read_accounts(path: &std::path::Path) -> Vec<thinwire_protocol::ProtocolId> {
+/// The account names of the line `wanted`. A bad name and a repeat are
+/// skipped. `first_accounts`: account 0 of a protocol is a valid name.
+fn read_accounts(
+    path: &std::path::Path,
+    wanted: &str,
+    first_accounts: bool,
+) -> Vec<thinwire_protocol::ProtocolId> {
     let Ok(contents) = fs::read_to_string(path) else {
         return Vec::new();
     };
     let Some(value) = contents.lines().find_map(|line| {
         let (key, value) = line.trim().split_once('=')?;
-        (key.trim() == ACCOUNTS_KEY).then(|| value.trim().trim_matches('"').to_owned())
+        (key.trim() == wanted).then(|| value.trim().trim_matches('"').to_owned())
     }) else {
         return Vec::new();
     };
     let mut accounts = Vec::new();
     for name in value.split(',') {
         if let Some(account) = thinwire_protocol::ProtocolId::from_key(name.trim())
-            && account.slot() > 0
+            && (first_accounts || account.slot() > 0)
             && !accounts.contains(&account)
         {
             accounts.push(account);
@@ -732,6 +770,27 @@ mod tests {
             "the helper path still reads"
         );
         assert_eq!(Settings::in_memory().signal_notice_version(), 0);
+    }
+
+    /// The order of the sidebar persists. Account 0 is a valid name there.
+    #[test]
+    fn the_account_order_persists() {
+        use thinwire_protocol::{ProtocolId, ProtocolKind};
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.account_order().is_empty());
+        let second = ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot");
+        let order = vec![ProtocolId::WhatsApp, second, ProtocolId::Telegram];
+        settings.set_account_order(order.clone());
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("account_order = \"whatsapp,telegram#1,telegram\""),
+            "{text}"
+        );
+        let loaded = Settings::load_from(path);
+        assert_eq!(loaded.account_order(), order);
+        assert!(loaded.extra_accounts().is_empty(), "another key");
     }
 
     /// The accounts after account 0 persist in their order. A bad name is
