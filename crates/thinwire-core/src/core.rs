@@ -993,6 +993,7 @@ impl Core {
                     self.state.stop_typing(Instant::now());
                 }
             }
+            Intent::SetPersonColors(on) => self.settings.set_person_colors(on),
             Intent::SetChatMute {
                 protocol,
                 conversation_id,

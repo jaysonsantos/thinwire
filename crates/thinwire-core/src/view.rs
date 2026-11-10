@@ -60,6 +60,12 @@ impl View<'_> {
         self.settings.rail_collapsed()
     }
 
+    /// Settings choice: each other person of a chat has a bubble color.
+    #[must_use]
+    pub fn person_colors(&self) -> bool {
+        self.settings.person_colors()
+    }
+
     /// Settings switch: the other people of a chat see when the user types.
     #[must_use]
     pub fn send_typing(&self) -> bool {

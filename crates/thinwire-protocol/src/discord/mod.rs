@@ -23,13 +23,19 @@ mod token;
 
 /// The folder of the audio files of the player. Every Discord account uses
 /// it: a file name is the handle of one message. A test writes in the temp
-/// folder, never in the cache folder of the user.
+/// folder, never in the cache folder of the user. Each test thread has its
+/// own folder: the tests of one process run at the same time, and the start
+/// of one adapter must not delete the file that another test writes (#542).
 #[cfg(any(test, feature = "discord-bot"))]
 fn voice_dir() -> Result<std::path::PathBuf, ()> {
     if cfg!(test) {
         return Ok(std::env::temp_dir()
             .join("thinwire-discord-voice-tests")
-            .join(std::process::id().to_string()));
+            .join(format!(
+                "{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            )));
     }
     dirs::cache_dir()
         .map(|dir| dir.join("thinwire").join("discord").join("voice"))

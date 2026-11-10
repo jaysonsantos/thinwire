@@ -105,6 +105,9 @@ pub struct Settings {
     rail_collapsed: bool,
     /// Tell the other people of a chat when the user types (#510). Default on.
     send_typing: bool,
+    /// Each other person of a chat has a bubble color (#581). Default off:
+    /// one color for the user and one for the other people.
+    person_colors: bool,
     path: PathBuf,
     persist_pending: bool,
     persist_epoch: u64,
@@ -139,6 +142,9 @@ const RAIL_COLLAPSED_KEY: &str = "rail_collapsed";
 
 /// Settings key of the outgoing typing state.
 const SEND_TYPING_KEY: &str = "send_typing";
+
+/// Settings key of the bubble color for each person.
+const PERSON_COLORS_KEY: &str = "person_colors";
 
 /// Settings key of the WhatsApp helper path.
 const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
@@ -179,6 +185,7 @@ impl Settings {
             notification_preview: read_bool(&path, "notification_preview").unwrap_or(true),
             rail_collapsed: read_bool(&path, RAIL_COLLAPSED_KEY).unwrap_or(false),
             send_typing: read_bool(&path, SEND_TYPING_KEY).unwrap_or(true),
+            person_colors: read_bool(&path, PERSON_COLORS_KEY).unwrap_or(false),
             path,
             persist_pending: false,
             persist_epoch: 0,
@@ -204,6 +211,7 @@ impl Settings {
             notification_preview: true,
             rail_collapsed: false,
             send_typing: true,
+            person_colors: false,
             path: PathBuf::new(),
             persist_pending: false,
             persist_epoch: 0,
@@ -343,6 +351,21 @@ impl Settings {
         }
     }
 
+    /// Each other person of a chat has a bubble color.
+    #[must_use]
+    pub const fn person_colors(&self) -> bool {
+        self.person_colors
+    }
+
+    /// One bubble color for each person, or one for all other people. Disk
+    /// persist is queued.
+    pub fn set_person_colors(&mut self, on: bool) {
+        if self.person_colors != on {
+            self.person_colors = on;
+            self.persist_pending = true;
+        }
+    }
+
     /// The account sidebar shows only the account icons.
     #[must_use]
     pub const fn rail_collapsed(&self) -> bool {
@@ -427,6 +450,9 @@ impl Settings {
         }
         if !self.send_typing {
             text.push_str(&format!("{SEND_TYPING_KEY} = false\n"));
+        }
+        if self.person_colors {
+            text.push_str(&format!("{PERSON_COLORS_KEY} = true\n"));
         }
         if self.signal_notice_version != 0 {
             text.push_str(&format!(
@@ -786,6 +812,25 @@ mod tests {
             Settings::load_from(path).notifications(),
             "a bad value is on"
         );
+    }
+
+    #[test]
+    fn the_person_colors_switch_persists_and_defaults_off() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(!settings.person_colors());
+        settings.set_person_colors(true);
+        settings.persist_now().expect("save");
+        assert!(Settings::load_from(path.clone()).person_colors());
+        settings.set_person_colors(false);
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains(PERSON_COLORS_KEY),
+            "the default writes no key"
+        );
+        assert!(!Settings::load_from(path).person_colors());
+        assert!(!Settings::in_memory().person_colors());
     }
 
     #[test]

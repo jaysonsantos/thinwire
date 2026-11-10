@@ -86,6 +86,8 @@ pub enum Scenario {
     LongChatStartOfChat,
     /// A group chat with sender names and a day break.
     GroupChat,
+    /// The same group chat with one bubble color for each person (#581).
+    PersonColors,
     /// A send that failed: a failed row with Retry, and the error.
     FailedSend,
     /// A send with no answer yet: a pending row.
@@ -139,13 +141,14 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
         Self::LongChatLoadingOlder,
         Self::LongChatStartOfChat,
         Self::GroupChat,
+        Self::PersonColors,
         Self::FailedSend,
         Self::PendingSend,
         Self::LoginPhone,
@@ -180,6 +183,7 @@ impl Scenario {
             Self::LongChatLoadingOlder => "long_chat_loading_older",
             Self::LongChatStartOfChat => "long_chat_start_of_chat",
             Self::GroupChat => "group_chat",
+            Self::PersonColors => "person_colors",
             Self::FailedSend => "failed_send",
             Self::PendingSend => "pending_send",
             Self::LoginPhone => "login_phone",
@@ -277,6 +281,9 @@ impl Scenario {
                 setup.intents.extend([select(ADA), older(ADA)]);
             }
             Self::GroupChat => setup.intents.push(select(BOOK_CLUB)),
+            Self::PersonColors => setup
+                .intents
+                .extend([Intent::SetPersonColors(true), select(BOOK_CLUB)]),
             Self::FailedSend => {
                 telegram.send = DemoSend::Reject;
                 setup.intents.extend(send(ADA, "See you at 6?"));
@@ -1154,6 +1161,11 @@ mod tests {
                 }
                 Scenario::GroupChat => {
                     assert_eq!(view.selected_messages().len(), 8, "{name}");
+                    assert!(!view.person_colors(), "{name}");
+                }
+                Scenario::PersonColors => {
+                    assert_eq!(view.selected_messages().len(), 8, "{name}");
+                    assert!(view.person_colors(), "{name}");
                 }
                 Scenario::Showcase => {
                     let messages = view.selected_messages();

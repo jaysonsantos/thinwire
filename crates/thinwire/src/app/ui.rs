@@ -498,6 +498,15 @@ fn typing_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>)
     if ui.checkbox(&mut on, "Show others when I type").changed() {
         out.push(Intent::SetSendTyping(on));
     }
+    // The bubble colors of the other people (#581).
+    ui.label(RichText::new("Message colors").small());
+    let mut each = snapshot.person_colors();
+    let before = each;
+    ui.radio_value(&mut each, false, "Me and others");
+    ui.radio_value(&mut each, true, "One color for each person");
+    if each != before {
+        out.push(Intent::SetPersonColors(each));
+    }
 }
 
 fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
@@ -2572,6 +2581,8 @@ fn thread(
         ViewNow::Local(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
         ViewNow::Fixed(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
     };
+    // A one-to-one chat has one other person, so it keeps the one color.
+    let person_colors = is_group && snapshot.person_colors();
     let actions = snapshot.message_actions(snapshot.selected_protocol);
     let selection = snapshot.selected_for_forward();
     let selecting = !selection.is_empty();
@@ -2590,6 +2601,7 @@ fn thread(
             protocol: message.protocol,
             conversation_id: &message.conversation_id,
             outbound: message.outbound,
+            person_colors,
             sender: &message.sender,
             body: &message.body,
             links: &message.links,
@@ -3062,6 +3074,8 @@ struct Bubble<'a> {
     protocol: ProtocolId,
     conversation_id: &'a str,
     outbound: bool,
+    /// Each other person has a bubble color (#581).
+    person_colors: bool,
     sender: &'a str,
     body: &'a str,
     links: &'a [MessageLink],
@@ -3566,7 +3580,11 @@ fn bubble(
         )
     } else {
         (
-            palette.surface,
+            if message.person_colors {
+                theme::person_fill(message.sender, ui.visuals().dark_mode)
+            } else {
+                palette.surface
+            },
             palette.text,
             MetaInk {
                 time: palette.text3,

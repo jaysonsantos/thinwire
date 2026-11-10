@@ -279,10 +279,53 @@ pub(crate) const fn avatar_ink(accent: u8, dark: bool) -> AvatarInk {
 /// 4.5:1 on the inbound bubble in both themes.
 #[must_use]
 pub(crate) fn sender_ink(sender: &str, dark: bool) -> Color32 {
-    let sum = sender.bytes().fold(0_u32, |sum, byte| {
-        sum.wrapping_mul(31).wrapping_add(u32::from(byte))
+    avatar_ink(sender_index(sender) as u8, dark).text
+}
+
+/// Bubble fill of each other person when "One color for each person" is on
+/// (#581). One fill for each [`avatar_ink`] pair, in the same order, so the
+/// name of a sender and their bubble have the same hue. Each fill keeps every
+/// ink of an inbound bubble at 4.5:1.
+const LIGHT_PERSON: [Color32; 7] = [
+    hex(0xFA_E2_E4),
+    hex(0xFA_E4_D0),
+    hex(0xEB_E4_FA),
+    hex(0xD5_EE_D5),
+    hex(0xCF_ED_EF),
+    hex(0xDD_E8_FA),
+    hex(0xFA_E1_EB),
+];
+
+const DARK_PERSON: [Color32; 7] = [
+    hex(0x4B_2A_31),
+    hex(0x42_30_22),
+    hex(0x37_2F_4D),
+    hex(0x21_38_2F),
+    hex(0x1E_37_3D),
+    hex(0x22_34_52),
+    hex(0x4C_28_3C),
+];
+
+/// Palette index of a sender. The same name always gives the same index, in
+/// each chat and after a restart. The hash is FNV-1a: it spreads short names
+/// better than a sum, so fewer people of one chat share a color.
+fn sender_index(sender: &str) -> usize {
+    let hash = sender.bytes().fold(0x811C_9DC5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
-    avatar_ink((sum % 7) as u8, dark).text
+    (hash % 7) as usize
+}
+
+/// Bubble fill of a sender when each person has a color (#581). It goes
+/// with [`sender_ink`]: the same sender has the same hue in both.
+#[must_use]
+pub(crate) fn person_fill(sender: &str, dark: bool) -> Color32 {
+    let index = sender_index(sender);
+    if dark {
+        DARK_PERSON[index]
+    } else {
+        LIGHT_PERSON[index]
+    }
 }
 
 /// Ink for a disabled "Muted in {protocol}" control (#206).
@@ -856,6 +899,63 @@ mod tests {
             assert_eq!(ink.on, palette.bg, "{theme} menu fill");
             for (part, color) in [("title", ink.title), ("reason", ink.reason)] {
                 let ratio = contrast(color, ink.on);
+                assert!(ratio >= TEXT_AA, "{theme} {part}: {ratio:.2} < {TEXT_AA}");
+            }
+        }
+    }
+
+    /// #581: a sender keeps one fill, and every ink of an inbound bubble
+    /// stays readable on each fill.
+    #[test]
+    fn a_person_keeps_one_fill_and_every_bubble_ink_is_readable_on_it() {
+        for (theme, dark, palette) in [
+            ("dark", true, Palette::DARK),
+            ("light", false, Palette::LIGHT),
+        ] {
+            assert_eq!(person_fill("Nora", dark), person_fill("Nora", dark));
+            let fills = if dark { DARK_PERSON } else { LIGHT_PERSON };
+            for (index, fill) in fills.into_iter().enumerate() {
+                let inks = [
+                    ("text", palette.text),
+                    ("quote", palette.text2),
+                    ("time", palette.text3),
+                    ("action", palette.accent),
+                    ("link", palette.link),
+                    ("error", palette.error),
+                    ("name", avatar_ink(index as u8, dark).text),
+                ];
+                for (part, ink) in inks {
+                    let ratio = contrast(ink, fill);
+                    assert!(
+                        ratio >= TEXT_AA,
+                        "{theme} person {index} {part}: {ratio:.2} < {TEXT_AA}"
+                    );
+                }
+            }
+            let senders = ["Nora", "Milo", "Ada"].map(|sender| person_fill(sender, dark));
+            assert_ne!(senders[0], senders[1], "{theme}");
+            assert_ne!(senders[1], senders[2], "{theme}");
+            assert_ne!(senders[0], senders[2], "{theme}");
+        }
+    }
+
+    /// #580: the text of each bubble is readable on its fill, and the two
+    /// fills are different.
+    #[test]
+    fn own_and_other_bubbles_have_different_fills_with_readable_text() {
+        for (theme, palette) in [("dark", Palette::DARK), ("light", Palette::LIGHT)] {
+            assert_ne!(palette.out, palette.surface, "{theme}");
+            for (part, ink, fill) in [
+                ("own text", palette.on_out, palette.out),
+                ("own time", palette.out_meta, palette.out),
+                ("own link", palette.out_link, palette.out),
+                ("own error", palette.out_error, palette.out),
+                ("other text", palette.text, palette.surface),
+                ("other quote", palette.text2, palette.surface),
+                ("other time", palette.text3, palette.surface),
+                ("other link", palette.link, palette.surface),
+            ] {
+                let ratio = contrast(ink, fill);
                 assert!(ratio >= TEXT_AA, "{theme} {part}: {ratio:.2} < {TEXT_AA}");
             }
         }

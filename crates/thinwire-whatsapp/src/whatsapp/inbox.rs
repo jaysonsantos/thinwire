@@ -20,6 +20,9 @@ pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
 
 /// Messages kept per chat. Older ones drop off the front.
 pub(super) const MESSAGES_PER_CHAT: usize = 200;
+/// Rows of a chat after the user fetched an older page. It bounds the memory
+/// and the rewrite of `inbox.sqlite` (#539).
+pub(super) const FETCHED_MESSAGES_PER_CHAT: usize = 2000;
 
 /// Handled ids kept per chat. Past this, the older half goes, oldest first
 /// (#158 review).
@@ -835,8 +838,9 @@ impl Inbox {
         self.upsert_event(jid)
     }
 
+    /// The groups with no name, the newest activity first.
     pub(super) fn unnamed_groups(&self) -> Vec<String> {
-        let mut jids: Vec<String> = self
+        let mut groups: Vec<(i64, String)> = self
             .chats
             .iter()
             .filter(|(jid, record)| {
@@ -846,10 +850,12 @@ impl Inbox {
                         .as_deref()
                         .is_none_or(|name| name.trim().is_empty())
             })
-            .map(|(jid, _)| jid.clone())
+            .map(|(jid, record)| (record.timestamp, jid.clone()))
             .collect();
-        jids.sort();
-        jids
+        // The newest chats first: the caller asks for a fixed number of
+        // names, and these are the groups the user sees (#539).
+        groups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        groups.into_iter().map(|(_, jid)| jid).collect()
     }
 
     /// The audio of the message with the handle `file_id`, while the
@@ -989,7 +995,9 @@ impl Inbox {
                 if record.counts_after_read(&message) {
                     added = added.saturating_add(1);
                 }
-                insert_message(&mut record.messages, record.keeps_older, message);
+                if insert_message(&mut record.messages, record.keeps_older, message) {
+                    record.history_ended = false;
+                }
             }
             // The user reads the open chat, so a later chunk keeps it read.
             // A chat read here changes its count only by new messages (#98):
@@ -1101,13 +1109,22 @@ impl Inbox {
         }
         let record = self.chats.entry(jid.to_string()).or_default();
         record.keeps_older = true;
+        // A row older than the cache shows that the chat did not end where
+        // the phone said earlier. The caller marks the end of this page
+        // after this call.
+        let oldest = record.messages.first().map(|row| row.timestamp);
+        if oldest.is_some_and(|oldest| messages.iter().any(|row| row.timestamp < oldest)) {
+            record.history_ended = false;
+        }
         for message in messages {
             if message.id.is_empty() {
                 continue;
             }
             record.optimistic.remove(&message.id);
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(&mut record.messages, record.keeps_older, message);
+            if insert_message(&mut record.messages, record.keeps_older, message) {
+                record.history_ended = false;
+            }
         }
     }
 
@@ -1152,7 +1169,9 @@ impl Inbox {
                 record.unread = record.unread.saturating_add(1);
             }
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(&mut record.messages, record.keeps_older, message.clone());
+            if insert_message(&mut record.messages, record.keeps_older, message.clone()) {
+                record.history_ended = false;
+            }
             if is_open {
                 record.mark_read();
             }
@@ -1328,7 +1347,9 @@ impl Inbox {
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
-        insert_message(&mut record.messages, record.keeps_older, message.clone());
+        if insert_message(&mut record.messages, record.keeps_older, message.clone()) {
+            record.history_ended = false;
+        }
         (
             pending,
             AdapterEvent::MessageReceived {
@@ -2034,7 +2055,17 @@ fn remember_name(names: &mut HashMap<String, String>, message: &WaMessage) {
     }
 }
 
-fn insert_message(messages: &mut Vec<WaMessage>, keeps_older: bool, mut message: WaMessage) {
+/// Put `message` in its place by time. `true`: the cap dropped an older row,
+/// so the cache does not start at the first message of the chat.
+///
+/// A chat with a fetched older page (`keeps_older`) keeps
+/// [`FETCHED_MESSAGES_PER_CHAT`] rows, and the other chats keep
+/// [`MESSAGES_PER_CHAT`]. The oldest rows go first: the phone has them.
+fn insert_message(
+    messages: &mut Vec<WaMessage>,
+    keeps_older: bool,
+    mut message: WaMessage,
+) -> bool {
     if let Some(existing) = messages.iter_mut().find(|row| row.id == message.id) {
         // A refresh with no reactions keeps the reactions the cache counted.
         if message.reactions.is_empty() {
@@ -2045,10 +2076,13 @@ fn insert_message(messages: &mut Vec<WaMessage>, keeps_older: bool, mut message:
         messages.push(message);
     }
     messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    if keeps_older {
-        return;
-    }
-    let mut excess = messages.len().saturating_sub(MESSAGES_PER_CHAT);
+    let cap = if keeps_older {
+        FETCHED_MESSAGES_PER_CHAT
+    } else {
+        MESSAGES_PER_CHAT
+    };
+    let before = messages.len();
+    let mut excess = before.saturating_sub(cap);
     if excess > 0 {
         messages.retain(|row| {
             if excess == 0 || row.id.starts_with(PENDING_PREFIX) {
@@ -2058,6 +2092,7 @@ fn insert_message(messages: &mut Vec<WaMessage>, keeps_older: bool, mut message:
             false
         });
     }
+    messages.len() < before
 }
 
 fn preview(body: &str) -> String {
@@ -3687,6 +3722,79 @@ pub(super) mod tests {
         assert!(
             !record.messages.iter().any(|row| row.id == "m0000"),
             "the oldest history row is evicted"
+        );
+    }
+
+    fn history_of(jid: &str, timestamp: i64, messages: Vec<WaMessage>) -> HistoryChat {
+        HistoryChat {
+            mute: Default::default(),
+            jid: jid.into(),
+            name: None,
+            unread: 0,
+            timestamp,
+            messages,
+        }
+    }
+
+    /// A chat with fetched pages has a larger cap, not no cap. The oldest
+    /// rows go, and the chat does not say "Start of chat" (#539).
+    #[test]
+    fn fetched_pages_stop_at_their_cap_and_the_end_mark_goes() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let row = |n: usize| {
+            message(
+                chat,
+                &format!("f{n:05}"),
+                "page",
+                i64::try_from(n).expect("small"),
+            )
+        };
+        inbox.apply_history(vec![history_of(chat, 5_000, vec![row(5_000)])], Vec::new());
+        inbox.apply_fetched(chat, (0..FETCHED_MESSAGES_PER_CHAT - 1).map(row).collect());
+        inbox.mark_history_ended(chat);
+        assert_eq!(inbox.chats[chat].messages.len(), FETCHED_MESSAGES_PER_CHAT);
+        assert!(inbox.chats[chat].history_ended);
+
+        inbox.apply_messages(vec![message(chat, "live", "now", 6_000)]);
+        let record = &inbox.chats[chat];
+        assert_eq!(record.messages.len(), FETCHED_MESSAGES_PER_CHAT);
+        assert_eq!(record.messages[0].id, "f00001", "the oldest row went");
+        assert!(!record.history_ended, "the phone has an older row again");
+    }
+
+    /// An end mark does not stay when a later page brings older rows (#539).
+    #[test]
+    fn an_older_fetched_page_clears_the_end_mark() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_history(
+            vec![history_of(chat, 100, vec![message(chat, "new", "hi", 100)])],
+            Vec::new(),
+        );
+        inbox.mark_history_ended(chat);
+        inbox.apply_fetched(chat, vec![message(chat, "same", "hi", 100)]);
+        assert!(inbox.chats[chat].history_ended, "no older row");
+        inbox.apply_fetched(chat, vec![message(chat, "old", "hi", 50)]);
+        assert!(!inbox.chats[chat].history_ended);
+    }
+
+    /// The groups the user sees first are asked for a name first (#539).
+    #[test]
+    fn unnamed_groups_come_newest_first() {
+        let mut inbox = Inbox::default();
+        inbox.apply_history(
+            vec![
+                history_of("1@g.us", 10, Vec::new()),
+                history_of("2@g.us", 30, Vec::new()),
+                history_of("3@g.us", 30, Vec::new()),
+                history_of("4@g.us", 20, Vec::new()),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            inbox.unnamed_groups(),
+            ["2@g.us", "3@g.us", "4@g.us", "1@g.us"]
         );
     }
 

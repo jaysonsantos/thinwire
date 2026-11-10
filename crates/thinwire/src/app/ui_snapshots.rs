@@ -179,6 +179,7 @@ shots! {
     long_chat => LongChat,
     long_chat_loading_older => LongChatLoadingOlder,
     group_chat => GroupChat,
+    person_colors => PersonColors,
     failed_send => FailedSend,
     login_phone => LoginPhone,
     login_code => LoginCode,

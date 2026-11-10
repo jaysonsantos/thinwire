@@ -120,6 +120,9 @@ pub enum Intent {
     /// (#510). Off also stops a typing state that still shows. Disk I/O
     /// runs off the caller thread.
     SetSendTyping(bool),
+    /// Settings: one bubble color for each other person of a chat (#581),
+    /// or one color for all of them. Disk I/O runs off the caller thread.
+    SetPersonColors(bool),
     /// Mute or unmute one chat in thinwire (#153). A protocol mute wins:
     /// an unmute here never unmutes it. Disk I/O runs off the caller thread.
     SetChatMute {
