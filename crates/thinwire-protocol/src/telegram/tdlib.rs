@@ -3349,18 +3349,47 @@ async fn send_media(
                 if !accepted {
                     rejected();
                 }
+                let reason = media_send_failure(&error);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
                     AdapterStatus::Error,
-                    format!(
-                        "Telegram did not send the photos or videos (TDLib {}).",
-                        error.code
-                    ),
+                    reason.clone(),
+                );
+                // The error block of the window names the reason too: the
+                // status line of the account is easy to miss.
+                crate::adapter::emit_command_failed(
+                    events,
+                    ProtocolId::Telegram,
+                    Some(conversation_id.to_owned()),
+                    &reason,
                 );
                 return;
             }
         }
+    }
+}
+
+/// Longest TDLib error text that the window shows.
+const SHOWN_ERROR_CHARS: usize = 120;
+
+/// Why TDLib refused a send of photos or videos, for the user. The text of
+/// TDLib shows when it is short and has no file path. The code always shows.
+fn media_send_failure(error: &tdlib_rs::types::Error) -> String {
+    let text = error.message.trim();
+    let shown = !text.is_empty()
+        && text.chars().count() <= SHOWN_ERROR_CHARS
+        && !text.contains(['/', '\\']);
+    if shown {
+        format!(
+            "Telegram did not send the photos or videos: {text} (TDLib {}).",
+            error.code
+        )
+    } else {
+        format!(
+            "Telegram did not send the photos or videos (TDLib {}).",
+            error.code
+        )
     }
 }
 
@@ -4721,5 +4750,29 @@ mod tests {
             typing_target("telegram:42", Some(too_big)).is_none(),
             "never the whole chat in place of the topic"
         );
+    }
+
+    /// The reason of a refused media send shows the text of TDLib, but
+    /// never a file path.
+    #[test]
+    fn a_refused_media_send_names_its_reason_without_a_path() {
+        let error = |message: &str| tdlib_rs::types::Error {
+            code: 400,
+            message: message.into(),
+        };
+        assert_eq!(
+            media_send_failure(&error("PHOTO_INVALID_DIMENSIONS")),
+            "Telegram did not send the photos or videos: PHOTO_INVALID_DIMENSIONS (TDLib 400)."
+        );
+        for hidden in [
+            "",
+            "File \"/Users/ada/cat.png\" is too big",
+            &"x".repeat(200),
+        ] {
+            assert_eq!(
+                media_send_failure(&error(hidden)),
+                "Telegram did not send the photos or videos (TDLib 400)."
+            );
+        }
     }
 }

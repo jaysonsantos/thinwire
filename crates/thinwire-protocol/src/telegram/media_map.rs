@@ -116,6 +116,22 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
         // voice note is `MessageExpiredVoiceNote` and stays on the label arm.
         tdlib_rs::enums::MessageContent::MessageVoiceNote(note) => map_voice(note),
         tdlib_rs::enums::MessageContent::MessageDocument(message) => map_document(message),
+        tdlib_rs::enums::MessageContent::MessageCall(call) => label(&call_label(call)),
+        tdlib_rs::enums::MessageContent::MessageLocation(_) => label("Location"),
+        tdlib_rs::enums::MessageContent::MessageContact(message) => {
+            let contact = &message.contact;
+            let name = format!("{} {}", contact.first_name, contact.last_name);
+            match name.trim() {
+                "" => label("Contact"),
+                name => label(&format!("Contact: {name}")),
+            }
+        }
+        tdlib_rs::enums::MessageContent::MessagePoll(message) => {
+            match message.poll.question.text.trim() {
+                "" => label("Poll"),
+                question => label(&format!("Poll: {question}")),
+            }
+        }
         _ => label("Message"),
     }
 }
@@ -236,6 +252,20 @@ fn sticker_box(width: u32, height: u32, sizes: &[PhotoSize]) -> (u32, u32) {
         u32::try_from(scaled).unwrap_or(STICKER_SIDE).max(1)
     };
     (scale(width), scale(height))
+}
+
+/// A call in a one-to-one chat: its kind, how it ended, and its length.
+fn call_label(call: &tdlib_rs::types::MessageCall) -> String {
+    use tdlib_rs::enums::CallDiscardReason;
+    let kind = if call.is_video { "Video call" } else { "Call" };
+    match call.discard_reason {
+        CallDiscardReason::Missed => format!("{kind}, not answered"),
+        CallDiscardReason::Declined => format!("{kind}, declined"),
+        _ if call.duration > 0 => {
+            format!("{kind}, {}:{:02}", call.duration / 60, call.duration % 60)
+        }
+        _ => kind.to_owned(),
+    }
 }
 
 /// A dice message: its emoji and the value. The value is zero until the
@@ -930,5 +960,31 @@ mod tests {
         assert_eq!(file.name(), "notes.txt");
         assert_eq!(file.file_id(), 12);
         assert_eq!(file.kind_label(), "TXT");
+    }
+
+    /// A call is not "Message": the row says what it was.
+    #[test]
+    fn a_call_has_a_label_with_its_end_and_length() {
+        use tdlib_rs::enums::CallDiscardReason;
+        let call = |is_video, discard_reason, duration| {
+            map_content(&tdlib_rs::enums::MessageContent::MessageCall(
+                tdlib_rs::types::MessageCall {
+                    is_video,
+                    discard_reason,
+                    duration,
+                },
+            ))
+            .text
+        };
+        assert_eq!(call(false, CallDiscardReason::HungUp, 75), "Call, 1:15");
+        assert_eq!(
+            call(true, CallDiscardReason::Missed, 0),
+            "Video call, not answered"
+        );
+        assert_eq!(
+            call(false, CallDiscardReason::Declined, 0),
+            "Call, declined"
+        );
+        assert_eq!(call(false, CallDiscardReason::Empty, 0), "Call");
     }
 }
