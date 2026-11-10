@@ -1,7 +1,11 @@
 //! Underlined links in a message, and the confirm step when the label hides
 //! the address.
 //!
-//! Opening a link happens off the UI thread. The address is not logged.
+//! The confirm dialog shows the link text, the real host, and the full
+//! address, so the user sees what the text said and where it goes.
+//!
+//! Opening a link happens off the UI thread. The address and the link text
+//! are not logged.
 //! [`open_url`] checks the scheme again. A blocked scheme is plain text.
 //! `http` and `https` go through `webbrowser` with its `hardened` feature.
 //! `mailto` goes to the OS handler as one argument.
@@ -19,6 +23,8 @@ use thinwire_protocol::{MessageLink, openable_url};
 #[derive(Clone)]
 struct PendingLink {
     url: String,
+    /// The text of the link in the message. The dialog shows it, and no log has it.
+    label: String,
     /// Open button from the last frame. Enter activates it only when it has focus.
     open_id: Option<egui::Id>,
 }
@@ -210,10 +216,11 @@ pub(crate) fn layout_job(
     job
 }
 
-pub(crate) fn remember_confirm(ctx: &egui::Context, url: &str) {
+/// Keep `url` and its link text `label` for the confirm dialog.
+pub(crate) fn remember_confirm(ctx: &egui::Context, url: &str, label: &str) {
     let same = ctx
         .data(|data| data.get_temp::<PendingLink>(confirm_id()))
-        .is_some_and(|pending| pending.url == url);
+        .is_some_and(|pending| pending.url == url && pending.label == label);
     if same {
         return;
     }
@@ -222,6 +229,7 @@ pub(crate) fn remember_confirm(ctx: &egui::Context, url: &str) {
             confirm_id(),
             PendingLink {
                 url: url.to_owned(),
+                label: label.to_owned(),
                 open_id: None,
             },
         );
@@ -308,12 +316,40 @@ fn open_button_label(url: &str) -> String {
     }
 }
 
+/// Most characters of the link text that the dialog shows.
+const LABEL_MAX_CHARS: usize = 80;
+
+/// The link text as the dialog shows it: in quotes, on one line, and cut
+/// with `…` after [`LABEL_MAX_CHARS`] characters.
+fn shown_label(label: &str) -> String {
+    let line = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let shown = if line.chars().count() > LABEL_MAX_CHARS {
+        let mut cut: String = line.chars().take(LABEL_MAX_CHARS - 1).collect();
+        cut.push('…');
+        cut
+    } else {
+        line
+    };
+    format!("\u{201c}{shown}\u{201d}")
+}
+
+/// A plain label whose accessible name is its text, also where AT-SPI reads
+/// the value. The text is never a link.
+fn dialog_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let text = text.into();
+    let name = text.text().to_owned();
+    let response = ui.add(egui::Label::new(text));
+    super::a11y::name_label(ui.ctx(), response.id, &name);
+    response
+}
+
 /// Semibold is the bold weight of the UI font.
 fn host_font() -> egui::FontId {
     egui::FontId::new(super::theme::size::BODY, super::theme::semibold())
 }
 
-/// The confirm dialog. It shows the real host and does not log the address.
+/// The confirm dialog. It shows the link text, the real host, and the full
+/// address. It does not log the address or the link text.
 pub(crate) fn confirm(ui: &mut egui::Ui) {
     let Some(pending) = ui
         .ctx()
@@ -322,6 +358,8 @@ pub(crate) fn confirm(ui: &mut egui::Ui) {
         return;
     };
     let url = pending.url.clone();
+    let label = pending.label.clone();
+    let shown = shown_label(&label);
     let host = confirm_host(&url);
     let open_label = open_button_label(&url);
     let screen = ui.ctx().content_rect();
@@ -340,15 +378,25 @@ pub(crate) fn confirm(ui: &mut egui::Ui) {
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ui.ctx(), |ui| {
                     ui.set_max_width(420.0);
-                    ui.label("This link text does not match the address.");
-                    if let Some(host) = &host {
-                        ui.label(
-                            egui::RichText::new(host)
-                                .font(host_font())
-                                .color(super::theme::palette(ui).text),
-                        );
-                    }
-                    ui.label(url.as_str());
+                    dialog_label(ui, "The link text is not the address that opens.");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        dialog_label(ui, "Link text:");
+                        let response = ui.add(egui::Label::new(shown.as_str()).truncate());
+                        super::a11y::name_label(ui.ctx(), response.id, &shown);
+                    });
+                    ui.horizontal(|ui| {
+                        dialog_label(ui, "Opens:");
+                        if let Some(host) = &host {
+                            dialog_label(
+                                ui,
+                                egui::RichText::new(host)
+                                    .font(host_font())
+                                    .color(super::theme::palette(ui).text),
+                            );
+                        }
+                    });
+                    dialog_label(ui, url.as_str());
                     ui.horizontal(|ui| {
                         let open_button = ui.button(&open_label);
                         open_id = Some(open_button.id);
@@ -387,6 +435,7 @@ pub(crate) fn confirm(ui: &mut egui::Ui) {
                 confirm_id(),
                 PendingLink {
                     url,
+                    label,
                     open_id: Some(id),
                 },
             );
@@ -435,7 +484,7 @@ pub(crate) fn interact(
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
         if needs_confirm(label, url) {
-            remember_confirm(ui.ctx(), url);
+            remember_confirm(ui.ctx(), url, label);
         } else {
             open_url(url);
         }
@@ -742,7 +791,7 @@ mod tests {
             Some("xn--pple-43d.com")
         );
 
-        let show = |target: &'static str| {
+        let show = |target: &'static str, label: &'static str| {
             let remember = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let fonts = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             Harness::builder()
@@ -762,14 +811,24 @@ mod tests {
                     }
                     // One shot. A later frame must not open the dialog again after Cancel.
                     if !remember.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        remember_confirm(ui.ctx(), target);
+                        remember_confirm(ui.ctx(), target, label);
                     }
                     confirm(ui);
                 })
         };
-        let mut harness = show(target);
+        let mut harness = show(target, label);
         harness.run();
+        harness.get_by_label("The link text is not the address that opens.");
+        harness.get_by_label("Link text:");
+        let text = harness.get_by_label("\u{201c}https://apple.com/account\u{201d}");
+        assert_eq!(
+            text.accesskit_node().value().as_deref(),
+            Some("\u{201c}https://apple.com/account\u{201d}"),
+            "AT-SPI reads the link text"
+        );
+        harness.get_by_label("Opens:");
         harness.get_by_label("xn--pple-43d.com");
+        harness.get_by_label(target);
         harness.get_by_role_and_label(Role::Button, "Open xn--pple-43d.com");
         let cancel = harness.get_by_role_and_label(Role::Button, "Cancel");
         assert!(
@@ -783,12 +842,54 @@ mod tests {
         assert!(harness.query_by_label("Cancel").is_none());
         OPENED.with(|opened| assert!(opened.borrow().is_empty(), "Enter cancels"));
 
-        let mut harness = show(target);
+        let mut harness = show(target, label);
         harness.run();
         harness.key_press(egui::Key::Escape);
         harness.step();
         assert!(harness.query_by_label("Cancel").is_none());
         OPENED.with(|opened| assert!(opened.borrow().is_empty(), "Escape cancels"));
+
+        // Words that point at a post: the dialog shows the words and the host.
+        let post = "https://x.com/poteto/status/2119521036660314339";
+        assert!(needs_confirm("read the thread", post));
+        let mut harness = show(post, "read the thread");
+        harness.run();
+        harness.get_by_label("\u{201c}read the thread\u{201d}");
+        harness.get_by_label("x.com");
+        harness.get_by_label(post);
+        harness.get_by_role_and_label(Role::Button, "Open x.com");
+    }
+
+    #[test]
+    fn the_pending_link_keeps_the_link_text_for_the_dialog() {
+        let ctx = egui::Context::default();
+        remember_confirm(&ctx, "https://x.com/poteto/status/1", "read this thread");
+        let pending = ctx
+            .data(|data| data.get_temp::<PendingLink>(confirm_id()))
+            .expect("pending link");
+        assert_eq!(pending.url, "https://x.com/poteto/status/1");
+        assert_eq!(pending.label, "read this thread");
+        // The same address with another text replaces the text.
+        remember_confirm(&ctx, "https://x.com/poteto/status/1", "x.com");
+        let pending = ctx
+            .data(|data| data.get_temp::<PendingLink>(confirm_id()))
+            .expect("pending link");
+        assert_eq!(pending.label, "x.com");
+    }
+
+    #[test]
+    fn the_dialog_shows_the_link_text_quoted_on_one_line_and_cut() {
+        assert_eq!(shown_label("read this"), "\u{201c}read this\u{201d}");
+        assert_eq!(shown_label(" two\nlines "), "\u{201c}two lines\u{201d}");
+        let long = "a".repeat(LABEL_MAX_CHARS + 5);
+        let shown = shown_label(&long);
+        let inner = shown
+            .trim_start_matches('\u{201c}')
+            .trim_end_matches('\u{201d}');
+        assert_eq!(inner.chars().count(), LABEL_MAX_CHARS);
+        assert!(inner.ends_with('…'));
+        let exact = "é".repeat(LABEL_MAX_CHARS);
+        assert_eq!(shown_label(&exact), format!("\u{201c}{exact}\u{201d}"));
     }
 
     #[test]
