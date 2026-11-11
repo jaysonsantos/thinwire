@@ -58,7 +58,8 @@ fn window_icon() -> egui::IconData {
 /// `slack_morphism` logs the one-time Socket Mode URL. Presage and libsignal
 /// log the provisioning URL. A more specific `RUST_LOG` directive wins over
 /// `slack_morphism=off` on an `EnvFilter`, so this layer drops those targets
-/// on its own.
+/// on its own. `mac_usernotifications` logs the path of a notification
+/// picture.
 fn init_tracing() {
     use tracing_subscriber::filter::FilterExt;
     let layer = tracing_subscriber::fmt::layer()
@@ -73,6 +74,7 @@ fn quiet_log_filter()
         !target.starts_with("slack_morphism")
             && !target.starts_with("presage")
             && !target.starts_with("libsignal")
+            && !target.starts_with("mac_usernotifications")
     })
 }
 

@@ -8078,6 +8078,7 @@ dependencies = [
  "notify-rust",
  "objc2-foundation 0.3.2",
  "thinwire-core",
+ "thinwire-protocol",
  "tracing",
  "windows",
  "windows-registry 0.100.0",

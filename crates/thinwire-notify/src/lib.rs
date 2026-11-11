@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 pub use pipe::{INBOX_LIMIT, MAX_DISMISS_TRIES, MAX_FAILURES_IN_A_ROW, RETRY_AFTER, RETRY_MAX};
 pub use thinwire_core::notify::{Notification, NotifyCommand, NotifyKey};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod badge;
 #[cfg(target_os = "macos")]
 mod macos;
 mod pipe;

@@ -120,7 +120,19 @@ impl TagService for Center {
                 return Ok(());
             }
         }
-        let handle = match block_on(request.send()) {
+        // The picture at the side of the text: the thinwire mark with the
+        // tile of the protocol. macOS moves the file into its own store,
+        // so each request has a new file.
+        let picture = crate::badge::fresh_file(notification.key.protocol);
+        if let Some(picture) = &picture {
+            request = request.image_path(picture.to_string_lossy());
+        }
+        let sent = block_on(request.send());
+        // macOS took the file. If it did not, the file does not stay.
+        if let Some(picture) = picture {
+            let _ = std::fs::remove_file(picture);
+        }
+        let handle = match sent {
             Ok(handle) => handle,
             Err(_) if not_allowed() => return Ok(()),
             Err(_) => return Err(BackendError("show")),

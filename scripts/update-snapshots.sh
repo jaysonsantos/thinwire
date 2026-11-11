@@ -14,6 +14,6 @@ UPDATE_SNAPSHOTS=1 cargo test -p thinwire --features ui-snapshots ui_snapshots -
 # a recompressed image still passes. oxipng leaves a file alone when it cannot
 # make it smaller, so a second run changes nothing. The `.old.png` backups that
 # kittest keeps, and the `.new.png` and `.diff.png` of a failed run, stay out.
-find crates/thinwire/tests/snapshots -name '*.png' \
+find crates/thinwire/tests/snapshots crates/thinwire-notify/assets -name '*.png' \
     ! -name '*.old.png' ! -name '*.new.png' ! -name '*.diff.png' -print0 |
     xargs -0 oxipng --opt 4 --strip safe --quiet

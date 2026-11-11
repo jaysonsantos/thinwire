@@ -913,3 +913,138 @@ mod signal_removed {
         shoot(ThemeMode::Dark, [1100.0, 720.0]);
     }
 }
+
+/// The pictures of a desktop notification: the thinwire mark with the tile
+/// of the protocol in its corner. `thinwire-notify` has no egui, so it
+/// ships these files (`crates/thinwire-notify/assets/`). This test makes
+/// them and keeps them equal to the painters of the sidebar.
+mod notify_badge {
+    use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+    use egui_kittest::{Harness, SnapshotOptions};
+    use thinwire_protocol::{ProtocolId, ProtocolKind};
+
+    use super::super::{icons, motion, theme};
+
+    /// Side of a picture, in pixels.
+    const SIDE: f32 = 256.0;
+    /// The body of `assets/icon.svg`: the gradient, and the square that
+    /// holds it on the 1024 grid.
+    const BODY_TOP: Color32 = Color32::from_rgb(0x6A, 0xA6, 0xFF);
+    const BODY_BOTTOM: Color32 = Color32::from_rgb(0x1F, 0x5B, 0xDB);
+    const SVG_ORIGIN: f32 = 100.0;
+    const SVG_SIDE: f32 = 824.0;
+    /// The "t" is smaller than in the app icon and sits up and left, so
+    /// the protocol tile has the bottom right corner.
+    const MARK_SCALE: f32 = 0.74;
+    const MARK_SHIFT: f32 = -30.0;
+    const TILE_SIDE: f32 = 112.0;
+    const TILE_MARGIN: f32 = 12.0;
+    const TILE_RING: f32 = 7.0;
+
+    /// A point of `icon.svg` on the picture.
+    fn at(x: f32, y: f32) -> Pos2 {
+        let full = |v: f32| (v - SVG_ORIGIN) / SVG_SIDE * SIDE;
+        let small = |v: f32| (full(v) - SIDE / 2.0) * MARK_SCALE + SIDE / 2.0 + MARK_SHIFT;
+        Pos2::new(small(x), small(y))
+    }
+
+    /// A stroke with round ends, as `stroke-linecap="round"` of the SVG.
+    fn round_line(painter: &egui::Painter, points: Vec<Pos2>, svg_width: f32) {
+        let width = svg_width / SVG_SIDE * SIDE * MARK_SCALE;
+        for end in [points[0], points[points.len() - 1]] {
+            painter.circle_filled(end, width / 2.0, Color32::WHITE);
+        }
+        painter.add(egui::Shape::line(
+            points,
+            Stroke::new(width, Color32::WHITE),
+        ));
+    }
+
+    fn draw(ui: &mut egui::Ui, protocol: &mut ProtocolId) {
+        let painter = ui.painter();
+        let full = Rect::from_min_size(Pos2::ZERO, Vec2::splat(SIDE));
+        // One pixel over each edge: the picture has no soft border.
+        icons::gradient_tile(painter, full.expand(1.0), 0.0, BODY_TOP, BODY_BOTTOM);
+
+        // The stem, its curve (a quadratic with the corner as control
+        // point), and the foot. Then the bar.
+        let mut stem = vec![at(482.0, 280.0), at(482.0, 610.0)];
+        for step in 1..=12 {
+            let t = step as f32 / 12.0;
+            let x = (1.0 - t).powi(2) * 482.0 + 2.0 * (1.0 - t) * t * 482.0 + t * t * 602.0;
+            let y = (1.0 - t).powi(2) * 610.0 + 2.0 * (1.0 - t) * t * 730.0 + t * t * 730.0;
+            stem.push(at(x, y));
+        }
+        stem.push(at(660.0, 730.0));
+        round_line(painter, stem, 120.0);
+        round_line(painter, vec![at(362.0, 430.0), at(640.0, 430.0)], 110.0);
+
+        let corner = SIDE - TILE_MARGIN;
+        let tile = Rect::from_min_max(
+            Pos2::new(corner - TILE_SIDE, corner - TILE_SIDE),
+            Pos2::new(corner, corner),
+        );
+        let ink = theme::protocol_tile(*protocol);
+        let radius = TILE_SIDE * 0.28;
+        painter.rect_filled(
+            tile.expand(TILE_RING),
+            egui::CornerRadius::same((radius + TILE_RING) as u8),
+            // The ring has the color of the body at that height, so the
+            // tile looks cut out of the "t".
+            motion::mix(BODY_TOP, BODY_BOTTOM, tile.center().y / SIDE),
+        );
+        icons::gradient_tile(painter, tile, radius, ink.top, ink.bottom);
+        icons::protocol(
+            painter,
+            tile.center(),
+            TILE_SIDE * 0.6,
+            *protocol,
+            ink.mark,
+            motion::mix(ink.top, ink.bottom, 0.5),
+        );
+    }
+
+    fn shoot(kind: ProtocolKind, name: &str) {
+        let mut harness = Harness::builder()
+            .with_size([SIDE, SIDE])
+            .wgpu()
+            .build_ui_state(
+                |ui, protocol| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| draw(ui, protocol));
+                },
+                ProtocolId::primary(kind),
+            );
+        harness.run();
+        harness.snapshot_options(
+            name,
+            &SnapshotOptions::new().output_path("../thinwire-notify/assets"),
+        );
+    }
+
+    #[test]
+    fn telegram() {
+        shoot(ProtocolKind::Telegram, "badge-telegram");
+    }
+
+    #[test]
+    fn whatsapp() {
+        shoot(ProtocolKind::WhatsApp, "badge-whatsapp");
+    }
+
+    #[test]
+    fn signal() {
+        shoot(ProtocolKind::Signal, "badge-signal");
+    }
+
+    #[test]
+    fn discord() {
+        shoot(ProtocolKind::Discord, "badge-discord");
+    }
+
+    #[test]
+    fn slack() {
+        shoot(ProtocolKind::Slack, "badge-slack");
+    }
+}
