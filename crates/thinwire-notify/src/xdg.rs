@@ -293,7 +293,7 @@ fn message_for(notification: &Notification, replaces: u32) -> notify_rust::Notif
     if replaces != NEW_NOTIFICATION {
         message.id(replaces);
     }
-    if let Some(picture) = crate::badge::shared_file(notification.key.protocol) {
+    if let Some(picture) = crate::badge::slot_file(notification) {
         message.image_path(&picture.to_string_lossy());
     }
     message
@@ -867,6 +867,7 @@ mod tests {
             sender: None,
             preview: "hi".into(),
             count: 1,
+            avatar: Default::default(),
         }
     }
 

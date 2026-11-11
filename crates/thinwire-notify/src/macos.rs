@@ -120,10 +120,10 @@ impl TagService for Center {
                 return Ok(());
             }
         }
-        // The picture at the side of the text: the thinwire mark with the
-        // tile of the protocol. macOS moves the file into its own store,
-        // so each request has a new file.
-        let picture = crate::badge::fresh_file(notification.key.protocol);
+        // The picture at the side of the text: the picture of the chat
+        // with the tile of the protocol. macOS moves the file into its own
+        // store, so each request has a new file.
+        let picture = crate::badge::fresh_file(notification);
         if let Some(picture) = &picture {
             request = request.image_path(picture.to_string_lossy());
         }

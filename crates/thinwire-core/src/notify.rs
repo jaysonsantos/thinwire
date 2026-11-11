@@ -8,7 +8,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use thinwire_protocol::{Arrival, ChatMessage, Conversation, ProtocolId, topic_mute_id};
+use thinwire_protocol::{
+    Arrival, ChatAvatar, ChatMessage, Conversation, ProtocolId, topic_mute_id,
+};
 
 use crate::mutes::ChatMute;
 
@@ -48,6 +50,9 @@ pub struct Notification {
     pub preview: String,
     /// New messages in this chat since the user looked at it.
     pub count: u32,
+    /// The picture of the chat, for the picture of the notification. Its
+    /// `Debug` prints no path and no bytes.
+    pub avatar: ChatAvatar,
 }
 
 impl Notification {
@@ -273,6 +278,7 @@ impl Notifications {
                 HIDDEN_PREVIEW.into()
             },
             count,
+            avatar: chat.avatar.clone(),
         };
         self.pending.insert(
             key,

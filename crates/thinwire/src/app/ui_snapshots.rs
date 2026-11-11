@@ -961,7 +961,12 @@ mod notify_badge {
     }
 
     fn draw(ui: &mut egui::Ui, protocol: &mut ProtocolId) {
-        let painter = ui.painter();
+        // The whole picture: the margin of the root panel clips the
+        // painter of `ui`, and a layer painter has no such clip.
+        let painter = &ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("notify_picture"),
+        ));
         let full = Rect::from_min_size(Pos2::ZERO, Vec2::splat(SIDE));
         // One pixel over each edge: the picture has no soft border.
         icons::gradient_tile(painter, full.expand(1.0), 0.0, BODY_TOP, BODY_BOTTOM);
@@ -1004,12 +1009,43 @@ mod notify_badge {
         );
     }
 
-    fn shoot(kind: ProtocolKind, name: &str) {
+    /// Side of the picture of a tile alone, in pixels.
+    const ALONE_SIDE: f32 = 96.0;
+
+    /// The tile of a protocol over the whole picture, with square corners.
+    /// `thinwire-notify` cuts the round corners and puts the tile on the
+    /// picture of a chat.
+    fn draw_tile(ui: &mut egui::Ui, protocol: &mut ProtocolId) {
+        // The whole picture: the margin of the root panel clips the
+        // painter of `ui`, and a layer painter has no such clip.
+        let painter = &ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("notify_picture"),
+        ));
+        let full = Rect::from_min_size(Pos2::ZERO, Vec2::splat(ALONE_SIDE));
+        let ink = theme::protocol_tile(*protocol);
+        icons::gradient_tile(painter, full.expand(1.0), 0.0, ink.top, ink.bottom);
+        icons::protocol(
+            painter,
+            full.center(),
+            ALONE_SIDE * 0.6,
+            *protocol,
+            ink.mark,
+            motion::mix(ink.top, ink.bottom, 0.5),
+        );
+    }
+
+    fn shoot_one(
+        kind: ProtocolKind,
+        name: &str,
+        side: f32,
+        draw: fn(&mut egui::Ui, &mut ProtocolId),
+    ) {
         let mut harness = Harness::builder()
-            .with_size([SIDE, SIDE])
+            .with_size([side, side])
             .wgpu()
             .build_ui_state(
-                |ui, protocol| {
+                move |ui, protocol| {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ui, |ui| draw(ui, protocol));
@@ -1023,28 +1059,32 @@ mod notify_badge {
         );
     }
 
-    #[test]
-    fn telegram() {
-        shoot(ProtocolKind::Telegram, "badge-telegram");
+    /// The mark with the tile, and the tile alone, of each protocol.
+    macro_rules! pictures {
+        ($($kind:ident => $name:ident),+ $(,)?) => {$(
+            mod $name {
+                use super::*;
+
+                #[test]
+                fn badge() {
+                    let name = concat!("badge-", stringify!($name));
+                    shoot_one(ProtocolKind::$kind, name, SIDE, draw);
+                }
+
+                #[test]
+                fn tile() {
+                    let name = concat!("tile-", stringify!($name));
+                    shoot_one(ProtocolKind::$kind, name, ALONE_SIDE, draw_tile);
+                }
+            }
+        )+};
     }
 
-    #[test]
-    fn whatsapp() {
-        shoot(ProtocolKind::WhatsApp, "badge-whatsapp");
-    }
-
-    #[test]
-    fn signal() {
-        shoot(ProtocolKind::Signal, "badge-signal");
-    }
-
-    #[test]
-    fn discord() {
-        shoot(ProtocolKind::Discord, "badge-discord");
-    }
-
-    #[test]
-    fn slack() {
-        shoot(ProtocolKind::Slack, "badge-slack");
+    pictures! {
+        Telegram => telegram,
+        WhatsApp => whatsapp,
+        Signal => signal,
+        Discord => discord,
+        Slack => slack,
     }
 }

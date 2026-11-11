@@ -177,6 +177,7 @@ mod tests {
             sender: None,
             preview: "hi".into(),
             count,
+            avatar: Default::default(),
         }
     }
 

@@ -170,6 +170,7 @@ mod tests {
                 sender: None,
                 preview: "hi".into(),
                 count: 2,
+                avatar: Default::default(),
             };
             content(&notification, true)
                 .and_then(|doc| ToastNotification::CreateToastNotification(&doc))
