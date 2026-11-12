@@ -20,6 +20,7 @@ pub mod instance;
 mod intent;
 pub mod mutes;
 pub mod notify;
+mod paging;
 mod secret_text;
 pub mod secrets;
 #[cfg(all(feature = "keychain-security-cli", target_os = "macos"))]

@@ -16,6 +16,7 @@ use thinwire_protocol::{
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
+use crate::paging::{Paging, StorePage};
 use crate::secrets::{SecretKey, SecretStore};
 use crate::sends::{Pending, SendTracker};
 
@@ -172,24 +173,6 @@ pub fn unreadable_messages_line(skipped: u32) -> String {
     }
 }
 
-fn push_unreadable(runs: &mut Vec<UnreadableRun>, before_id: Option<String>, skipped: u32) {
-    if skipped == 0 {
-        return;
-    }
-    if let Some(run) = runs.iter_mut().find(|run| run.before_id == before_id) {
-        run.skipped = run.skipped.saturating_add(skipped);
-        return;
-    }
-    runs.push(UnreadableRun { before_id, skipped });
-}
-
-/// Skips not drawn yet. Empty pages add to it until a page shows rows or
-/// the store ends.
-struct OpenUnreadable {
-    before_id: Option<String>,
-    skipped: u32,
-}
-
 /// What the thread shows for the selected chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
@@ -322,7 +305,7 @@ pub const OLDER_RETRY_DELAY: Duration = Duration::from_secs(2);
 pub const OLDER_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Wait before try `tries + 1` of an anchor that brought nothing `tries` times.
-fn older_wait(tries: u32) -> Duration {
+pub(crate) fn older_wait(tries: u32) -> Duration {
     OLDER_RETRY_DELAY
         .saturating_mul(1 << tries.saturating_sub(1).min(16))
         .min(OLDER_RETRY_MAX)
@@ -588,9 +571,6 @@ struct RejectedBody {
 /// One thread: protocol, chat, and topic. `None` is a chat with no topic.
 type OlderPageKey = (ProtocolId, String, Option<MessageTopic>);
 
-/// An older page that brought nothing new: the anchor, when, and how many times.
-type OlderRetry = (String, Instant, u32);
-
 /// The side of a pane in the split view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitSide {
@@ -763,31 +743,13 @@ pub struct Snapshot {
     /// test holds in every feature build (qa on #111).
     #[cfg(any(test, feature = "test-support"))]
     hidden_for_test: HashSet<ProtocolId>,
-    /// Threads with a request for older messages in flight (#30), keyed by
-    /// protocol, chat, and topic. `None` is a chat with no topic. One request
-    /// at a time for each thread.
-    older_loading: HashSet<OlderPageKey>,
+    /// The older-page state of each thread (#30): requests in flight, the
+    /// loaded start, the wait of an anchor, the failure note, the unreadable
+    /// runs, and the store cursors.
+    paging: Paging,
     /// Protocols whose chat-list load a reconnect ended. `Linked` loads the
     /// list again (#163).
     list_on_link: HashSet<ProtocolId>,
-    /// Threads whose start is loaded. No more older requests (#30).
-    older_at_start: HashSet<OlderPageKey>,
-    /// Threads whose last older request brought nothing older: the anchor it
-    /// used and when it ended. That anchor waits `OLDER_RETRY_DELAY` (#61
-    /// review).
-    older_retry: HashMap<OlderPageKey, OlderRetry>,
-    /// Threads whose last older page did not load. A later success clears
-    /// that thread. The thread shows plain text only (#57).
-    older_note: HashSet<OlderPageKey>,
-    /// Closed runs of unreadable stored rows, oldest request first.
-    unreadable: HashMap<OlderPageKey, Vec<UnreadableRun>>,
-    /// A run that is still loading. Empty pages add to it.
-    open_unreadable: HashMap<OlderPageKey, OpenUnreadable>,
-    /// The next older read of this thread starts at this store timestamp.
-    history_resume: HashMap<OlderPageKey, u64>,
-    /// The store timestamp last sent for this thread. The next cursor must
-    /// be older, so a stuck cursor cannot loop.
-    history_asked: HashMap<OlderPageKey, u64>,
     /// Scroll the open chat into view once, after the user opens it.
     /// A message that reorders the list does not set this.
     scroll_to_selected: bool,
@@ -1178,10 +1140,8 @@ impl Snapshot {
             app_keychain_ready: false,
             chat_list_loading: HashSet::new(),
             history_loading: HashSet::new(),
-            older_loading: HashSet::new(),
+            paging: Paging::default(),
             list_on_link: HashSet::new(),
-            older_at_start: HashSet::new(),
-            older_retry: HashMap::new(),
             notices: HashMap::new(),
             viewed: None,
             window_focused: true,
@@ -1193,11 +1153,6 @@ impl Snapshot {
             extra_visible: HashSet::new(),
             #[cfg(any(test, feature = "test-support"))]
             hidden_for_test: HashSet::new(),
-            older_note: HashSet::new(),
-            unreadable: HashMap::new(),
-            open_unreadable: HashMap::new(),
-            history_resume: HashMap::new(),
-            history_asked: HashMap::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             scroll_to_message: None,
@@ -1545,23 +1500,13 @@ impl Snapshot {
                 // part of the key, so an answer for topic A does not end topic B.
                 let key = older_key(protocol, &conversation_id, topic);
                 let failed = note.is_some();
-                match note {
-                    Some(detail) => {
-                        tracing::debug!(?protocol, %detail, "older page did not load");
-                        self.older_note.insert(key.clone());
-                    }
-                    None => {
-                        self.older_note.remove(&key);
-                    }
+                if let Some(detail) = note {
+                    tracing::debug!(?protocol, %detail, "older page did not load");
                 }
-                self.older_loading.remove(&key);
-                // A failed page keeps the open run and the store cursor, so
-                // the retry sends the same read. The asked timestamp is the
-                // in-flight cursor; leaving it set makes that retry look like
-                // a cursor that did not move. A success closes or continues
-                // the run, and a success that does not move still drops it.
+                self.paging.answered(&key, failed);
+                // A failed page keeps the open run and the store cursor. A
+                // success closes or continues the run.
                 let continued = if failed {
-                    self.history_asked.remove(&key);
                     false
                 } else if let Some(cursor) = store_cursor {
                     self.note_unreadable(UnreadablePage {
@@ -1574,8 +1519,7 @@ impl Snapshot {
                         initial: false,
                     })
                 } else {
-                    self.close_open_run(&key);
-                    self.history_resume.remove(&key);
+                    self.paging.no_store_cursor(&key);
                     false
                 };
                 if continued {
@@ -1585,22 +1529,14 @@ impl Snapshot {
                     .message_bucket(protocol, &conversation_id, &before_message_id)
                     .and_then(|bucket| self.messages.get(&bucket))
                     .and_then(|list| list.first())
-                    .map(|row| row.id.as_str());
-                if !more {
-                    self.older_retry.remove(&key);
-                    self.older_at_start.insert(key);
-                } else if oldest == Some(before_message_id.as_str()) {
-                    // Nothing older came: do not ask this anchor at once.
-                    // A repeat on the same anchor waits longer (#67).
-                    let tries = match self.older_retry.get(&key) {
-                        Some((anchor, _, tries)) if *anchor == before_message_id => tries + 1,
-                        _ => 1,
-                    };
-                    self.older_retry
-                        .insert(key, (before_message_id, Instant::now(), tries));
-                } else {
-                    self.older_retry.remove(&key);
-                }
+                    .map(|row| row.id.clone());
+                self.paging.settle(
+                    &key,
+                    more,
+                    before_message_id,
+                    oldest.as_deref(),
+                    Instant::now(),
+                );
                 self.continue_reply_jump();
             }
             AdapterEvent::ChatListLoaded { protocol } => {
@@ -3463,28 +3399,12 @@ impl Snapshot {
 
     /// Drop older-page memory of one chat, for every topic.
     fn forget_older_chat(&mut self, protocol: ProtocolId, chat: &str) {
-        let same =
-            |key: &(ProtocolId, String, Option<MessageTopic>)| key.0 == protocol && key.1 == chat;
-        self.older_loading.retain(|key| !same(key));
-        self.older_at_start.retain(|key| !same(key));
-        self.older_retry.retain(|key, _| !same(key));
-        self.older_note.retain(|key| !same(key));
-        self.unreadable.retain(|key, _| !same(key));
-        self.open_unreadable.retain(|key, _| !same(key));
-        self.history_resume.retain(|key, _| !same(key));
-        self.history_asked.retain(|key, _| !same(key));
+        self.paging.forget_chat(protocol, chat);
     }
 
     /// Drop older-page memory of one protocol.
     fn forget_older_protocol(&mut self, protocol: ProtocolId) {
-        self.older_loading.retain(|key| key.0 != protocol);
-        self.older_at_start.retain(|key| key.0 != protocol);
-        self.older_retry.retain(|key, _| key.0 != protocol);
-        self.older_note.retain(|key| key.0 != protocol);
-        self.unreadable.retain(|key, _| key.0 != protocol);
-        self.open_unreadable.retain(|key, _| key.0 != protocol);
-        self.history_resume.retain(|key, _| key.0 != protocol);
-        self.history_asked.retain(|key, _| key.0 != protocol);
+        self.paging.forget_protocol(protocol);
     }
 
     /// Every adapter answered `Shutdown` with `Stopped`: no session of any
@@ -3832,7 +3752,7 @@ impl Snapshot {
     pub fn is_loading(&self) -> bool {
         !self.chat_list_loading.is_empty()
             || !self.history_loading.is_empty()
-            || !self.older_loading.is_empty()
+            || self.paging.any_loading()
             || !self.sends.is_empty()
             || !self.telegram_send_unconfirmed.is_empty()
     }
@@ -3848,7 +3768,7 @@ impl Snapshot {
             .any(|(owner, _)| *owner == protocol)
         {
             Some(LOADING_MESSAGES_STATUS)
-        } else if self.older_loading.iter().any(|key| key.0 == protocol) {
+        } else if self.paging.protocol_loading(protocol) {
             // F1 (#82): older pages of this protocol only, keyed by
             // (protocol, chat, topic).
             Some(LOADING_OLDER_STATUS)
@@ -3929,8 +3849,8 @@ impl Snapshot {
     #[must_use]
     pub fn older_note(&self) -> Option<&'static str> {
         let id = self.pane.conversation.clone()?;
-        self.older_note
-            .contains(&older_key(self.pane.protocol, &id, self.pane.topic))
+        self.paging
+            .failed(&older_key(self.pane.protocol, &id, self.pane.topic))
             .then_some(OLDER_PAGE_FAILED_NOTE)
     }
 
@@ -3944,9 +3864,9 @@ impl Snapshot {
             return OlderState::Idle;
         }
         let key = older_key(self.pane.protocol, id, self.pane.topic);
-        if self.older_loading.contains(&key) {
+        if self.paging.is_loading(&key) {
             OlderState::Loading
-        } else if self.older_at_start.contains(&key) {
+        } else if self.paging.at_start(&key) {
             OlderState::StartOfChat
         } else {
             OlderState::Idle
@@ -3970,8 +3890,9 @@ impl Snapshot {
         };
         let protocol = self.pane.protocol;
         let topic = self.pane.topic;
-        let store_cursor = self.take_resume_cursor(protocol, &id, topic);
-        self.older_loading.insert(older_key(protocol, &id, topic));
+        let key = older_key(protocol, &id, topic);
+        let store_cursor = self.paging.take_resume_cursor(&key);
+        self.paging.asked(&key);
         if let Some(topic) = topic {
             self.push(AdapterCommand::LoadOlderTopic {
                 protocol,
@@ -3995,10 +3916,8 @@ impl Snapshot {
         let Some(id) = self.pane.conversation.as_ref() else {
             return &[];
         };
-        self.unreadable
-            .get(&older_key(self.pane.protocol, id, self.pane.topic))
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.paging
+            .runs(&older_key(self.pane.protocol, id, self.pane.topic))
     }
 
     fn oldest_message_id(
@@ -4027,163 +3946,21 @@ impl Snapshot {
         } = page;
         let key = older_key(protocol, chat, topic);
         let oldest = self.oldest_message_id(protocol, chat, topic);
-        let added = if initial {
-            oldest.is_some()
-        } else {
-            oldest.as_deref().is_some_and(|id| id != request_before)
-        };
-        let moves = self
-            .history_asked
-            .get(&key)
-            .is_none_or(|asked| cursor.before_ms < *asked);
-        if !added && cursor.resume && moves && more && topic.is_none() {
-            let before_id = self.open_unreadable.get(&key).map_or_else(
-                || {
-                    if initial || request_before.is_empty() {
-                        None
-                    } else {
-                        Some(request_before.to_string())
-                    }
-                },
-                |open| open.before_id.clone(),
-            );
-            let skipped = self
-                .open_unreadable
-                .get(&key)
-                .map(|open| open.skipped)
-                .unwrap_or(0)
-                .saturating_add(cursor.skipped);
-            self.open_unreadable
-                .insert(key, OpenUnreadable { before_id, skipped });
-            return self.queue_store_page(protocol, chat, request_before, cursor.before_ms);
-        }
-        let pending = self.open_unreadable.remove(&key);
-        if cursor.runs.is_empty() {
-            let skipped = pending
-                .as_ref()
-                .map(|open| open.skipped)
-                .unwrap_or(0)
-                .saturating_add(cursor.skipped);
-            if skipped > 0 {
-                let before_id = pending.map_or_else(
-                    || Self::unreadable_anchor(initial, request_before, oldest),
-                    |open| open.before_id,
-                );
-                self.unreadable
-                    .entry(key.clone())
-                    .or_default()
-                    .push(UnreadableRun { before_id, skipped });
-            }
-        } else {
-            let mut leading = pending.as_ref().map(|open| open.skipped).unwrap_or(0);
-            let pending_anchor = pending.map(|open| open.before_id);
-            let mut edge = 0u32;
-            let mut placed = Vec::new();
-            for run in cursor.runs {
-                if run.skipped == 0 {
-                    continue;
-                }
-                match run.after_id {
-                    None => leading = leading.saturating_add(run.skipped),
-                    Some(id) if self.message_is_loaded(protocol, chat, topic, &id) => {
-                        push_unreadable(&mut placed, Some(id), run.skipped);
-                    }
-                    Some(_) => {
-                        tracing::warn!(
-                            "history run names a message that is not loaded; the count joins the oldest line"
-                        );
-                        edge = edge.saturating_add(run.skipped);
-                    }
-                }
-            }
-            if edge > 0 {
-                push_unreadable(&mut placed, oldest.clone(), edge);
-            }
-            if leading > 0 {
-                let before_id = pending_anchor
-                    .unwrap_or_else(|| Self::unreadable_anchor(initial, request_before, oldest));
-                push_unreadable(&mut placed, before_id, leading);
-            }
-            if !placed.is_empty() {
-                self.unreadable
-                    .entry(key.clone())
-                    .or_default()
-                    .extend(placed);
-            }
-        }
-        if cursor.resume && moves && more && added && topic.is_none() {
-            self.history_resume.insert(key, cursor.before_ms);
-        } else {
-            self.history_resume.remove(&key);
-        }
-        false
-    }
-
-    fn message_is_loaded(
-        &self,
-        protocol: ProtocolId,
-        chat: &str,
-        topic: Option<MessageTopic>,
-        id: &str,
-    ) -> bool {
-        self.messages
-            .get(&thread_key(protocol, chat, topic))
-            .is_some_and(|rows| rows.iter().any(|row| row.id == id))
-    }
-
-    fn unreadable_anchor(
-        initial: bool,
-        request_before: &str,
-        oldest: Option<String>,
-    ) -> Option<String> {
-        if initial {
-            oldest
-        } else if request_before.is_empty() {
-            None
-        } else {
-            Some(request_before.to_string())
-        }
-    }
-
-    fn close_open_run(&mut self, key: &OlderPageKey) {
-        let Some(open) = self.open_unreadable.remove(key) else {
-            return;
-        };
-        if open.skipped == 0 {
-            return;
-        }
-        self.unreadable
-            .entry(key.clone())
-            .or_default()
-            .push(UnreadableRun {
-                before_id: open.before_id,
-                skipped: open.skipped,
-            });
-    }
-
-    /// Queue the next page from `before_ms`. `false` when that timestamp does
-    /// not move older than the last request.
-    fn queue_store_page(
-        &mut self,
-        protocol: ProtocolId,
-        chat: &str,
-        request_before: &str,
-        before_ms: u64,
-    ) -> bool {
-        let key = older_key(protocol, chat, None);
-        if self
-            .history_asked
-            .get(&key)
-            .is_some_and(|asked| before_ms >= *asked)
-        {
-            self.history_resume.remove(&key);
+        let rows = self.messages.get(&key);
+        let next = self.paging.store_page(
+            &key,
+            StorePage {
+                request_before,
+                cursor,
+                more,
+                initial,
+                oldest,
+            },
+            |id| rows.is_some_and(|rows| rows.iter().any(|row| row.id == id)),
+        );
+        let Some(before_ms) = next else {
             return false;
-        }
-        self.history_resume.insert(key.clone(), before_ms);
-        self.history_asked.insert(key.clone(), before_ms);
-        self.older_loading.insert(key.clone());
-        self.older_retry.remove(&key);
-        self.older_at_start.remove(&key);
+        };
         let before_message_id = if request_before.is_empty() {
             before_ms.to_string()
         } else {
@@ -4196,32 +3973,6 @@ impl Snapshot {
             store_cursor: Some(before_ms),
         });
         true
-    }
-
-    /// The saved store cursor, when it is older than the last finished
-    /// request. A failed read clears that timestamp, so the same cursor is
-    /// sent again. A cursor that a finished read did not move is dropped.
-    fn take_resume_cursor(
-        &mut self,
-        protocol: ProtocolId,
-        chat: &str,
-        topic: Option<MessageTopic>,
-    ) -> Option<u64> {
-        if topic.is_some() {
-            return None;
-        }
-        let key = older_key(protocol, chat, topic);
-        let cursor = self.history_resume.get(&key).copied()?;
-        if self
-            .history_asked
-            .get(&key)
-            .is_some_and(|asked| cursor >= *asked)
-        {
-            self.history_resume.remove(&key);
-            return None;
-        }
-        self.history_asked.insert(key, cursor);
-        Some(cursor)
     }
 
     /// A request for older messages of the selected chat would go out now.
@@ -4243,17 +3994,11 @@ impl Snapshot {
         let id = self.pane.conversation.clone()?;
         let key = older_key(protocol, &id, self.pane.topic);
         let history_key = (protocol, id.clone());
-        if self.history_loading.contains(&history_key)
-            || self.older_loading.contains(&key)
-            || self.older_at_start.contains(&key)
-        {
+        if self.history_loading.contains(&history_key) {
             return None;
         }
         let oldest = self.selected_messages().first()?.id.clone();
-        if let Some((anchor, at, tries)) = self.older_retry.get(&key)
-            && *anchor == oldest
-            && now.saturating_duration_since(*at) < older_wait(*tries)
-        {
+        if !self.paging.may_ask(&key, &oldest, now) {
             return None;
         }
         Some((id, oldest))
@@ -4317,7 +4062,7 @@ impl Snapshot {
             self.scroll_to_message = Some(jump.message_id);
             return;
         }
-        if self.older_loading.contains(&jump.thread) {
+        if self.paging.is_loading(&jump.thread) {
             // A page is on its way. Its answer continues the jump.
             self.reply_jump = Some(jump);
             return;
@@ -6090,7 +5835,7 @@ impl Snapshot {
         // An older page in flight can lose its answer too, and a queued one
         // would go out during the reconnect. End both; a later scroll asks
         // again (#163, Codex r4137896062).
-        self.older_loading.retain(|key| key.0 != protocol);
+        self.paging.stop_loading(protocol, None);
         self.pending.retain(|command| {
             !matches!(
                 command,
@@ -6568,13 +6313,12 @@ impl Snapshot {
             Some(chat) => {
                 let key = (protocol, chat.to_owned());
                 self.history_loading.remove(&key);
-                self.older_loading
-                    .retain(|page| !(page.0 == protocol && page.1 == chat));
+                self.paging.stop_loading(protocol, Some(chat));
             }
             None => {
                 self.chat_list_loading.remove(&protocol);
                 self.history_loading.retain(|(owner, _)| *owner != protocol);
-                self.older_loading.retain(|page| page.0 != protocol);
+                self.paging.stop_loading(protocol, None);
             }
         }
     }
@@ -8646,13 +8390,13 @@ mod tests {
                 .history_loading
                 .insert((ProtocolId::WhatsApp, chat.clone()));
             snapshot
-                .older_loading
-                .insert((ProtocolId::WhatsApp, chat.clone(), None));
+                .paging
+                .asked(&(ProtocolId::WhatsApp, chat.clone(), None));
             snapshot.chat_list_loading.insert(ProtocolId::Telegram);
             helper(&mut snapshot, state);
             assert!(!snapshot.chat_list_loading.contains(&ProtocolId::WhatsApp));
             assert!(snapshot.history_loading.is_empty(), "{state:?}");
-            assert!(snapshot.older_loading.is_empty(), "{state:?}");
+            assert!(!snapshot.paging.any_loading(), "{state:?}");
             assert!(snapshot.chat_list_loading.contains(&ProtocolId::Telegram));
         }
     }
@@ -12738,11 +12482,11 @@ mod tests {
             protocol: ProtocolId::Telegram,
             id: "telegram:1".into(),
         });
-        assert!(!snapshot.older_at_start.contains(&(
-            ProtocolId::Telegram,
-            "telegram:1".to_owned(),
-            None
-        )));
+        assert!(
+            !snapshot
+                .paging
+                .at_start(&(ProtocolId::Telegram, "telegram:1".to_owned(), None))
+        );
     }
 
     fn send_texts(snapshot: &mut Snapshot) -> Vec<String> {
@@ -17219,7 +16963,7 @@ mod tests {
     #[test]
     fn older_loading_line_names_only_its_protocol() {
         let mut snapshot = shell_with(&[ProtocolId::WhatsApp]);
-        snapshot.older_loading.insert((
+        snapshot.paging.asked(&(
             ProtocolId::WhatsApp,
             "whatsapp:1@s.whatsapp.net".into(),
             None,
@@ -19147,15 +18891,12 @@ mod tests {
         let mut snapshot = shell_with(&[ProtocolId::Slack]);
         link(&mut snapshot, ProtocolId::Slack);
         let key = (ProtocolId::Slack, "slack:C1".to_owned(), None);
-        snapshot.older_loading.insert(key.clone());
+        snapshot.paging.asked(&key);
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
             state: AccountState::Linking,
         });
-        assert!(
-            !snapshot.older_loading.contains(&key),
-            "the older spinner stops"
-        );
+        assert!(!snapshot.paging.is_loading(&key), "the older spinner stops");
         assert_ne!(
             snapshot.loading_line(ProtocolId::Slack),
             Some(LOADING_OLDER_STATUS)
@@ -19778,8 +19519,8 @@ mod tests {
         link(&mut snapshot, ProtocolId::Slack);
         snapshot.chat_list_loading.insert(ProtocolId::Slack);
         snapshot
-            .older_loading
-            .insert((ProtocolId::Telegram, "telegram:1".into(), None));
+            .paging
+            .asked(&(ProtocolId::Telegram, "telegram:1".into(), None));
         assert_eq!(
             snapshot.status_line(),
             LOADING_OLDER_STATUS,
@@ -19787,7 +19528,7 @@ mod tests {
         );
 
         // The Telegram older page ends; Slack still loads its chat list.
-        snapshot.older_loading.clear();
+        snapshot.paging.stop_loading(ProtocolId::Telegram, None);
         assert!(snapshot.is_loading());
         assert!(!snapshot.status_is_idle());
         assert_eq!(snapshot.status_line(), "Slack: Loading chats…");
