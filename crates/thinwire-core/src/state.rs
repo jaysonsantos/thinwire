@@ -793,15 +793,11 @@ pub struct Snapshot {
     /// until the adapter accepts it; only the request's own `SendAccepted` /
     /// `SendRejected` ends an entry (PR #40 review, shell plan items 4, 10).
     sends: SendTracker,
-    /// The shell's id for the next pairing (WhatsApp or Signal).
+    /// The pairing that runs now, for each helper account (WhatsApp or
+    /// Signal). A QR or pair code of any other pairing is dropped (shell
+    /// plan 12).
     #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
-    next_pairing_generation: u64,
-    /// The id of the pairing that runs now, for each protocol. A QR or pair
-    /// code of any other pairing is dropped (shell plan 12). No entry: no
-    /// pairing of that protocol runs. One entry for each protocol: the end
-    /// of a WhatsApp pairing must not end a Signal link, and the reverse.
-    #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
-    pairing_generation: HashMap<ProtocolId, u64>,
+    pairings: crate::pairing::Pairings,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -1171,9 +1167,7 @@ impl Snapshot {
             stopped: HashSet::new(),
             sends: SendTracker::default(),
             #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
-            next_pairing_generation: 1,
-            #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
-            pairing_generation: HashMap::new(),
+            pairings: crate::pairing::Pairings::default(),
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -7310,10 +7304,7 @@ impl Snapshot {
         self.whatsapp_started = true;
         self.error = None;
         self.status_text = WHATSAPP_PAIRING_REQUESTED.into();
-        let generation = self.next_pairing_generation;
-        self.next_pairing_generation += 1;
-        self.pairing_generation
-            .insert(self.whatsapp_link_account, generation);
+        let generation = self.pairings.begin(self.whatsapp_link_account);
         self.push(AdapterCommand::WhatsAppBeginLink { generation });
     }
 
@@ -7345,10 +7336,7 @@ impl Snapshot {
     #[cfg(feature = "whatsapp-web")]
     #[must_use]
     pub fn whatsapp_pairing_generation(&self) -> u64 {
-        self.pairing_generation
-            .get(&self.whatsapp_link_account)
-            .copied()
-            .unwrap_or(0)
+        self.pairings.running(self.whatsapp_link_account)
     }
 
     /// WhatsApp linked (`Account { Linked }`): close the pair screen the user
@@ -7398,7 +7386,7 @@ impl Snapshot {
     /// later payload of the old pairing.
     #[cfg(feature = "whatsapp-web")]
     fn end_pairing(&mut self) {
-        self.pairing_generation.remove(&self.whatsapp_link_account);
+        self.pairings.end(self.whatsapp_link_account);
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
         self.whatsapp_qr_exhausted = false;
@@ -7407,11 +7395,7 @@ impl Snapshot {
     /// A pairing payload belongs to the pairing of `protocol` that runs now.
     #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     fn current_pairing(&self, protocol: ProtocolId, generation: u64) -> bool {
-        let current = self.pairing_generation.get(&protocol) == Some(&generation);
-        if !current {
-            tracing::warn!("pairing payload dropped: it is from an older pairing");
-        }
-        current
+        self.pairings.is_current(protocol, generation)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -7448,7 +7432,7 @@ impl Snapshot {
     /// payload of the old link.
     #[cfg(feature = "signal-local")]
     fn end_signal_pairing(&mut self) {
-        self.pairing_generation.remove(&self.signal_link_account);
+        self.pairings.end(self.signal_link_account);
         self.signal_qr = None;
     }
 
@@ -7626,10 +7610,7 @@ impl Snapshot {
         self.signal_inbox_open = false;
         self.error = None;
         self.status_text = "Signal linking requested.".into();
-        let generation = self.next_pairing_generation;
-        self.next_pairing_generation += 1;
-        self.pairing_generation
-            .insert(self.signal_link_account, generation);
+        let generation = self.pairings.begin(self.signal_link_account);
         self.push(AdapterCommand::SignalBeginLink { generation });
     }
 
@@ -7638,10 +7619,7 @@ impl Snapshot {
     #[cfg(feature = "signal-local")]
     #[must_use]
     pub fn signal_pairing_generation(&self) -> u64 {
-        self.pairing_generation
-            .get(&self.signal_link_account)
-            .copied()
-            .unwrap_or(0)
+        self.pairings.running(self.signal_link_account)
     }
 
     /// Leave the link screen after `Account { Linked }`. The worker stays up.

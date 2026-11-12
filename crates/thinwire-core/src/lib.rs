@@ -21,6 +21,8 @@ mod intent;
 pub mod mutes;
 pub mod notify;
 mod paging;
+#[cfg(any(test, feature = "whatsapp-web", feature = "signal-local"))]
+mod pairing;
 mod secret_text;
 pub mod secrets;
 #[cfg(all(feature = "keychain-security-cli", target_os = "macos"))]
