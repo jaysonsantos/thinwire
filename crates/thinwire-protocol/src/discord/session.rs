@@ -47,6 +47,7 @@ use crate::adapter::{
     emit_message_delivery, emit_message_replaced, emit_notice, emit_older_history_loaded,
     emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
+use crate::clip::{Clip, ClipKind};
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
 const EMPTY_SEND_REFUSAL: &str = "A message needs text.";
@@ -1277,82 +1278,34 @@ impl Owner {
     }
 
     fn download_voice(&mut self, file_id: i32) {
-        let events = self.events.clone();
-        let failed = move |events: &EventTx| {
-            let _ = events.send(AdapterEvent::VoiceFailed {
-                protocol: ProtocolId::Discord,
-                file_id,
-                stop: crate::media::VoiceStop::Unplayable,
-            });
-        };
-        let (Some(url), Ok(dir)) = (self.voices.get(&file_id).cloned(), super::voice_dir()) else {
-            failed(&events);
-            return;
-        };
-        let api = Arc::clone(&self.api);
-        tokio::spawn(async move {
-            let stored = match api.download(url, crate::voice_files::VOICE_MAX_BYTES).await {
-                Ok(bytes) => tokio::task::spawn_blocking(move || {
-                    crate::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
-                })
-                .await
-                .unwrap_or(Err(())),
-                Err(_) => Err(()),
-            };
-            match stored {
-                Ok(path) => {
-                    let _ = events.send(AdapterEvent::VoiceReady {
-                        protocol: ProtocolId::Discord,
-                        file_id,
-                        path,
-                    });
-                }
-                Err(()) => {
-                    tracing::debug!("a discord audio file did not download");
-                    failed(&events);
-                }
-            }
-        });
+        self.download_clip(Clip::audio(ProtocolId::Discord, file_id));
     }
 
     /// Download the video `file_id` into the folder of the player files.
     /// The answer is `VideoReady`, or `VideoFailed` when no history row has
     /// the handle, or when the download or the write failed.
     fn download_video(&mut self, file_id: i32) {
-        let events = self.events.clone();
-        let failed = move |events: &EventTx| {
-            let _ = events.send(AdapterEvent::VideoFailed {
-                protocol: ProtocolId::Discord,
-                file_id,
-            });
+        self.download_clip(Clip::video(ProtocolId::Discord, file_id));
+    }
+
+    fn download_clip(&mut self, clip: Clip) {
+        let known = match clip.kind {
+            ClipKind::Audio => self.voices.get(&clip.file_id),
+            ClipKind::Video => self.videos.get(&clip.file_id),
         };
-        let (Some(url), Ok(dir)) = (self.videos.get(&file_id).cloned(), super::voice_dir()) else {
-            failed(&events);
+        let (Some(url), Ok(dir)) = (known.cloned(), super::voice_dir()) else {
+            clip.refuse(&self.events);
             return;
         };
+        let events = self.events.clone();
         let api = Arc::clone(&self.api);
         tokio::spawn(async move {
-            let stored = match api.download(url, crate::voice_files::VIDEO_MAX_BYTES).await {
-                Ok(bytes) => tokio::task::spawn_blocking(move || {
-                    crate::voice_files::store_video(&dir, file_id, &bytes).map_err(|_| ())
+            let stored = clip
+                .store(&dir, false, || async move {
+                    api.download(url, clip.max_bytes()).await.map_err(|_| ())
                 })
-                .await
-                .unwrap_or(Err(())),
-                Err(_) => Err(()),
-            };
-            match stored {
-                Ok(path) => {
-                    let _ = events.send(AdapterEvent::VideoReady {
-                        protocol: ProtocolId::Discord,
-                        file_id,
-                        path,
-                    });
-                }
-                Err(()) => {
-                    tracing::debug!("a discord video file did not download");
-                    failed(&events);
-                }
-            }
+                .await;
+            clip.answer(&events, stored);
         });
     }
 

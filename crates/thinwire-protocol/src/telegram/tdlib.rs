@@ -2591,17 +2591,8 @@ fn fail_download(kind: InFlight, file_id: i32, events: &EventTx) {
 }
 
 fn video_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {
-    match crate::AudioPath::new(path).filter(|_| completed) {
-        Some(path) => AdapterEvent::VideoReady {
-            protocol: ProtocolId::Telegram,
-            file_id,
-            path,
-        },
-        None => AdapterEvent::VideoFailed {
-            protocol: ProtocolId::Telegram,
-            file_id,
-        },
-    }
+    let stored = crate::AudioPath::new(path).filter(|_| completed);
+    crate::clip::Clip::video(ProtocolId::Telegram, file_id).event(stored.ok_or(()))
 }
 
 fn finish_voice(file: tdlib_rs::types::File, events: &EventTx) {
@@ -2628,18 +2619,8 @@ fn file_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {
 }
 
 fn voice_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {
-    match crate::AudioPath::new(path).filter(|_| completed) {
-        Some(path) => AdapterEvent::VoiceReady {
-            protocol: ProtocolId::Telegram,
-            file_id,
-            path,
-        },
-        None => AdapterEvent::VoiceFailed {
-            protocol: ProtocolId::Telegram,
-            file_id,
-            stop: crate::media::VoiceStop::Unplayable,
-        },
-    }
+    let stored = crate::AudioPath::new(path).filter(|_| completed);
+    crate::clip::Clip::audio(ProtocolId::Telegram, file_id).event(stored.ok_or(()))
 }
 
 async fn finish_photo(client_id: i32, file: tdlib_rs::types::File, secret: bool, events: &EventTx) {

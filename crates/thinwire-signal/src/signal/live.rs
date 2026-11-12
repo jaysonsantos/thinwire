@@ -33,6 +33,7 @@ use super::path::{
 };
 use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
+use thinwire_protocol::clip::{Clip, ClipKind};
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     HistorySkipRun, HistoryStoreCursor, ProtocolId, RedactedPairingSecret, SIGNAL_PREVIOUS_ACCOUNT,
@@ -4799,48 +4800,9 @@ fn download_voice(
     events: &EventTx,
     file_id: i32,
 ) {
-    let failed = move |events: &EventTx| {
-        let _ = events.send(AdapterEvent::VoiceFailed {
-            protocol: ProtocolId::Signal,
-            file_id,
-            stop: thinwire_protocol::VoiceStop::Unplayable,
-        });
-    };
-    let (Some(pointer), Ok(dir)) = (session.media().voice(file_id), super::path::voice_dir())
-    else {
-        failed(events);
-        return;
-    };
-    let manager = manager.clone();
-    let session = Arc::clone(session);
-    let events = events.clone();
-    tokio::spawn(async move {
-        let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
-        let stored = match manager.get_attachment(&pointer).await {
-            Ok(bytes) => tokio::task::spawn_blocking(move || {
-                thinwire_protocol::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
-            })
-            .await
-            .unwrap_or(Err(())),
-            Err(_) => Err(()),
-        };
-        if !session.is_current(token) {
-            return;
-        }
-        match stored {
-            Ok(path) => {
-                let _ = events.send(AdapterEvent::VoiceReady {
-                    protocol: ProtocolId::Signal,
-                    file_id,
-                    path,
-                });
-            }
-            Err(()) => {
-                tracing::debug!("a signal audio file did not download");
-                failed(&events);
-            }
-        }
-    });
+    let clip = Clip::audio(ProtocolId::Signal, file_id);
+    let folder = super::path::voice_dir();
+    download_clip(manager, session, token, events, clip, folder);
 }
 
 /// Download the video `file_id` into the video folder. The answer is
@@ -4855,18 +4817,32 @@ fn download_video(
     events: &EventTx,
     file_id: i32,
 ) {
-    let failed = move |events: &EventTx| {
-        let _ = events.send(AdapterEvent::VideoFailed {
-            protocol: ProtocolId::Signal,
-            file_id,
-        });
+    let clip = Clip::video(ProtocolId::Signal, file_id);
+    let folder = super::path::video_dir();
+    download_clip(manager, session, token, events, clip, folder);
+}
+
+/// The steps of one download for a player. Only a video has the guard
+/// against a second request, and only a video uses its earlier file again.
+fn download_clip<Refused>(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Arc<Session>,
+    token: u64,
+    events: &EventTx,
+    clip: Clip,
+    folder: Result<std::path::PathBuf, Refused>,
+) {
+    let video = clip.kind == ClipKind::Video;
+    let pointer = if video {
+        session.media().video(clip.file_id)
+    } else {
+        session.media().voice(clip.file_id)
     };
-    let (Some(pointer), Ok(dir)) = (session.media().video(file_id), super::path::video_dir())
-    else {
-        failed(events);
+    let (Some(pointer), Ok(dir)) = (pointer, folder) else {
+        clip.refuse(events);
         return;
     };
-    if !session.media().start_video(file_id) {
+    if video && !session.media().start_video(clip.file_id) {
         return;
     }
     let manager = manager.clone();
@@ -4874,57 +4850,18 @@ fn download_video(
     let events = events.clone();
     tokio::spawn(async move {
         let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
-        let stored = store_video(&dir, file_id, || async {
-            manager.get_attachment(&pointer).await.map_err(|_| ())
-        })
-        .await;
-        session.media().end_video(file_id);
-        if !session.is_current(token) {
-            return;
+        let stored = clip
+            .store(&dir, video, || async {
+                manager.get_attachment(&pointer).await.map_err(|_| ())
+            })
+            .await;
+        if video {
+            session.media().end_video(clip.file_id);
         }
-        match stored {
-            Ok(path) => {
-                let _ = events.send(AdapterEvent::VideoReady {
-                    protocol: ProtocolId::Signal,
-                    file_id,
-                    path,
-                });
-            }
-            Err(()) => {
-                tracing::debug!("a signal video did not download");
-                failed(&events);
-            }
+        if session.is_current(token) {
+            clip.answer(&events, stored);
         }
     });
-}
-
-/// The file of the video `file_id` in `dir`: the file of an earlier
-/// download, else the bytes of `fetch`, written as a private file.
-async fn store_video<Fetch, Fetched>(
-    dir: &Path,
-    file_id: i32,
-    fetch: Fetch,
-) -> Result<thinwire_protocol::AudioPath, ()>
-where
-    Fetch: FnOnce() -> Fetched,
-    Fetched: Future<Output = Result<Vec<u8>, ()>>,
-{
-    let folder = dir.to_path_buf();
-    let known = tokio::task::spawn_blocking(move || {
-        thinwire_protocol::voice_files::stored_video(&folder, file_id)
-    })
-    .await
-    .map_err(|_| ())?;
-    if let Some(path) = known {
-        return Ok(path);
-    }
-    let bytes = fetch().await?;
-    let folder = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        thinwire_protocol::voice_files::store_video(&folder, file_id, &bytes).map_err(|_| ())
-    })
-    .await
-    .map_err(|_| ())?
 }
 
 fn fail(events: &EventTx, detail: &str) {
@@ -5535,7 +5472,8 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("thinwire-signal-video-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = store_video(&dir, 7, || async { Ok(b"ftyp-video".to_vec()) })
+        let path = Clip::video(ProtocolId::Signal, 7)
+            .store(&dir, true, || async { Ok(b"ftyp-video".to_vec()) })
             .await
             .expect("stored");
         assert!(path.as_path().is_absolute());
@@ -5548,13 +5486,20 @@ mod tests {
             let folder = std::fs::metadata(&dir).expect("folder");
             assert_eq!(folder.permissions().mode() & 0o777, 0o700);
         }
-        let again = store_video(&dir, 7, || async { panic!("no second download") })
+        let again = Clip::video(ProtocolId::Signal, 7)
+            .store(&dir, true, || async { panic!("no second download") })
             .await
             .expect("the same file");
         assert_eq!(again, path);
-        assert!(store_video(&dir, 8, || async { Err(()) }).await.is_err());
         assert!(
-            store_video(&dir, 9, || async { Ok(Vec::new()) })
+            Clip::video(ProtocolId::Signal, 8)
+                .store(&dir, true, || async { Err(()) })
+                .await
+                .is_err()
+        );
+        assert!(
+            Clip::video(ProtocolId::Signal, 9)
+                .store(&dir, true, || async { Ok(Vec::new()) })
                 .await
                 .is_err()
         );

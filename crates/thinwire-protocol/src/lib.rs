@@ -1,6 +1,7 @@
 //! Protocol adapters, capability metadata, and the tokio host.
 
 mod adapter;
+pub mod clip;
 #[cfg(any(test, feature = "contract-kit"))]
 pub mod contract;
 pub mod demo;

@@ -15,6 +15,7 @@ use super::inbox::{
     self, HistoryChat, Inbox, MediaRef, MediaRequest, Mute, TargetRef, WaContact, WaMessage,
     WaReaction,
 };
+use thinwire_protocol::clip::Clip;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
     emit_status,
@@ -550,13 +551,8 @@ impl Session {
     /// `VoiceReady`, or `VoiceFailed` when the link is down, the message left
     /// the cache, or the download or the write failed.
     pub(super) fn download_voice(&self, file_id: i32, events: &EventTx) {
-        let failed = move |events: &EventTx| {
-            let _ = events.send(AdapterEvent::VoiceFailed {
-                protocol: ProtocolId::WhatsApp,
-                file_id,
-                stop: thinwire_protocol::VoiceStop::Unplayable,
-            });
-        };
+        let clip = Clip::audio(ProtocolId::WhatsApp, file_id);
+        let failed = move |events: &EventTx| clip.refuse(events);
         let mut state = self.lock();
         let ready = (!state.closed && state.connected)
             .then(|| state.sender.clone().zip(state.inbox.voice_media(file_id)))
@@ -578,27 +574,10 @@ impl Session {
         let events = events.clone();
         runtime.spawn(async move {
             let _permit = gate.acquire_owned().await.ok();
-            let stored = match sender.download(&media).await {
-                Ok(bytes) => tokio::task::spawn_blocking(move || {
-                    thinwire_protocol::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
-                })
-                .await
-                .unwrap_or(Err(())),
-                Err(()) => Err(()),
-            };
-            match stored {
-                Ok(path) => {
-                    let _ = events.send(AdapterEvent::VoiceReady {
-                        protocol: ProtocolId::WhatsApp,
-                        file_id,
-                        path,
-                    });
-                }
-                Err(()) => {
-                    tracing::debug!("whatsapp audio download failed");
-                    failed(&events);
-                }
-            }
+            let stored = clip
+                .store(&dir, false, || async { sender.download(&media).await })
+                .await;
+            clip.answer(&events, stored);
         });
     }
 
@@ -607,12 +586,8 @@ impl Session {
     /// left the cache, or the download or the write failed. A file of an
     /// earlier download of this run answers at once.
     pub(super) fn download_video(&self, file_id: i32, events: &EventTx) {
-        let failed = move |events: &EventTx| {
-            let _ = events.send(AdapterEvent::VideoFailed {
-                protocol: ProtocolId::WhatsApp,
-                file_id,
-            });
-        };
+        let clip = Clip::video(ProtocolId::WhatsApp, file_id);
+        let failed = move |events: &EventTx| clip.refuse(events);
         let mut state = self.lock();
         if state.video_downloads.contains(&file_id) {
             return;
@@ -666,19 +641,7 @@ impl Session {
             if closed {
                 return;
             }
-            match stored {
-                Ok(path) => {
-                    let _ = events.send(AdapterEvent::VideoReady {
-                        protocol: ProtocolId::WhatsApp,
-                        file_id,
-                        path,
-                    });
-                }
-                Err(()) => {
-                    tracing::debug!("whatsapp video download failed");
-                    failed(&events);
-                }
-            }
+            clip.answer(&events, stored);
         });
     }
 

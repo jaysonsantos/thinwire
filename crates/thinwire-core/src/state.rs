@@ -7075,89 +7075,56 @@ impl Snapshot {
         self.queue(AdapterCommand::DownloadDocument { protocol, file_id });
     }
 
+    /// Every loaded message of one account. A media answer names a file
+    /// handle, and more than one row can show the same file.
+    fn rows_of(&mut self, protocol: ProtocolId) -> impl Iterator<Item = &mut ChatMessage> {
+        self.messages
+            .values_mut()
+            .flatten()
+            .filter(move |message| message.protocol == protocol)
+    }
+
     fn file_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
         self.file_downloads.remove(&(protocol, file_id));
-        for message in self.messages.values_mut().flatten() {
-            if message.protocol != protocol {
-                continue;
-            }
-            if let Some(file) = message.file.as_mut()
-                && file.file_id() == file_id
-            {
-                file.set_file(path.clone());
-            }
+        let files = self.rows_of(protocol).filter_map(|row| row.file.as_mut());
+        for file in files.filter(|file| file.file_id() == file_id) {
+            file.set_file(path.clone());
         }
     }
 
     fn file_failed(&mut self, protocol: ProtocolId, file_id: i32) {
         self.file_downloads.remove(&(protocol, file_id));
-        for message in self.messages.values_mut().flatten() {
-            if message.protocol != protocol {
-                continue;
-            }
-            if let Some(file) = message.file.as_mut()
-                && file.file_id() == file_id
-            {
-                file.mark_failed();
-            }
+        let files = self.rows_of(protocol).filter_map(|row| row.file.as_mut());
+        for file in files.filter(|file| file.file_id() == file_id) {
+            file.mark_failed();
         }
     }
 
     fn voice_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
-        for list in self.messages.values_mut() {
-            for message in list.iter_mut() {
-                if message.protocol != protocol {
-                    continue;
-                }
-                let Some(audio) = message.audio.as_mut() else {
-                    continue;
-                };
-                if audio.file_id() == file_id {
-                    audio.set_file(path.clone());
-                }
-            }
+        let audios = self.rows_of(protocol).filter_map(|row| row.audio.as_mut());
+        for audio in audios.filter(|audio| audio.file_id() == file_id) {
+            audio.set_file(path.clone());
         }
     }
 
     fn voice_failed(&mut self, protocol: ProtocolId, file_id: i32, stop: VoiceStop) {
-        for list in self.messages.values_mut() {
-            for message in list.iter_mut() {
-                if message.protocol != protocol {
-                    continue;
-                }
-                let Some(audio) = message.audio.as_mut() else {
-                    continue;
-                };
-                if audio.file_id() == file_id {
-                    audio.mark_stopped(stop);
-                }
-            }
+        let audios = self.rows_of(protocol).filter_map(|row| row.audio.as_mut());
+        for audio in audios.filter(|audio| audio.file_id() == file_id) {
+            audio.mark_stopped(stop);
         }
     }
 
     fn video_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
-        for message in self.messages.values_mut().flatten() {
-            if message.protocol != protocol {
-                continue;
-            }
-            if let Some(video) = message.video.as_mut()
-                && video.file_id() == file_id
-            {
-                video.set_file(path.clone());
-            }
+        let videos = self.rows_of(protocol).filter_map(|row| row.video.as_mut());
+        for video in videos.filter(|video| video.file_id() == file_id) {
+            video.set_file(path.clone());
         }
     }
 
     fn video_failed(&mut self, protocol: ProtocolId, file_id: i32) {
-        for message in self.messages.values_mut().flatten() {
-            if message.protocol != protocol {
-                continue;
-            }
-            if let Some(video) = message.video.as_mut()
-                && video.file_id() == file_id
-            {
-                video.mark_failed();
-            }
+        let videos = self.rows_of(protocol).filter_map(|row| row.video.as_mut());
+        for video in videos.filter(|video| video.file_id() == file_id) {
+            video.mark_failed();
         }
     }
 
