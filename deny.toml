@@ -24,4 +24,12 @@ ignore = [
   { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
+  # A vulnerability notice, accepted by the owner on 2026-11-12. SQLite
+  # before 3.54.0 can return old memory when a database file and its `-wal`
+  # file have different page sizes. The attack needs a local program that
+  # writes both files into a session folder, and such a program already runs
+  # as the user. libsqlite3-sys 0.39 pins sqlcipher-src 419.0.6, and rusqlite,
+  # diesel, and sqlx need 0.39, so no fixed version fits now. Remove this
+  # entry when a libsqlite3-sys release has sqlcipher-src 420 or later.
+  { id = "RUSTSEC-2026-0502", reason = "sqlcipher-src 419.0.6: SQLite WAL page-size read, local attack only. No libsqlite3-sys 0.39 release has the fix" },
 ]
