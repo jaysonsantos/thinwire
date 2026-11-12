@@ -3088,6 +3088,58 @@ fn older_step(
     }
 }
 
+/// The colors of one bubble: its fill, its text, and its time and marks.
+struct BubbleInk {
+    fill: egui::Color32,
+    body: egui::Color32,
+    meta: MetaInk,
+}
+
+/// Choose the colors of a bubble. A message of only emoji has no fill, so
+/// its marks have the inks of the plain thread. An own message has the
+/// `out` fill. A message of another person has the `surface` fill, or
+/// `person`: the fill of that person in a group chat (#580).
+fn bubble_ink(
+    palette: &theme::Palette,
+    emoji: bool,
+    outbound: bool,
+    person: Option<egui::Color32>,
+) -> BubbleInk {
+    let on_thread = MetaInk {
+        time: palette.text3,
+        read: palette.accent,
+        error: palette.error,
+        action: palette.accent,
+    };
+    if emoji {
+        BubbleInk {
+            fill: egui::Color32::TRANSPARENT,
+            body: palette.text,
+            meta: on_thread,
+        }
+    } else if outbound {
+        BubbleInk {
+            fill: palette.out,
+            body: palette.on_out,
+            meta: MetaInk {
+                time: palette.out_meta,
+                read: palette.on_out,
+                error: palette.out_error,
+                action: palette.on_out,
+            },
+        }
+    } else {
+        BubbleInk {
+            fill: person.unwrap_or(palette.surface),
+            body: palette.text,
+            meta: MetaInk {
+                read: palette.text3,
+                ..on_thread
+            },
+        }
+    }
+}
+
 /// Colors of the time and the delivery marks. They depend on what is behind
 /// them: the bubble fill, or the plain thread for a message of only emoji.
 struct MetaInk {
@@ -3663,44 +3715,13 @@ fn bubble(
     } else {
         egui::Align::Min
     };
-    let (fill, body, ink) = if emoji {
-        (
-            egui::Color32::TRANSPARENT,
-            palette.text,
-            MetaInk {
-                time: palette.text3,
-                read: palette.accent,
-                error: palette.error,
-                action: palette.accent,
-            },
-        )
-    } else if message.outbound {
-        (
-            palette.out,
-            palette.on_out,
-            MetaInk {
-                time: palette.out_meta,
-                read: palette.on_out,
-                error: palette.out_error,
-                action: palette.on_out,
-            },
-        )
-    } else {
-        (
-            if message.person_colors {
-                theme::person_fill(message.sender, ui.visuals().dark_mode)
-            } else {
-                palette.surface
-            },
-            palette.text,
-            MetaInk {
-                time: palette.text3,
-                read: palette.text3,
-                error: palette.error,
-                action: palette.accent,
-            },
-        )
-    };
+    let person = (message.person_colors && !message.outbound)
+        .then(|| theme::person_fill(message.sender, ui.visuals().dark_mode));
+    let BubbleInk {
+        fill,
+        body,
+        meta: ink,
+    } = bubble_ink(palette, emoji, message.outbound, person);
     let mut body_galley = None;
     ui.with_layout(egui::Layout::top_down(align), |ui| {
         let frame = egui::Frame::new()
@@ -4492,6 +4513,35 @@ fn send_label(can_send: bool, palette: &theme::Palette) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::{InboxAnchor, account_label, anchored_inbox_offset, badge_text, row_scrolls};
+
+    #[test]
+    fn a_bubble_gets_its_colors_from_its_kind() {
+        use super::{bubble_ink, egui, theme};
+
+        for palette in [&theme::Palette::LIGHT, &theme::Palette::DARK] {
+            let person = egui::Color32::from_rgb(1, 2, 3);
+            // Only emoji: no fill, and the marks have the inks of the thread.
+            let emoji = bubble_ink(palette, true, true, Some(person));
+            assert_eq!(emoji.fill, egui::Color32::TRANSPARENT);
+            assert_eq!(emoji.body, palette.text);
+            assert_eq!(emoji.meta.time, palette.text3);
+            assert_eq!(emoji.meta.read, palette.accent);
+            // An own message: the `out` fill and its own inks.
+            let own = bubble_ink(palette, false, true, Some(person));
+            assert_eq!(own.fill, palette.out, "a person fill is for other people");
+            assert_eq!(own.body, palette.on_out);
+            assert_eq!(own.meta.time, palette.out_meta);
+            assert_eq!(own.meta.error, palette.out_error);
+            // Another person: `surface`, or the fill of that person.
+            let other = bubble_ink(palette, false, false, None);
+            assert_eq!(other.fill, palette.surface);
+            assert_eq!(other.body, palette.text);
+            assert_eq!(other.meta.action, palette.accent);
+            let colored = bubble_ink(palette, false, false, Some(person));
+            assert_eq!(colored.fill, person);
+            assert_eq!(colored.body, other.body);
+        }
+    }
 
     #[test]
     fn only_one_to_three_emoji_lose_their_bubble() {
