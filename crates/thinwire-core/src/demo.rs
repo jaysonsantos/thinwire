@@ -463,7 +463,7 @@ pub fn summary(core: &Core) -> String {
         view.auth
     );
     for row in view.visible_conversations() {
-        let mark = if view.selected_conversation.as_deref() == Some(row.id.as_str()) {
+        let mark = if view.pane.conversation.as_deref() == Some(row.id.as_str()) {
             '>'
         } else {
             ' '
@@ -1151,10 +1151,10 @@ mod tests {
         core.dispatch(Intent::FocusOtherPane);
         let view = core.view();
         assert_eq!(view.split(), Some(SplitSide::Left));
-        assert_eq!(view.selected_protocol, ProtocolId::Telegram);
-        assert_eq!(view.selected_conversation.as_deref(), Some(ADA));
-        assert_eq!(view.compose, "");
-        assert_eq!(view.search, "");
+        assert_eq!(view.pane.protocol, ProtocolId::Telegram);
+        assert_eq!(view.pane.conversation.as_deref(), Some(ADA));
+        assert_eq!(view.pane.compose, "");
+        assert_eq!(view.pane.search, "");
         assert_eq!(
             view.split_other_chat(),
             Some((ProtocolId::Slack, SLACK_GENERAL, None))
@@ -1164,10 +1164,10 @@ mod tests {
         core.dispatch(Intent::FocusOtherPane);
         let view = core.view();
         assert_eq!(view.split(), Some(SplitSide::Right));
-        assert_eq!(view.selected_protocol, ProtocolId::Slack);
-        assert_eq!(view.selected_conversation.as_deref(), Some(SLACK_GENERAL));
-        assert_eq!(view.compose, "to slack");
-        assert_eq!(view.search, "gen");
+        assert_eq!(view.pane.protocol, ProtocolId::Slack);
+        assert_eq!(view.pane.conversation.as_deref(), Some(SLACK_GENERAL));
+        assert_eq!(view.pane.compose, "to slack");
+        assert_eq!(view.pane.search, "gen");
     }
 
     /// A draw of the other pane sees its chat and its draft, and changes
@@ -1184,9 +1184,9 @@ mod tests {
 
         let seen = core.with_other_pane(|view| {
             (
-                view.selected_protocol,
-                view.selected_conversation.clone(),
-                view.compose.clone(),
+                view.pane.protocol,
+                view.pane.conversation.clone(),
+                view.pane.compose.clone(),
                 view.selected_messages().len(),
             )
         });
@@ -1201,8 +1201,8 @@ mod tests {
         );
         assert_eq!(summary(&core), before);
         let view = core.view();
-        assert_eq!(view.selected_protocol, ProtocolId::Slack);
-        assert_eq!(view.compose, "to slack");
+        assert_eq!(view.pane.protocol, ProtocolId::Slack);
+        assert_eq!(view.pane.compose, "to slack");
         assert_eq!(view.split(), Some(SplitSide::Right));
     }
 
@@ -1214,10 +1214,10 @@ mod tests {
         let mut core = Scenario::SplitView.build(runtime.handle());
         core.dispatch(Intent::CloseSplit);
         assert_eq!(core.view().split(), None);
-        assert_eq!(core.view().selected_protocol, ProtocolId::Slack);
+        assert_eq!(core.view().pane.protocol, ProtocolId::Slack);
         assert_eq!(core.with_other_pane(|_| ()), None);
         core.dispatch(Intent::FocusOtherPane);
-        assert_eq!(core.view().selected_protocol, ProtocolId::Slack);
+        assert_eq!(core.view().pane.protocol, ProtocolId::Slack);
     }
 
     /// With the split open, "Open in split" of another account changes
@@ -1229,7 +1229,7 @@ mod tests {
         core.dispatch(Intent::OpenSplit(ProtocolId::Telegram));
         let view = core.view();
         assert_eq!(view.split(), Some(SplitSide::Right));
-        assert_eq!(view.selected_protocol, ProtocolId::Telegram);
+        assert_eq!(view.pane.protocol, ProtocolId::Telegram);
         assert_eq!(view.split_other_protocol(), Some(ProtocolId::Telegram));
     }
 
@@ -1262,7 +1262,7 @@ mod tests {
                 }
                 Scenario::SplitView => {
                     assert_eq!(view.split(), Some(SplitSide::Right), "{name}");
-                    assert_eq!(view.selected_protocol, ProtocolId::Slack, "{name}");
+                    assert_eq!(view.pane.protocol, ProtocolId::Slack, "{name}");
                     assert_eq!(
                         view.split_other_chat(),
                         Some((ProtocolId::Telegram, ADA, None)),
@@ -1340,7 +1340,7 @@ mod tests {
                     assert!(view.notice(ProtocolId::Telegram).is_some(), "{name}");
                 }
                 Scenario::MutedInbox | Scenario::MutedHere | Scenario::MutedByProtocol => {
-                    let open = view.selected_conversation.as_deref().expect("open chat");
+                    let open = view.pane.conversation.as_deref().expect("open chat");
                     let expected = match scenario {
                         Scenario::MutedHere => ChatMute::Here,
                         Scenario::MutedByProtocol => ChatMute::Protocol,

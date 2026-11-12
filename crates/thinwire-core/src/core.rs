@@ -691,9 +691,9 @@ impl Core {
     pub fn with_other_pane<T>(&mut self, draw: impl FnOnce(&View<'_>) -> T) -> Option<T> {
         self.state.check_split();
         self.state.split()?;
-        self.state.peek_other_pane();
+        self.state.enter_other_pane();
         let drawn = draw(&self.view());
-        self.state.peek_other_pane();
+        self.state.leave_other_pane();
         Some(drawn)
     }
 
@@ -967,7 +967,7 @@ impl Core {
                 let _ = self.state.select_topic(conversation_id, topic);
             }
             Intent::CloseTopic { conversation_id } => {
-                if self.state.selected_conversation.as_deref() == Some(conversation_id.as_str()) {
+                if self.state.pane.conversation.as_deref() == Some(conversation_id.as_str()) {
                     self.state.close_open_topic();
                 }
             }
@@ -1046,7 +1046,7 @@ impl Core {
                 if self.state.has_session(key.protocol) {
                     self.state.select_protocol(key.protocol);
                 }
-                if self.state.selected_protocol == key.protocol
+                if self.state.pane.protocol == key.protocol
                     && self
                         .state
                         .conversation(key.protocol, &key.conversation_id)
@@ -1157,8 +1157,8 @@ impl Core {
                 conversation_id,
                 message_id,
             } => {
-                if self.state.selected_protocol == protocol
-                    && self.state.selected_conversation.as_deref() == Some(conversation_id.as_str())
+                if self.state.pane.protocol == protocol
+                    && self.state.pane.conversation.as_deref() == Some(conversation_id.as_str())
                 {
                     self.state.jump_to_message(&message_id);
                 }
@@ -1759,15 +1759,15 @@ mod tests {
         signal.mark_seen();
         core.dispatch(Intent::SetSearch("alice".into()));
         assert!(signal.has_changed());
-        assert_eq!(core.view().search, "alice");
-        core.state.selected_conversation = Some("telegram:1".into());
+        assert_eq!(core.view().pane.search, "alice");
+        core.state.pane.conversation = Some("telegram:1".into());
         core.dispatch(Intent::SetDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "hello".into(),
             topic: None,
         });
-        assert_eq!(core.view().compose, "hello");
+        assert_eq!(core.view().pane.compose, "hello");
         core.dispatch(Intent::SetTheme(ThemeMode::Dark));
         assert_eq!(core.view().theme(), ThemeMode::Dark);
     }
@@ -3334,7 +3334,7 @@ mod tests {
 
         let mut core = memory_core();
         core.state = ready_with_chats(&core.secrets);
-        core.state.compose = "draft for Ada".into();
+        core.state.pane.compose = "draft for Ada".into();
         core.dispatch(Intent::SelectConversation {
             id: "telegram:1".into(),
         });
@@ -3365,11 +3365,8 @@ mod tests {
             matches!(&core.take_notify()[..], [NotifyCommand::Show(_)]),
             "the message is shown, not opened"
         );
-        assert_eq!(
-            core.view().selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
-        assert_eq!(core.view().compose, "draft for Ada");
+        assert_eq!(core.view().pane.conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(core.view().pane.compose, "draft for Ada");
         assert!(!core.view().wants_scroll_to_selected());
         assert!(!core.view().wants_focus_compose());
 
@@ -3379,10 +3376,7 @@ mod tests {
             topic: None,
         };
         core.dispatch(Intent::OpenFromNotification(key));
-        assert_eq!(
-            core.view().selected_conversation.as_deref(),
-            Some("telegram:2")
-        );
+        assert_eq!(core.view().pane.conversation.as_deref(), Some("telegram:2"));
         assert!(
             core.view().wants_scroll_to_selected(),
             "a click scrolls that chat into view"
@@ -3536,18 +3530,15 @@ mod tests {
             topic: Some(MessageTopic::Forum(8)),
         };
         core.dispatch(Intent::OpenFromNotification(missing));
-        assert_eq!(
-            core.view().selected_conversation.as_deref(),
-            Some("telegram:9")
-        );
-        assert!(core.view().selected_topic.is_none());
+        assert_eq!(core.view().pane.conversation.as_deref(), Some("telegram:9"));
+        assert!(core.view().pane.topic.is_none());
         let known = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:9".into(),
             topic: Some(MessageTopic::Forum(2)),
         };
         core.dispatch(Intent::OpenFromNotification(known));
-        assert_eq!(core.view().selected_topic, Some(MessageTopic::Forum(2)));
+        assert_eq!(core.view().pane.topic, Some(MessageTopic::Forum(2)));
     }
 
     /// A topic muted in Telegram does not notify, and an open topic is named
@@ -3567,7 +3558,7 @@ mod tests {
         core.state
             .apply(AdapterEvent::ConversationUpsert { conversation: camp });
         assert_ne!(
-            core.view().selected_conversation.as_deref(),
+            core.view().pane.conversation.as_deref(),
             Some("telegram:9"),
             "the forum stays closed"
         );
@@ -3679,7 +3670,7 @@ mod tests {
             "{shown:?}"
         );
         assert_ne!(
-            core.view().selected_conversation.as_deref(),
+            core.view().pane.conversation.as_deref(),
             Some("telegram:9"),
             "notifying does not open the forum"
         );
@@ -4062,32 +4053,29 @@ mod tests {
             topic: Some(trail),
             text: "bring water".into(),
         });
-        assert_eq!(core.view().compose, "bring water");
+        assert_eq!(core.view().pane.compose, "bring water");
         core.dispatch(Intent::Key(crate::AuthKey::Escape));
         assert!(core.view().showing_topic_list());
-        assert!(core.view().selected_topic.is_none());
-        assert_eq!(core.view().compose, "");
+        assert!(core.view().pane.topic.is_none());
+        assert_eq!(core.view().pane.compose, "");
         core.dispatch(Intent::SelectTopic {
             conversation_id: "telegram:9".into(),
             topic: trail,
         });
-        assert_eq!(core.view().compose, "bring water");
-        assert_eq!(core.view().selected_topic, Some(trail));
+        assert_eq!(core.view().pane.compose, "bring water");
+        assert_eq!(core.view().pane.topic, Some(trail));
 
         // The breadcrumb goes back to the topic list too. A close for
         // another chat does nothing.
         core.dispatch(Intent::CloseTopic {
             conversation_id: "telegram:1".into(),
         });
-        assert_eq!(core.view().selected_topic, Some(trail));
+        assert_eq!(core.view().pane.topic, Some(trail));
         core.dispatch(Intent::CloseTopic {
             conversation_id: "telegram:9".into(),
         });
         assert!(core.view().showing_topic_list());
-        assert_eq!(
-            core.view().selected_conversation.as_deref(),
-            Some("telegram:9")
-        );
+        assert_eq!(core.view().pane.conversation.as_deref(), Some("telegram:9"));
     }
 
     /// A notification for a topic opens the forum when that forum's topics
@@ -4107,20 +4095,14 @@ mod tests {
         core.dispatch(Intent::SelectConversation {
             id: "telegram:1".into(),
         });
-        assert_eq!(
-            core.view().selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
+        assert_eq!(core.view().pane.conversation.as_deref(), Some("telegram:1"));
         core.dispatch(Intent::OpenFromNotification(NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:9".into(),
             topic: Some(MessageTopic::Forum(2)),
         }));
-        assert_eq!(
-            core.view().selected_conversation.as_deref(),
-            Some("telegram:9")
-        );
-        assert!(core.view().selected_topic.is_none());
+        assert_eq!(core.view().pane.conversation.as_deref(), Some("telegram:9"));
+        assert!(core.view().pane.topic.is_none());
         assert!(core.view().showing_topic_list());
         assert!(
             core.view()
@@ -4515,14 +4497,14 @@ mod tests {
         );
 
         // A click for a protocol with no session changes no selection.
-        let selected = core.view().selected_conversation.clone();
+        let selected = core.view().pane.conversation.clone();
         core.dispatch(Intent::OpenFromNotification(NotifyKey {
             protocol: ProtocolId::Slack,
             conversation_id: "telegram:2".into(),
             topic: None,
         }));
-        assert_eq!(core.view().selected_protocol, ProtocolId::Telegram);
-        assert_eq!(core.view().selected_conversation, selected);
+        assert_eq!(core.view().pane.protocol, ProtocolId::Telegram);
+        assert_eq!(core.view().pane.conversation, selected);
 
         // Shutdown: the shown notification gets its dismiss.
         core.dispatch(Intent::Shutdown);
@@ -4649,13 +4631,17 @@ mod tests {
             text: "for Ada only".into(),
             topic: None,
         });
-        assert_eq!(core.view().compose, "", "chat 2 gets no text from chat 1");
+        assert_eq!(
+            core.view().pane.compose,
+            "",
+            "chat 2 gets no text from chat 1"
+        );
 
         core.dispatch(Intent::SelectConversation {
             id: "telegram:1".into(),
         });
         assert_eq!(
-            core.view().compose,
+            core.view().pane.compose,
             "for Ada only",
             "chat 1 keeps its draft"
         );
@@ -4846,7 +4832,7 @@ mod tests {
         assert_eq!(woke.ok(), Some(true), "the wake fired the change signal");
         assert!(core.pump(), "pump reports the expiry");
         assert!(core.view().can_send(), "the chat is unlocked");
-        assert_eq!(core.view().compose, "hello", "the text stays");
+        assert_eq!(core.view().pane.compose, "hello", "the text stays");
         assert!(core.send_wake.is_none(), "no send left, no wake");
     }
 
@@ -4895,12 +4881,12 @@ mod tests {
             unreachable!("matched above");
         };
         assert!(core.sending(), "Shutdown does not drop the send");
-        assert_eq!(core.view().compose, "hello", "kept until the answer");
+        assert_eq!(core.view().pane.compose, "hello", "kept until the answer");
 
         events_tx.send(answer(true, request)).expect("queue");
         assert!(core.pump());
         assert_eq!(
-            core.view().compose,
+            core.view().pane.compose,
             "",
             "the accept after Shutdown settles it"
         );
@@ -5240,7 +5226,7 @@ mod tests {
         events_tx.send(answer(true, request)).expect("queue");
         core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
         assert!(core.pump());
-        assert_eq!(core.view().compose, "", "the sent text is cleared");
+        assert_eq!(core.view().pane.compose, "", "the sent text is cleared");
         assert!(core.view().error.is_none(), "no timeout error stays");
     }
 
@@ -5252,7 +5238,7 @@ mod tests {
         events_tx.send(answer(false, request)).expect("queue");
         core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
         assert!(core.pump());
-        assert_eq!(core.view().compose, "hello", "the text stays");
+        assert_eq!(core.view().pane.compose, "hello", "the text stays");
         assert_eq!(
             core.view().error.as_ref().map(|error| error.why.as_str()),
             Some("Telegram did not answer in time.")
@@ -5268,11 +5254,11 @@ mod tests {
         let (mut core, events_tx, request) = core_with_unanswered_send();
         core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
         assert!(core.pump(), "the send expired");
-        assert_eq!(core.view().compose, "hello");
+        assert_eq!(core.view().pane.compose, "hello");
         events_tx.send(answer(true, request)).expect("queue");
         core.state.age_sends_for_test(crate::sends::EXPIRED_KEEP);
         assert!(core.pump());
-        assert_eq!(core.view().compose, "", "the sent text is cleared");
+        assert_eq!(core.view().pane.compose, "", "the sent text is cleared");
     }
 
     /// An accept before the deadline settles the send the normal way. Its
@@ -5307,7 +5293,7 @@ mod tests {
         events_tx.send(row(Delivery::Pending)).expect("queue");
         events_tx.send(answer(true, request)).expect("queue");
         assert!(core.pump());
-        assert_eq!(core.view().compose, "");
+        assert_eq!(core.view().pane.compose, "");
         assert!(core.view().error.is_none());
         events_tx.send(row(Delivery::Sent)).expect("queue");
         events_tx

@@ -21,8 +21,7 @@ use thinwire_protocol::ProtocolKind;
 /// step. With no helper program there is no button: the account row already
 /// says to reinstall (ADR 0013 decision 6).
 pub(crate) fn link_offer(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
-    if !snapshot.selected_protocol.is(ProtocolKind::Signal) || !snapshot.signal_linking_available()
-    {
+    if !snapshot.pane.protocol.is(ProtocolKind::Signal) || !snapshot.signal_linking_available() {
         return;
     }
     let linked = snapshot

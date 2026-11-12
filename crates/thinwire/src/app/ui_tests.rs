@@ -51,7 +51,7 @@ fn compose_ui_uses_enter_multiline_and_disabled_send() {
     let ui = include_str!("ui.rs");
     let compose = &ui[ui.find("fn compose(").expect("compose")..];
     let compose = &compose[..compose.find("\nfn ").expect("next")];
-    assert!(compose.contains("edited(ui, &snapshot.compose"));
+    assert!(compose.contains("edited(ui, &snapshot.pane.compose"));
     assert!(compose.contains("TextEdit::multiline(text)"));
     // Plain Enter sends and is eaten, so the field does not also add a line.
     // Shift+Enter misses this branch. A closed topic or a removed Signal
@@ -704,7 +704,7 @@ fn busy_lines_leave_the_strip_and_failures_stay_on_it() {
     use super::ui::{busy_line, status_strip_visible};
     let store = SecretStore::memory();
     let mut snapshot = settled(&store);
-    snapshot.compose = "hello".into();
+    snapshot.pane.compose = "hello".into();
     snapshot.send_compose();
     assert_eq!(busy_line(&snapshot).as_deref(), Some(SENDING_STATUS));
     assert!(

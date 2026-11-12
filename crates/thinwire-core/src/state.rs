@@ -607,36 +607,61 @@ impl SplitSide {
     }
 }
 
-/// What one pane of the split view shows. `Debug` prints no chat id and no
-/// search text.
+/// What one pane shows: the account, the chat, the topic, the search of
+/// the chat list, the compose text, and the keyboard highlight. Every value
+/// that belongs to a pane is here, so a change of pane is one exchange of
+/// this value. `Debug` prints no chat id, no search text, and no compose
+/// text.
 #[derive(Clone, PartialEq, Eq)]
-struct PaneView {
-    protocol: ProtocolId,
-    signal_retained: Option<u32>,
-    conversation: Option<String>,
-    topic: Option<MessageTopic>,
-    search: String,
+pub struct Pane {
+    pub protocol: ProtocolId,
+    /// The previous Signal account open in the switcher. `None` is the live
+    /// Signal number, or another protocol. The number is a slot, not an
+    /// account id.
+    pub(crate) signal_retained: Option<u32>,
+    pub conversation: Option<String>,
+    /// The open topic of the selected chat. `None` is the topic list, or a
+    /// chat that has no topics.
+    pub topic: Option<MessageTopic>,
+    pub search: String,
+    pub compose: String,
+    /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
+    pub focused_row: Option<String>,
 }
 
-impl std::fmt::Debug for PaneView {
+impl Pane {
+    fn new(protocol: ProtocolId) -> Self {
+        Self {
+            protocol,
+            signal_retained: None,
+            conversation: None,
+            topic: None,
+            search: String::new(),
+            compose: String::new(),
+            focused_row: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Pane {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PaneView")
+        f.debug_struct("Pane")
             .field("protocol", &self.protocol)
+            .field("signal_retained", &self.signal_retained)
             .field("has_chat", &self.conversation.is_some())
             .finish()
     }
 }
 
-/// The split view. The `selected_*` fields of the snapshot are the pane
-/// with the focus, and `other` is the second pane.
+/// The split view. `Snapshot::pane` is the pane with the focus, and
+/// `other` is the second pane.
 #[derive(Debug)]
 struct Split {
-    other: PaneView,
+    /// The second pane. Its compose text is empty and it has no keyboard
+    /// highlight: the draft of its thread is in `Snapshot::drafts`.
+    other: Pane,
     /// The side of the pane with the focus.
     active: SplitSide,
-    /// The compose text and the keyboard highlight of the pane with the
-    /// focus, while the frontend draws the other pane (`peek_other_pane`).
-    peeked: Option<(String, Option<String>)>,
 }
 
 pub struct Snapshot {
@@ -645,17 +670,11 @@ pub struct Snapshot {
     messages: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<ChatMessage>>,
     /// Forum topics and bot threads, keyed by protocol and chat.
     topics: HashMap<(ProtocolId, String), Vec<ChatTopic>>,
-    pub selected_protocol: ProtocolId,
-    pub selected_conversation: Option<String>,
-    /// The open topic of the selected chat. `None` is the topic list, or a
-    /// chat that has no topics.
-    pub selected_topic: Option<MessageTopic>,
-    /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
-    pub focused_row: Option<String>,
+    /// What the pane with the focus shows. With one pane, it is the window.
+    pub pane: Pane,
     /// Read-only notice opened from Unofficial or Ban risk. It does not
     /// start a link and it does not cancel one.
     notice_review: Option<ProtocolId>,
-    pub search: String,
     pub auth: AuthScreen,
     pub telegram_api_id: String,
     pub telegram_api_hash: String,
@@ -686,7 +705,6 @@ pub struct Snapshot {
     /// Last outgoing message id the other party has read, per chat.
     /// Telegram `last_read_outbox_message_id`. A later id does not move it back.
     outbox_read: HashMap<(ProtocolId, String), i64>,
-    pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
     pub auth_notice: Option<String>,
@@ -898,10 +916,6 @@ pub struct Snapshot {
     /// shows the check. Keys stay, and this is not removal.
     #[cfg(feature = "signal-local")]
     signal_checking: bool,
-    /// The previous Signal account open in the switcher. `None` is the live
-    /// Signal number, or another protocol. The number is a slot, not an
-    /// account id.
-    selected_signal_retained: Option<u32>,
     /// The split view: the pane that does not have the focus. `None` is
     /// one pane.
     split: Option<Split>,
@@ -1007,7 +1021,7 @@ impl std::fmt::Debug for Snapshot {
             .collect();
         let mut out = f.debug_struct("Snapshot");
         out.field("accounts", &accounts)
-            .field("selected_protocol", &self.selected_protocol)
+            .field("pane", &self.pane)
             .field("notice_review", &self.notice_review)
             .field("auth", &self.auth)
             .field("auth_busy", &self.auth_busy)
@@ -1032,8 +1046,7 @@ impl std::fmt::Debug for Snapshot {
             .field("signal_inbox_open", &self.signal_inbox_open)
             .field("signal_removed", &self.signal_removed)
             .field("signal_checking", &self.signal_checking);
-        out.field("selected_signal_retained", &self.selected_signal_retained)
-            .field("retained_publish", &self.retained_publish);
+        out.field("retained_publish", &self.retained_publish);
         out.finish_non_exhaustive()
     }
 }
@@ -1136,12 +1149,8 @@ impl Snapshot {
             conversations: HashMap::new(),
             messages: HashMap::new(),
             topics: HashMap::new(),
-            selected_protocol: ProtocolId::Telegram,
-            selected_conversation: None,
-            selected_topic: None,
-            focused_row: None,
+            pane: Pane::new(ProtocolId::Telegram),
             notice_review: None,
-            search: String::new(),
             auth: AuthScreen::Idle,
             telegram_api_id: String::new(),
             telegram_api_hash: String::new(),
@@ -1155,7 +1164,6 @@ impl Snapshot {
             telegram_send_unconfirmed: Vec::new(),
             telegram_unbound_messages: Vec::new(),
             outbox_read: HashMap::new(),
-            compose: String::new(),
             auth_busy: false,
             auth_notice: None,
             auth_rejection: None,
@@ -1254,7 +1262,6 @@ impl Snapshot {
             signal_removed: false,
             #[cfg(feature = "signal-local")]
             signal_checking: false,
-            selected_signal_retained: None,
             split: None,
             retained_publish: None,
         }
@@ -1983,8 +1990,8 @@ impl Snapshot {
         self.end_session(account);
         self.accounts.retain(|row| row.caps.id != account);
         self.stopped.remove(&account);
-        if self.selected_protocol == account {
-            self.selected_protocol = account.first_account();
+        if self.pane.protocol == account {
+            self.pane.protocol = account.first_account();
             self.set_selected_conversation(None);
         }
     }
@@ -2436,7 +2443,7 @@ impl Snapshot {
         }
         // Any linked protocol shows the inbox, not only Telegram (shell plan 2).
         // A previous Signal number is local history. It opens with no session.
-        if self.any_linked() || self.selected_signal_retained.is_some() {
+        if self.any_linked() || self.pane.signal_retained.is_some() {
             return CenterView::Thread;
         }
         if self.keychain_failed && !self.keychain_retry {
@@ -2483,11 +2490,11 @@ impl Snapshot {
         }
         // Park the draft under the old protocol before the protocol changes.
         self.set_selected_conversation(None);
-        self.selected_protocol = protocol;
+        self.pane.protocol = protocol;
         // The live account of that protocol. A previous Signal number has
         // its own row.
-        self.selected_signal_retained = None;
-        self.focused_row = None;
+        self.pane.signal_retained = None;
+        self.pane.focused_row = None;
         self.ensure_conversation_selection();
     }
 
@@ -2501,20 +2508,19 @@ impl Snapshot {
             return;
         }
         self.set_selected_conversation(None);
-        self.selected_protocol = ProtocolId::Signal;
-        self.selected_signal_retained = Some(slot);
-        self.focused_row = None;
+        self.pane.protocol = ProtocolId::Signal;
+        self.pane.signal_retained = Some(slot);
+        self.pane.focused_row = None;
         self.ensure_conversation_selection();
     }
 
-    /// What the pane with the focus shows now.
-    fn pane_view(&self) -> PaneView {
-        PaneView {
-            protocol: self.selected_protocol,
-            signal_retained: self.selected_signal_retained,
-            conversation: self.selected_conversation.clone(),
-            topic: self.selected_topic,
-            search: self.search.clone(),
+    /// The selection as the pane without the focus keeps it: the draft of
+    /// its thread goes to `drafts`, and the keyboard highlight goes.
+    fn parked_pane(&self) -> Pane {
+        Pane {
+            compose: String::new(),
+            focused_row: None,
+            ..self.pane.clone()
         }
     }
 
@@ -2547,9 +2553,8 @@ impl Snapshot {
         }
         if self.split.is_none() {
             self.split = Some(Split {
-                other: self.pane_view(),
+                other: self.parked_pane(),
                 active: SplitSide::Right,
-                peeked: None,
             });
             // Each pane has its own search.
             self.set_search(String::new());
@@ -2569,13 +2574,13 @@ impl Snapshot {
         let Some(split) = self.split.take() else {
             return;
         };
-        let here = self.pane_view();
+        let here = self.parked_pane();
         let there = split.other;
         match there.signal_retained {
             Some(slot) => self.select_retained_signal(slot),
             None => self.select_protocol(there.protocol),
         }
-        if self.selected_protocol == there.protocol
+        if self.pane.protocol == there.protocol
             && let Some(id) = there.conversation
             && self.conversation(there.protocol, &id).is_some()
         {
@@ -2590,7 +2595,6 @@ impl Snapshot {
         self.split = Some(Split {
             other: here,
             active: split.active.other(),
-            peeked: None,
         });
     }
 
@@ -2605,55 +2609,49 @@ impl Snapshot {
         }
     }
 
-    /// Change the selection to the other pane, or back, for one draw of the
-    /// frontend. It moves no draft and sends no command: the second call
-    /// puts every value back. The compose text of the other pane is the
-    /// draft of its thread.
-    pub(crate) fn peek_other_pane(&mut self) {
-        let Some(mut split) = self.split.take() else {
+    /// Make the other pane the selection for one draw of the frontend.
+    /// It moves no draft and sends no command. The compose text of the
+    /// other pane is a copy of the draft of its thread.
+    /// [`Self::leave_other_pane`] puts the selection back.
+    pub(crate) fn enter_other_pane(&mut self) {
+        let Some(split) = self.split.as_mut() else {
             return;
         };
-        let here = self.pane_view();
-        let there = std::mem::replace(&mut split.other, here);
-        self.selected_protocol = there.protocol;
-        self.selected_signal_retained = there.signal_retained;
-        self.selected_conversation = there.conversation;
-        self.selected_topic = there.topic;
-        self.search = there.search;
-        match split.peeked.take() {
-            Some((compose, focused_row)) => {
-                self.compose = compose;
-                self.focused_row = focused_row;
-            }
-            None => {
-                let draft = self
-                    .selected_conversation
-                    .as_ref()
-                    .and_then(|id| {
-                        self.drafts
-                            .get(&(self.selected_protocol, id.clone(), self.selected_topic))
-                    })
-                    .cloned()
-                    .unwrap_or_default();
-                split.peeked = Some((
-                    std::mem::replace(&mut self.compose, draft),
-                    self.focused_row.take(),
-                ));
-            }
-        }
-        self.split = Some(split);
+        std::mem::swap(&mut self.pane, &mut split.other);
+        let draft = self
+            .pane
+            .conversation
+            .as_ref()
+            .and_then(|id| {
+                self.drafts
+                    .get(&(self.pane.protocol, id.clone(), self.pane.topic))
+            })
+            .cloned()
+            .unwrap_or_default();
+        self.pane.compose = draft;
+    }
+
+    /// End [`Self::enter_other_pane`]: the pane with the focus is the
+    /// selection again, with its compose text and its keyboard highlight.
+    pub(crate) fn leave_other_pane(&mut self) {
+        let Some(split) = self.split.as_mut() else {
+            return;
+        };
+        std::mem::swap(&mut self.pane, &mut split.other);
+        split.other.compose.clear();
+        split.other.focused_row = None;
     }
 
     /// The open account row is selected in the switcher.
     #[must_use]
     pub fn account_row_selected(&self, account: &AccountRow) -> bool {
-        if self.selected_protocol != account.caps.id {
+        if self.pane.protocol != account.caps.id {
             return false;
         }
         if !account.caps.id.is(ProtocolKind::Signal) {
             return true;
         }
-        self.selected_signal_retained == account.signal_retained
+        self.pane.signal_retained == account.signal_retained
     }
 
     /// Why the open Signal chat cannot send, when it is a previous number.
@@ -2661,10 +2659,10 @@ impl Snapshot {
     /// `None` for the live number and for every other protocol.
     #[must_use]
     pub fn signal_read_only_reason(&self) -> Option<&'static str> {
-        if self.selected_protocol != ProtocolId::Signal {
+        if self.pane.protocol != ProtocolId::Signal {
             return None;
         }
-        let slot = self.selected_signal_retained?;
+        let slot = self.pane.signal_retained?;
         let unreadable = self
             .accounts
             .iter()
@@ -2680,10 +2678,10 @@ impl Snapshot {
     /// That row has no composer and no Send control.
     #[must_use]
     pub fn hides_composer(&self) -> bool {
-        if self.selected_protocol != ProtocolId::Signal {
+        if self.pane.protocol != ProtocolId::Signal {
             return false;
         }
-        let Some(slot) = self.selected_signal_retained else {
+        let Some(slot) = self.pane.signal_retained else {
             return false;
         };
         self.accounts
@@ -2722,9 +2720,9 @@ impl Snapshot {
     /// A click, Enter on the highlight, and a notification click all come here.
     /// A later message does not: the list stays where the user left it.
     pub fn select_conversation(&mut self, id: String) {
-        self.focused_row = Some(id.clone());
+        self.pane.focused_row = Some(id.clone());
         let has_topics = self
-            .conversation(self.selected_protocol, &id)
+            .conversation(self.pane.protocol, &id)
             .is_some_and(|row| row.has_topics);
         self.set_selection(Some(id), None);
         // The topic list has no compose field.
@@ -2736,7 +2734,7 @@ impl Snapshot {
     /// Open one topic of the selected chat. A hidden topic is not a row.
     /// `false` when that topic is not loaded: the caller can open the chat.
     pub fn select_topic(&mut self, conversation_id: String, topic: MessageTopic) -> bool {
-        let protocol = self.selected_protocol;
+        let protocol = self.pane.protocol;
         let Some(row) = self
             .topics
             .get(&(protocol, conversation_id.clone()))
@@ -2748,9 +2746,9 @@ impl Snapshot {
             return false;
         }
         let closed = row.closed;
-        let same_chat = self.selected_conversation.as_deref() == Some(conversation_id.as_str());
+        let same_chat = self.pane.conversation.as_deref() == Some(conversation_id.as_str());
         if !same_chat {
-            self.focused_row = Some(conversation_id.clone());
+            self.pane.focused_row = Some(conversation_id.clone());
             self.scroll_to_selected = true;
         }
         self.set_selection(Some(conversation_id), Some(topic));
@@ -2762,10 +2760,10 @@ impl Snapshot {
     /// Leave the open topic and show its topic list. The draft stays with
     /// the topic.
     pub fn close_open_topic(&mut self) {
-        if self.selected_topic.is_none() {
+        if self.pane.topic.is_none() {
             return;
         }
-        let id = self.selected_conversation.clone();
+        let id = self.pane.conversation.clone();
         self.set_selection(id, None);
         self.focus_compose = false;
     }
@@ -2787,9 +2785,10 @@ impl Snapshot {
             return None;
         }
         let current = self
+            .pane
             .focused_row
             .as_deref()
-            .or(self.selected_conversation.as_deref())
+            .or(self.pane.conversation.as_deref())
             .and_then(|id| ids.iter().position(|row| row == id));
         let next = match current {
             Some(index) => (index as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize,
@@ -2797,14 +2796,14 @@ impl Snapshot {
             None => 0,
         };
         let id = ids[next].clone();
-        (self.focused_row.as_deref() != Some(id.as_str())).then_some(id)
+        (self.pane.focused_row.as_deref() != Some(id.as_str())).then_some(id)
     }
 
     pub fn move_inbox_selection(&mut self, delta: i32) {
         let Some(id) = self.inbox_move_target(delta) else {
             return;
         };
-        self.focused_row = Some(id);
+        self.pane.focused_row = Some(id);
         self.sync_focused_row(FocusFollow::Moved);
     }
 
@@ -2813,7 +2812,7 @@ impl Snapshot {
     pub fn focus_inbox_row(&mut self, id: String) {
         let visible = self.visible_conversations().iter().any(|row| row.id == id);
         if visible {
-            self.focused_row = Some(id);
+            self.pane.focused_row = Some(id);
         }
     }
 
@@ -2821,7 +2820,7 @@ impl Snapshot {
     /// True when this chat of this protocol is the selected one.
     #[must_use]
     pub fn is_selected_chat(&self, protocol: ProtocolId, chat: &str) -> bool {
-        self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(chat)
+        self.pane.protocol == protocol && self.pane.conversation.as_deref() == Some(chat)
     }
 
     /// Store unsent text of one chat. The selected chat keeps it in `compose`,
@@ -2835,7 +2834,7 @@ impl Snapshot {
         text: String,
     ) {
         if self.is_selected_thread(protocol, chat, topic) {
-            self.compose = text;
+            self.pane.compose = text;
         } else if text.is_empty() {
             self.drafts.remove(&(protocol, chat.to_owned(), topic));
         } else {
@@ -2860,7 +2859,7 @@ impl Snapshot {
         {
             return;
         }
-        let empty = self.compose.trim().is_empty();
+        let empty = self.pane.compose.trim().is_empty();
         let thread = (protocol, chat.to_owned(), topic);
         if let Some(typing) = self.typing.draft_changed(thread, empty, now) {
             self.push(AdapterCommand::SetTyping {
@@ -2899,7 +2898,8 @@ impl Snapshot {
             .any(|row| row.caps.id == protocol && row.linked() && row.caps.typing);
         let topic_open = self.selected_topic_row().is_none_or(|topic| !topic.closed);
         let retained = self
-            .selected_conversation
+            .pane
+            .conversation
             .as_deref()
             .is_some_and(|id| thinwire_protocol::signal_retained_slot(id).is_some());
         typing
@@ -2914,8 +2914,8 @@ impl Snapshot {
     /// when nobody types.
     #[must_use]
     pub fn typing_line(&self) -> Option<String> {
-        let chat = self.selected_conversation.clone()?;
-        let thread = (self.selected_protocol, chat, self.selected_topic);
+        let chat = self.pane.conversation.clone()?;
+        let thread = (self.pane.protocol, chat, self.pane.topic);
         crate::typing::typing_line(&self.typing.names(&thread))
     }
 
@@ -2979,11 +2979,11 @@ impl Snapshot {
     /// The tray of the open thread.
     #[must_use]
     pub fn compose_attachments(&self) -> &[OutgoingFile] {
-        let Some(chat) = self.selected_conversation.clone() else {
+        let Some(chat) = self.pane.conversation.clone() else {
             return &[];
         };
         self.attachments
-            .get(&(self.selected_protocol, chat, self.selected_topic))
+            .get(&(self.pane.protocol, chat, self.pane.topic))
             .map_or(&[], Vec::as_slice)
     }
 
@@ -3030,7 +3030,7 @@ impl Snapshot {
         chat: &str,
         topic: Option<MessageTopic>,
     ) -> bool {
-        self.is_selected_chat(protocol, chat) && self.selected_topic == topic
+        self.is_selected_chat(protocol, chat) && self.pane.topic == topic
     }
 
     /// What the message menu offers for the linked account of `protocol`.
@@ -3064,7 +3064,7 @@ impl Snapshot {
         message_id: &str,
     ) {
         if !self.message_actions(protocol).reply
-            || !self.is_selected_thread(protocol, conversation_id, self.selected_topic)
+            || !self.is_selected_thread(protocol, conversation_id, self.pane.topic)
             || !self
                 .selected_messages()
                 .iter()
@@ -3076,7 +3076,7 @@ impl Snapshot {
         self.replying = Some(ReplyTarget {
             protocol,
             conversation_id: conversation_id.to_owned(),
-            topic: self.selected_topic,
+            topic: self.pane.topic,
             message_id: message_id.to_owned(),
         });
     }
@@ -3116,7 +3116,7 @@ impl Snapshot {
         message_id: &str,
     ) {
         if !self.message_actions(protocol).edit
-            || !self.is_selected_thread(protocol, conversation_id, self.selected_topic)
+            || !self.is_selected_thread(protocol, conversation_id, self.pane.topic)
         {
             return;
         }
@@ -3131,24 +3131,24 @@ impl Snapshot {
         };
         let draft = match self.editing.take() {
             Some(old) => old.draft,
-            None => std::mem::take(&mut self.compose),
+            None => std::mem::take(&mut self.pane.compose),
         };
         self.replying = None;
         self.editing = Some(EditTarget {
             protocol,
             conversation_id: conversation_id.to_owned(),
-            topic: self.selected_topic,
+            topic: self.pane.topic,
             message_id: message_id.to_owned(),
             draft,
         });
-        self.compose = body;
+        self.pane.compose = body;
         self.focus_compose = true;
     }
 
     /// End the edit with no change. The draft of the thread comes back.
     pub(crate) fn cancel_edit(&mut self) {
         if let Some(target) = self.editing.take() {
-            self.compose = target.draft;
+            self.pane.compose = target.draft;
         }
     }
 
@@ -3181,7 +3181,7 @@ impl Snapshot {
     /// A message of the open thread that can be forwarded on `protocol`.
     fn forwardable(&self, protocol: ProtocolId, conversation_id: &str, message_id: &str) -> bool {
         self.message_actions(protocol).forward
-            && self.is_selected_thread(protocol, conversation_id, self.selected_topic)
+            && self.is_selected_thread(protocol, conversation_id, self.pane.topic)
             && self
                 .selected_messages()
                 .iter()
@@ -3199,7 +3199,7 @@ impl Snapshot {
         if !self.forwardable(protocol, conversation_id, message_id) {
             return;
         }
-        let topic = self.selected_topic;
+        let topic = self.pane.topic;
         let same_thread = self.selection.as_ref().is_some_and(|selection| {
             selection.protocol == protocol
                 && selection.conversation_id == conversation_id
@@ -3333,7 +3333,7 @@ impl Snapshot {
     /// save the new text. An empty text keeps the edit open. The same text
     /// ends the edit with no command.
     fn save_edit(&mut self) {
-        let body = self.compose.trim().to_owned();
+        let body = self.pane.compose.trim().to_owned();
         let Some(message) = self.edit_target() else {
             self.cancel_edit();
             return;
@@ -3409,7 +3409,7 @@ impl Snapshot {
         if !actions.react || emoji.is_empty() || emoji.len() > MAX_EMOJI_BYTES {
             return;
         }
-        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+        if !self.is_selected_thread(protocol, conversation_id, self.pane.topic) {
             return;
         }
         let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
@@ -3437,28 +3437,28 @@ impl Snapshot {
     /// Change the open chat and topic. The compose text stays with the
     /// thread it was typed in.
     fn set_selection(&mut self, id: Option<String>, topic: Option<MessageTopic>) {
-        if self.selected_conversation == id && self.selected_topic == topic {
+        if self.pane.conversation == id && self.pane.topic == topic {
             return;
         }
         // The edit text never becomes a draft.
         self.cancel_edit();
         self.reply_jump = None;
         self.scroll_to_message = None;
-        let draft = std::mem::take(&mut self.compose);
-        if let Some(old) = self.selected_conversation.clone()
+        let draft = std::mem::take(&mut self.pane.compose);
+        if let Some(old) = self.pane.conversation.clone()
             && !draft.is_empty()
         {
             self.drafts
-                .insert((self.selected_protocol, old, self.selected_topic), draft);
+                .insert((self.pane.protocol, old, self.pane.topic), draft);
         }
-        self.selected_topic = topic;
+        self.pane.topic = topic;
         if let Some(new) = id.as_ref() {
-            self.compose = self
+            self.pane.compose = self
                 .drafts
-                .remove(&(self.selected_protocol, new.clone(), topic))
+                .remove(&(self.pane.protocol, new.clone(), topic))
                 .unwrap_or_default();
         }
-        self.selected_conversation = id;
+        self.pane.conversation = id;
     }
 
     /// Drop older-page memory of one chat, for every topic.
@@ -3517,7 +3517,7 @@ impl Snapshot {
     /// chat has no send or retry in flight.
     #[must_use]
     pub fn can_send(&self) -> bool {
-        let protocol = self.selected_protocol;
+        let protocol = self.pane.protocol;
         let sends_text = self
             .accounts
             .iter()
@@ -3525,17 +3525,18 @@ impl Snapshot {
         let topic_open = self.selected_topic_row().is_none_or(|topic| !topic.closed);
         // A previous Signal number stays in the switcher. It cannot send.
         let retained = self
-            .selected_conversation
+            .pane
+            .conversation
             .as_deref()
             .is_some_and(|id| thinwire_protocol::signal_retained_slot(id).is_some());
         if self.edit_target().is_some() {
-            return sends_text && !retained && !self.compose.trim().is_empty();
+            return sends_text && !retained && !self.pane.compose.trim().is_empty();
         }
         let has_files = !self.compose_attachments().is_empty();
         sends_text
             && !retained
             && topic_open
-            && (!self.compose.trim().is_empty() || has_files)
+            && (!self.pane.compose.trim().is_empty() || has_files)
             && (!has_files || self.sends_media(protocol))
             && self
                 .selected_conversation_row()
@@ -3554,10 +3555,10 @@ impl Snapshot {
 
     /// Send a failed outgoing message again. Only a `Failed` row queues a command.
     pub fn retry_send(&mut self, message_id: &str) {
-        let Some(conversation_id) = self.selected_conversation.clone() else {
+        let Some(conversation_id) = self.pane.conversation.clone() else {
             return;
         };
-        let protocol = self.selected_protocol;
+        let protocol = self.pane.protocol;
         // The same checks as Send (PR #68 review): the protocol is linked and
         // sends text, and the chat is writable. The tracker checks in-flight.
         let sends_text = self
@@ -3573,7 +3574,7 @@ impl Snapshot {
         }
         let Some(message) = self
             .messages
-            .get_mut(&thread_key(protocol, &conversation_id, self.selected_topic))
+            .get_mut(&thread_key(protocol, &conversation_id, self.pane.topic))
             .and_then(|list| list.iter_mut().find(|row| row.id == message_id))
         else {
             return;
@@ -3589,8 +3590,8 @@ impl Snapshot {
             return;
         };
         message.delivery = Delivery::Pending;
-        if self.compose == message.body {
-            self.compose.clear();
+        if self.pane.compose == message.body {
+            self.pane.compose.clear();
         }
         self.error = None;
         self.push(AdapterCommand::ResendMessage {
@@ -3603,10 +3604,10 @@ impl Snapshot {
 
     /// New inbox search. A highlight that the query hides is cleared.
     pub fn set_search(&mut self, text: String) {
-        if self.search == text {
+        if self.pane.search == text {
             return;
         }
-        self.search = text;
+        self.pane.search = text;
         self.sync_focused_row(FocusFollow::Query);
     }
 
@@ -3650,19 +3651,19 @@ impl Snapshot {
     /// Chats in the middle column: the selected account only. There is no
     /// combined inbox.
     pub fn visible_conversations(&self) -> Vec<&Conversation> {
-        if !self.account_surface_visible(self.selected_protocol) {
+        if !self.account_surface_visible(self.pane.protocol) {
             return Vec::new();
         }
         // Retained Signal history is on this computer. It stays when the
         // live session ends.
         let retained_open =
-            self.selected_protocol == ProtocolId::Signal && self.selected_signal_retained.is_some();
-        if !retained_open && !self.has_session(self.selected_protocol) {
+            self.pane.protocol == ProtocolId::Signal && self.pane.signal_retained.is_some();
+        if !retained_open && !self.has_session(self.pane.protocol) {
             return Vec::new();
         }
-        let query = self.search.trim().to_ascii_lowercase();
+        let query = self.pane.search.trim().to_ascii_lowercase();
         self.conversations
-            .get(&self.selected_protocol)
+            .get(&self.pane.protocol)
             .into_iter()
             .flatten()
             .filter(|row| self.chat_in_open_account(&row.id))
@@ -3733,12 +3734,12 @@ impl Snapshot {
     /// session (Ready). A previous Signal number pages from `retained/`
     /// with no live session.
     fn pages_older(&self) -> bool {
-        let protocol = self.selected_protocol;
+        let protocol = self.pane.protocol;
         let pages = self
             .accounts
             .iter()
             .any(|row| row.caps.id == protocol && row.caps.pages_history);
-        if protocol == ProtocolId::Signal && self.selected_signal_retained.is_some() {
+        if protocol == ProtocolId::Signal && self.pane.signal_retained.is_some() {
             return pages;
         }
         match protocol {
@@ -3754,9 +3755,9 @@ impl Snapshot {
     }
 
     pub fn selected_conversation_row(&self) -> Option<&Conversation> {
-        let id = self.selected_conversation.as_ref()?;
+        let id = self.pane.conversation.as_ref()?;
         self.conversations
-            .get(&self.selected_protocol)?
+            .get(&self.pane.protocol)?
             .iter()
             .find(|row| row.id == *id)
     }
@@ -3766,16 +3767,16 @@ impl Snapshot {
         if !self.visible_conversations().is_empty() {
             return InboxState::Rows;
         }
-        let has_rows = self.has_session(self.selected_protocol)
+        let has_rows = self.has_session(self.pane.protocol)
             && self
                 .conversations
-                .get(&self.selected_protocol)
+                .get(&self.pane.protocol)
                 .is_some_and(|rows| !rows.is_empty());
         if has_rows {
             return InboxState::NoMatch;
         }
-        if self.chat_list_loading.contains(&self.selected_protocol)
-            && self.has_session(self.selected_protocol)
+        if self.chat_list_loading.contains(&self.pane.protocol)
+            && self.has_session(self.pane.protocol)
         {
             return InboxState::Loading;
         }
@@ -3792,7 +3793,7 @@ impl Snapshot {
     pub fn inbox_placeholder(&self) -> Option<&'static str> {
         match self.inbox_state() {
             InboxState::Loading => Some(LOADING_CHATS_STATUS),
-            InboxState::Empty if self.protocol_linked(self.selected_protocol) => Some(NO_CHATS_YET),
+            InboxState::Empty if self.protocol_linked(self.pane.protocol) => Some(NO_CHATS_YET),
             InboxState::Rows | InboxState::Empty | InboxState::NoMatch => None,
         }
     }
@@ -3889,7 +3890,7 @@ impl Snapshot {
     /// Telegram failure is still the last status (#73). That failure then
     /// wins over a load of another protocol (#90).
     fn status_source(&self) -> (std::borrow::Cow<'_, str>, bool) {
-        if let Some(line) = self.loading_line(self.selected_protocol) {
+        if let Some(line) = self.loading_line(self.pane.protocol) {
             return (line.into(), true);
         }
         if self.failure_status.as_deref() == Some(self.status_text.as_str()) {
@@ -3899,7 +3900,7 @@ impl Snapshot {
             .accounts
             .iter()
             .map(|row| row.caps.id)
-            .filter(|id| *id != self.selected_protocol && self.account_surface_visible(*id))
+            .filter(|id| *id != self.pane.protocol && self.account_surface_visible(*id))
             .find_map(|id| self.loading_line(id).map(|line| (id, line)));
         match other {
             Some((id, line)) => (format!("{}: {line}", id.display_name()).into(), true),
@@ -3909,7 +3910,7 @@ impl Snapshot {
 
     #[must_use]
     pub fn thread_state(&self) -> ThreadState {
-        let Some(id) = self.selected_conversation.as_ref() else {
+        let Some(id) = self.pane.conversation.as_ref() else {
             return ThreadState::NoSelection;
         };
         if !self.selected_messages().is_empty() {
@@ -3917,7 +3918,7 @@ impl Snapshot {
         }
         if self
             .history_loading
-            .contains(&(self.selected_protocol, id.clone()))
+            .contains(&(self.pane.protocol, id.clone()))
         {
             return ThreadState::Loading;
         }
@@ -3927,22 +3928,22 @@ impl Snapshot {
     /// Why the last older page of the selected thread did not load (#57).
     #[must_use]
     pub fn older_note(&self) -> Option<&'static str> {
-        let id = self.selected_conversation.clone()?;
+        let id = self.pane.conversation.clone()?;
         self.older_note
-            .contains(&older_key(self.selected_protocol, &id, self.selected_topic))
+            .contains(&older_key(self.pane.protocol, &id, self.pane.topic))
             .then_some(OLDER_PAGE_FAILED_NOTE)
     }
 
     /// Older-message paging of the selected chat (#30).
     #[must_use]
     pub fn older_state(&self) -> OlderState {
-        let Some(id) = self.selected_conversation.as_ref() else {
+        let Some(id) = self.pane.conversation.as_ref() else {
             return OlderState::Idle;
         };
         if !self.pages_older() {
             return OlderState::Idle;
         }
-        let key = older_key(self.selected_protocol, id, self.selected_topic);
+        let key = older_key(self.pane.protocol, id, self.pane.topic);
         if self.older_loading.contains(&key) {
             OlderState::Loading
         } else if self.older_at_start.contains(&key) {
@@ -3967,8 +3968,8 @@ impl Snapshot {
         let Some((id, oldest)) = self.older_anchor_at(now) else {
             return;
         };
-        let protocol = self.selected_protocol;
-        let topic = self.selected_topic;
+        let protocol = self.pane.protocol;
+        let topic = self.pane.topic;
         let store_cursor = self.take_resume_cursor(protocol, &id, topic);
         self.older_loading.insert(older_key(protocol, &id, topic));
         if let Some(topic) = topic {
@@ -3991,11 +3992,11 @@ impl Snapshot {
     /// Closed runs of unreadable rows in the open thread.
     #[must_use]
     pub fn unreadable_runs(&self) -> &[UnreadableRun] {
-        let Some(id) = self.selected_conversation.as_ref() else {
+        let Some(id) = self.pane.conversation.as_ref() else {
             return &[];
         };
         self.unreadable
-            .get(&older_key(self.selected_protocol, id, self.selected_topic))
+            .get(&older_key(self.pane.protocol, id, self.pane.topic))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -4238,9 +4239,9 @@ impl Snapshot {
         if !self.pages_older() {
             return None;
         }
-        let protocol = self.selected_protocol;
-        let id = self.selected_conversation.clone()?;
-        let key = older_key(protocol, &id, self.selected_topic);
+        let protocol = self.pane.protocol;
+        let id = self.pane.conversation.clone()?;
+        let key = older_key(protocol, &id, self.pane.topic);
         let history_key = (protocol, id.clone());
         if self.history_loading.contains(&history_key)
             || self.older_loading.contains(&key)
@@ -4282,14 +4283,14 @@ impl Snapshot {
             self.scroll_to_message = Some(message_id.to_owned());
             return;
         }
-        let Some(chat) = self.selected_conversation.as_deref() else {
+        let Some(chat) = self.pane.conversation.as_deref() else {
             return;
         };
         if !self.pages_older() {
             return;
         }
         self.reply_jump = Some(ReplyJump {
-            thread: older_key(self.selected_protocol, chat, self.selected_topic),
+            thread: older_key(self.pane.protocol, chat, self.pane.topic),
             message_id: message_id.to_owned(),
             pages_left: REPLY_JUMP_PAGES,
         });
@@ -4302,10 +4303,10 @@ impl Snapshot {
         let Some(mut jump) = self.reply_jump.take() else {
             return;
         };
-        let Some(chat) = self.selected_conversation.as_deref() else {
+        let Some(chat) = self.pane.conversation.as_deref() else {
             return;
         };
-        if jump.thread != older_key(self.selected_protocol, chat, self.selected_topic) {
+        if jump.thread != older_key(self.pane.protocol, chat, self.pane.topic) {
             return;
         }
         if self
@@ -4351,32 +4352,32 @@ impl Snapshot {
     }
 
     pub fn selected_messages(&self) -> &[ChatMessage] {
-        let Some(id) = self.selected_conversation.as_ref() else {
+        let Some(id) = self.pane.conversation.as_ref() else {
             return &[];
         };
         self.messages
-            .get(&thread_key(self.selected_protocol, id, self.selected_topic))
+            .get(&thread_key(self.pane.protocol, id, self.pane.topic))
             .map_or(&[], Vec::as_slice)
     }
 
     /// The open topic, when one is selected.
     #[must_use]
     pub fn selected_topic_row(&self) -> Option<&ChatTopic> {
-        let id = self.selected_conversation.as_ref()?;
-        let topic = self.selected_topic?;
+        let id = self.pane.conversation.as_ref()?;
+        let topic = self.pane.topic?;
         self.topics
-            .get(&(self.selected_protocol, id.clone()))
+            .get(&(self.pane.protocol, id.clone()))
             .and_then(|rows| rows.iter().find(|row| row.topic == topic))
     }
 
     /// Topics of the selected chat, in list order.
     #[must_use]
     pub fn selected_topics(&self) -> Vec<&ChatTopic> {
-        let Some(id) = self.selected_conversation.as_ref() else {
+        let Some(id) = self.pane.conversation.as_ref() else {
             return Vec::new();
         };
         self.topics
-            .get(&(self.selected_protocol, id.clone()))
+            .get(&(self.pane.protocol, id.clone()))
             .map(|topics| ordered_topics(topics))
             .unwrap_or_default()
     }
@@ -4729,8 +4730,8 @@ impl Snapshot {
         topic: Option<MessageTopic>,
         body: &str,
     ) {
-        if self.is_selected_thread(protocol, chat, topic) && self.compose.trim() == body {
-            self.compose.clear();
+        if self.is_selected_thread(protocol, chat, topic) && self.pane.compose.trim() == body {
+            self.pane.compose.clear();
         }
         let key = (protocol, chat.to_owned(), topic);
         if self
@@ -4914,7 +4915,7 @@ impl Snapshot {
     /// shows, or the chat's draft.
     fn current_text(&self, protocol: ProtocolId, chat: &str, topic: Option<MessageTopic>) -> &str {
         if self.is_selected_thread(protocol, chat, topic) {
-            self.compose.trim()
+            self.pane.compose.trim()
         } else {
             self.drafts
                 .get(&(protocol, chat.to_owned(), topic))
@@ -5065,18 +5066,18 @@ impl Snapshot {
         if !self.can_send() {
             return;
         }
-        let Some(conversation_id) = self.selected_conversation.clone() else {
+        let Some(conversation_id) = self.pane.conversation.clone() else {
             return;
         };
-        let body = self.compose.trim().to_string();
+        let body = self.pane.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
-        let protocol = self.selected_protocol;
+        let protocol = self.pane.protocol;
         let files = self.compose_attachments().to_vec();
         let Some(request) = self.sends.begin_send_files(
             protocol,
             &conversation_id,
             &body,
-            self.selected_topic,
+            self.pane.topic,
             files.clone(),
             Instant::now(),
         ) else {
@@ -5085,18 +5086,18 @@ impl Snapshot {
         self.error = None;
         self.attachment_note = None;
         self.typing
-            .message_sent(&(protocol, conversation_id.clone(), self.selected_topic));
+            .message_sent(&(protocol, conversation_id.clone(), self.pane.topic));
         if !files.is_empty() {
             // The files stay in the tray until the adapter accepts them.
             self.push(AdapterCommand::SendMedia {
                 protocol,
                 conversation_id,
-                topic: self.selected_topic,
+                topic: self.pane.topic,
                 files,
                 caption: body,
                 request,
             });
-        } else if let Some(topic) = self.selected_topic {
+        } else if let Some(topic) = self.pane.topic {
             let reply_to = self.take_reply();
             self.push(AdapterCommand::SendTopicText {
                 protocol,
@@ -5420,8 +5421,8 @@ impl Snapshot {
         // The worker loads the main list right after Ready.
         self.chat_list_loading.insert(account);
         // Keep a selection the user made in another linked protocol (#70).
-        let keep = !self.selected_protocol.is(ProtocolKind::Telegram)
-            && self.has_session(self.selected_protocol);
+        let keep =
+            !self.pane.protocol.is(ProtocolKind::Telegram) && self.has_session(self.pane.protocol);
         if !keep {
             self.select_protocol(account);
         }
@@ -5525,13 +5526,13 @@ impl Snapshot {
     }
 
     fn ensure_conversation_selection(&mut self) {
-        if self.selected_conversation.is_some() {
+        if self.pane.conversation.is_some() {
             return;
         }
         // A placeholder row is not a chat: never auto-select it (#70).
         // A previous Signal number is not a chat of the live account.
-        let protocol = self.selected_protocol;
-        let retained = self.selected_signal_retained;
+        let protocol = self.pane.protocol;
+        let retained = self.pane.signal_retained;
         let first = self.conversations.get(&protocol).and_then(|rows| {
             rows.iter()
                 .find(|row| {
@@ -5551,8 +5552,8 @@ impl Snapshot {
     /// plan 3). The adapter checks its own id format; the core only needs the
     /// row in the protocol's list.
     fn queue_open_chat(&mut self) {
-        let protocol = self.selected_protocol;
-        let Some(id) = self.selected_conversation.clone() else {
+        let protocol = self.pane.protocol;
+        let Some(id) = self.pane.conversation.clone() else {
             return;
         };
         // The previous number's messages are already loaded from its store.
@@ -5573,7 +5574,7 @@ impl Snapshot {
         if !listed {
             return;
         }
-        let topic = self.selected_topic;
+        let topic = self.pane.topic;
         let already = self.pending.iter().any(|command| match (command, topic) {
             (
                 AdapterCommand::OpenTopic {
@@ -5747,8 +5748,8 @@ impl Snapshot {
         if !self.window_focused || self.center_view() != CenterView::Thread {
             return None;
         }
-        let protocol = self.selected_protocol;
-        let id = self.selected_conversation.clone()?;
+        let protocol = self.pane.protocol;
+        let id = self.pane.conversation.clone()?;
         let row = self.conversation(protocol, &id)?;
         let listed = self.has_session(protocol)
             && self.account_surface_visible(protocol)
@@ -5757,7 +5758,7 @@ impl Snapshot {
             return None;
         }
         if row.has_topics {
-            let topic = self.selected_topic?;
+            let topic = self.pane.topic?;
             return Some((protocol, id, Some(topic)));
         }
         Some((protocol, id, None))
@@ -5780,7 +5781,7 @@ impl Snapshot {
                 self.sessions.insert(protocol);
                 // The first linked account, or the linked one while nothing
                 // useful is selected: show it (shell plan 2).
-                if first_link || !self.protocol_linked(self.selected_protocol) {
+                if first_link || !self.protocol_linked(self.pane.protocol) {
                     self.select_protocol(protocol);
                 }
                 // A chat opened while the account was Linking did not load:
@@ -5788,8 +5789,8 @@ impl Snapshot {
                 // chat that loaded before the reconnect does not load again.
                 let waiting = self.open_on_link.as_ref().is_some_and(|(owner, id)| {
                     *owner == protocol
-                        && self.selected_protocol == protocol
-                        && self.selected_conversation.as_ref() == Some(id)
+                        && self.pane.protocol == protocol
+                        && self.pane.conversation.as_ref() == Some(id)
                 });
                 if waiting {
                     self.queue_open_chat();
@@ -6054,8 +6055,8 @@ impl Snapshot {
                     if *owner == protocol
             )
         };
-        if self.selected_protocol == protocol
-            && let Some(id) = self.selected_conversation.clone()
+        if self.pane.protocol == protocol
+            && let Some(id) = self.pane.conversation.clone()
         {
             let queued = self.pending.iter().any(|command| {
                 is_open(command)
@@ -6118,10 +6119,10 @@ impl Snapshot {
 
     /// `true` when `id` belongs to the account row that is open.
     fn chat_in_open_account(&self, id: &str) -> bool {
-        if !self.selected_protocol.is(ProtocolKind::Signal) {
+        if !self.pane.protocol.is(ProtocolKind::Signal) {
             return true;
         }
-        thinwire_protocol::signal_retained_slot(id) == self.selected_signal_retained
+        thinwire_protocol::signal_retained_slot(id) == self.pane.signal_retained
     }
 
     /// A retained Signal inbox event is local history. It applies with no
@@ -6181,13 +6182,13 @@ impl Snapshot {
 
     /// A selected previous account that this link did not publish is closed.
     fn settle_retained_signal_selection(&mut self) {
-        if let Some(slot) = self.selected_signal_retained {
+        if let Some(slot) = self.pane.signal_retained {
             let exists = self.accounts.iter().any(|row| {
                 row.caps.id.is(ProtocolKind::Signal) && row.signal_retained == Some(slot)
             });
             if !exists {
-                self.selected_signal_retained = None;
-                self.selected_conversation = None;
+                self.pane.signal_retained = None;
+                self.pane.conversation = None;
                 self.ensure_conversation_selection();
             }
         }
@@ -6206,7 +6207,7 @@ impl Snapshot {
             if thinwire_protocol::signal_retained_chat(&row.id) != Some(live_id) {
                 continue;
             }
-            if self.selected_signal_retained == Some(slot) {
+            if self.pane.signal_retained == Some(slot) {
                 return Some(row.id.clone());
             }
             if best.as_ref().is_none_or(|(kept, _)| slot > *kept) {
@@ -6447,8 +6448,8 @@ impl Snapshot {
             self.topics.retain(|(owner, _), _| *owner != protocol);
         }
         self.outbox_read.retain(|(owner, _), _| *owner != protocol);
-        if self.selected_protocol == protocol {
-            self.selected_topic = None;
+        if self.pane.protocol == protocol {
+            self.pane.topic = None;
         }
         self.history_loading.retain(|(owner, _)| *owner != protocol);
         self.chat_list_loading.remove(&protocol);
@@ -6497,10 +6498,10 @@ impl Snapshot {
         // A previous Signal number stays selected. Its rows and history
         // stay. The live row shows its own signed-out state.
         let stay_on_retained =
-            protocol == ProtocolId::Signal && self.selected_signal_retained.is_some();
-        if self.selected_protocol == protocol && !stay_on_retained {
-            self.compose.clear();
-            self.selected_conversation = None;
+            protocol == ProtocolId::Signal && self.pane.signal_retained.is_some();
+        if self.pane.protocol == protocol && !stay_on_retained {
+            self.pane.compose.clear();
+            self.pane.conversation = None;
             if let Some(next) = self
                 .accounts
                 .iter()
@@ -6513,12 +6514,13 @@ impl Snapshot {
             }
         } else if stay_on_retained
             && self
-                .selected_conversation
+                .pane
+                .conversation
                 .as_deref()
                 .is_some_and(|id| thinwire_protocol::signal_retained_slot(id).is_none())
         {
-            self.compose.clear();
-            self.selected_conversation = None;
+            self.pane.compose.clear();
+            self.pane.conversation = None;
             self.ensure_conversation_selection();
         }
     }
@@ -6590,10 +6592,10 @@ impl Snapshot {
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
         self.drop_rejected_body(protocol, id);
         self.forget_older_chat(protocol, id);
-        if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
-            self.compose.clear();
-            self.selected_conversation = None;
-            self.selected_topic = None;
+        if self.pane.protocol == protocol && self.pane.conversation.as_deref() == Some(id) {
+            self.pane.compose.clear();
+            self.pane.conversation = None;
+            self.pane.topic = None;
             self.ensure_conversation_selection();
         }
         self.sync_focused_row(FocusFollow::List);
@@ -6606,11 +6608,12 @@ impl Snapshot {
     fn sync_focused_row(&mut self, reason: FocusFollow) {
         let ids = self.visible_ids();
         let kept = self
+            .pane
             .focused_row
             .as_ref()
             .is_some_and(|id| ids.iter().any(|row| row == id));
         if !kept {
-            self.focused_row = None;
+            self.pane.focused_row = None;
         } else if self.highlight_needs_scroll(reason, &ids) {
             self.scroll_to_focused = true;
         }
@@ -6626,7 +6629,7 @@ impl Snapshot {
     }
 
     fn highlight_index_changed(&self, ids: &[String]) -> bool {
-        let Some(id) = self.focused_row.as_deref() else {
+        let Some(id) = self.pane.focused_row.as_deref() else {
             return false;
         };
         let old = self.seen_visible_ids.iter().position(|row| row == id);
@@ -6644,7 +6647,7 @@ impl Snapshot {
     /// The highlight, when it is one of the rows on screen. Enter uses this.
     #[must_use]
     pub fn visible_focused_row(&self) -> Option<String> {
-        let id = self.focused_row.clone()?;
+        let id = self.pane.focused_row.clone()?;
         self.visible_conversations()
             .iter()
             .any(|row| row.id == id)
@@ -6800,8 +6803,8 @@ impl Snapshot {
         let selected =
             self.is_selected_thread(message.protocol, &message.conversation_id, message.topic);
         if selected {
-            if self.compose.trim().is_empty() {
-                self.compose.clone_from(&message.body);
+            if self.pane.compose.trim().is_empty() {
+                self.pane.compose.clone_from(&message.body);
             }
         } else {
             self.drafts
@@ -7054,13 +7057,13 @@ impl Snapshot {
         message_id: &str,
         file_id: i32,
     ) {
-        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+        if !self.is_selected_thread(protocol, conversation_id, self.pane.topic) {
             return;
         }
         let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
             return;
         };
-        if key.2 != self.selected_topic {
+        if key.2 != self.pane.topic {
             return;
         }
         let (known, ready, secret) = {
@@ -7112,13 +7115,13 @@ impl Snapshot {
         file_id: i32,
     ) {
         // Every adapter that sets audio on a message can download it.
-        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+        if !self.is_selected_thread(protocol, conversation_id, self.pane.topic) {
             return;
         }
         let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
             return;
         };
-        if key.2 != self.selected_topic {
+        if key.2 != self.pane.topic {
             return;
         }
         {
@@ -7301,13 +7304,13 @@ impl Snapshot {
         message_id: &str,
         file_id: i32,
     ) {
-        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+        if !self.is_selected_thread(protocol, conversation_id, self.pane.topic) {
             return;
         }
         let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
             return;
         };
-        if key.2 != self.selected_topic {
+        if key.2 != self.pane.topic {
             return;
         }
         {
@@ -7423,13 +7426,13 @@ impl Snapshot {
         message_id: &str,
         file_id: i32,
     ) {
-        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+        if !self.is_selected_thread(protocol, conversation_id, self.pane.topic) {
             return;
         }
         let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
             return;
         };
-        if key.2 != self.selected_topic {
+        if key.2 != self.pane.topic {
             return;
         }
         {
@@ -10088,7 +10091,7 @@ mod tests {
             "the reply stays with its chat"
         );
 
-        snapshot.compose = "Yes".into();
+        snapshot.pane.compose = "Yes".into();
         snapshot.send_compose();
         let replies: Vec<_> = snapshot
             .take_commands()
@@ -10188,10 +10191,10 @@ mod tests {
     #[test]
     fn an_edit_sends_the_new_text_and_brings_the_draft_back() {
         let mut snapshot = telegram_chat_with_rows(&[(5, false), (6, true)]);
-        snapshot.compose = "draft".into();
+        snapshot.pane.compose = "draft".into();
         snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
         assert!(snapshot.edit_target().is_none(), "not an own message");
-        assert_eq!(snapshot.compose, "draft");
+        assert_eq!(snapshot.pane.compose, "draft");
 
         snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
         snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:6");
@@ -10200,15 +10203,15 @@ mod tests {
             Some("telegram:1:6")
         );
         assert!(snapshot.reply_target().is_none(), "an edit ends the reply");
-        assert_eq!(snapshot.compose, "Hi");
+        assert_eq!(snapshot.pane.compose, "Hi");
 
-        snapshot.compose = "  ".into();
+        snapshot.pane.compose = "  ".into();
         assert!(!snapshot.can_send(), "an empty text");
         snapshot.send_compose();
         assert!(snapshot.take_commands().is_empty());
         assert!(snapshot.edit_target().is_some(), "the edit stays open");
 
-        snapshot.compose = "Hello ".into();
+        snapshot.pane.compose = "Hello ".into();
         assert!(snapshot.can_send());
         snapshot.send_compose();
         assert_eq!(
@@ -10221,7 +10224,7 @@ mod tests {
             }]
         );
         assert!(snapshot.edit_target().is_none());
-        assert_eq!(snapshot.compose, "draft");
+        assert_eq!(snapshot.pane.compose, "draft");
         snapshot.send_compose();
         assert!(
             !snapshot
@@ -10240,27 +10243,30 @@ mod tests {
         let edit = |snapshot: &mut Snapshot| {
             snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:6");
             assert!(snapshot.edit_target().is_some());
-            snapshot.compose = "changed".into();
+            snapshot.pane.compose = "changed".into();
         };
-        snapshot.compose = "draft".into();
+        snapshot.pane.compose = "draft".into();
         edit(&mut snapshot);
         snapshot.cancel_edit();
-        assert_eq!(snapshot.compose, "draft");
+        assert_eq!(snapshot.pane.compose, "draft");
 
         edit(&mut snapshot);
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: test_support::telegram_chat(2, "Bob", 1),
         });
         snapshot.select_conversation("telegram:2".into());
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
         snapshot.select_conversation("telegram:1".into());
         assert!(snapshot.edit_target().is_none(), "a chat switch ends it");
-        assert_eq!(snapshot.compose, "draft", "the edit text is not a draft");
+        assert_eq!(
+            snapshot.pane.compose, "draft",
+            "the edit text is not a draft"
+        );
 
         edit(&mut snapshot);
-        snapshot.compose = "Hi".into();
+        snapshot.pane.compose = "Hi".into();
         snapshot.send_compose();
-        assert_eq!(snapshot.compose, "draft");
+        assert_eq!(snapshot.pane.compose, "draft");
 
         edit(&mut snapshot);
         snapshot.apply(AdapterEvent::MessagesRemoved {
@@ -10269,7 +10275,7 @@ mod tests {
             message_ids: vec!["telegram:1:6".into()],
         });
         assert!(snapshot.edit_target().is_none(), "the message is gone");
-        assert_eq!(snapshot.compose, "draft");
+        assert_eq!(snapshot.pane.compose, "draft");
         assert!(
             !snapshot
                 .take_commands()
@@ -11294,9 +11300,9 @@ mod tests {
             conversation: telegram_chat(1, "Ada", 10),
         });
         assert_eq!(snapshot.inbox_state(), InboxState::Rows);
-        snapshot.search = "zzz".into();
+        snapshot.pane.search = "zzz".into();
         assert_eq!(snapshot.inbox_state(), InboxState::NoMatch);
-        snapshot.search = "ad".into();
+        snapshot.pane.search = "ad".into();
         assert_eq!(snapshot.inbox_state(), InboxState::Rows);
 
         snapshot.refresh_visible();
@@ -11466,10 +11472,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(2, "Bob", 5),
         });
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
         assert_eq!(snapshot.thread_state(), ThreadState::Loading);
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
@@ -11512,7 +11515,7 @@ mod tests {
             conversation: telegram_chat(3, "Cy", 99),
         });
         assert_eq!(
-            snapshot.selected_conversation.as_deref(),
+            snapshot.pane.conversation.as_deref(),
             Some("telegram:2"),
             "a row that jumps to the top does not become the open chat"
         );
@@ -11536,7 +11539,7 @@ mod tests {
         snapshot.select_conversation("telegram:2".into());
         assert!(snapshot.take_scroll_to_selected());
         assert!(snapshot.take_focus_compose());
-        snapshot.compose = "draft for Bob".into();
+        snapshot.pane.compose = "draft for Bob".into();
         snapshot.sync_viewed();
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(2, "Bob", 20),
@@ -11558,11 +11561,8 @@ mod tests {
         ada.last_at = 1_700_000_100;
         snapshot.apply(AdapterEvent::ConversationUpsert { conversation: ada });
 
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:2")
-        );
-        assert_eq!(snapshot.compose, "draft for Bob");
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:2"));
+        assert_eq!(snapshot.pane.compose, "draft for Bob");
         assert!(!snapshot.wants_focus_compose());
         assert!(!snapshot.wants_scroll_to_selected());
         assert!(!snapshot.wants_scroll_to_focused());
@@ -11583,11 +11583,8 @@ mod tests {
             .expect("Bob");
         assert_eq!(bob.unread, 0, "the open chat is not marked unread");
         assert_eq!(bob.preview, "while reading");
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:2")
-        );
-        assert_eq!(snapshot.compose, "draft for Bob");
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:2"));
+        assert_eq!(snapshot.pane.compose, "draft for Bob");
         assert!(!snapshot.wants_scroll_to_selected());
     }
 
@@ -11611,7 +11608,7 @@ mod tests {
         snapshot.select_topic("telegram:9".into(), trail);
         assert!(snapshot.take_focus_compose());
         assert!(snapshot.take_scroll_to_selected());
-        snapshot.compose = "draft for Trail".into();
+        snapshot.pane.compose = "draft for Trail".into();
         snapshot.sync_viewed();
 
         let mut message = telegram_text(9, 8, "soup");
@@ -11620,8 +11617,8 @@ mod tests {
         message.sent_at = 200;
         snapshot.apply(AdapterEvent::MessageReceived { message });
 
-        assert_eq!(snapshot.selected_topic, Some(trail));
-        assert_eq!(snapshot.compose, "draft for Trail");
+        assert_eq!(snapshot.pane.topic, Some(trail));
+        assert_eq!(snapshot.pane.compose, "draft for Trail");
         assert!(snapshot.selected_messages().is_empty());
         assert!(!snapshot.wants_focus_compose());
         assert!(!snapshot.wants_scroll_to_selected());
@@ -11633,9 +11630,9 @@ mod tests {
         assert_eq!(food_row.last_at, 200);
 
         snapshot.center_key(AuthKey::Escape, &store);
-        assert!(snapshot.selected_topic.is_none());
+        assert!(snapshot.pane.topic.is_none());
         snapshot.select_topic("telegram:9".into(), trail);
-        assert_eq!(snapshot.compose, "draft for Trail");
+        assert_eq!(snapshot.pane.compose, "draft for Trail");
     }
 
     #[test]
@@ -11782,7 +11779,7 @@ mod tests {
             None,
             vec!["/a/1.jpg".into(), "/a/2.jpg".into()],
         );
-        snapshot.compose = "look".into();
+        snapshot.pane.compose = "look".into();
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -11843,7 +11840,7 @@ mod tests {
         }
         snapshot.select_conversation("telegram:9".into());
         snapshot.select_topic("telegram:9".into(), trail);
-        snapshot.compose = "ok".into();
+        snapshot.pane.compose = "ok".into();
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -11859,14 +11856,14 @@ mod tests {
             });
         let request = request.expect("send");
         snapshot.select_topic("telegram:9".into(), food);
-        snapshot.compose = "ok".into();
+        snapshot.pane.compose = "ok".into();
         snapshot.set_draft(ProtocolId::Telegram, "telegram:9", Some(gear), "ok".into());
         snapshot.apply(AdapterEvent::SendAccepted {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:9".into(),
             request,
         });
-        assert_eq!(snapshot.compose, "ok", "Food keeps its unsent text");
+        assert_eq!(snapshot.pane.compose, "ok", "Food keeps its unsent text");
         assert!(
             !snapshot.drafts.contains_key(&(
                 ProtocolId::Telegram,
@@ -11992,10 +11989,10 @@ mod tests {
         snapshot.select_protocol(ProtocolId::Discord);
         snapshot.select_conversation("discord:1".into());
         snapshot.select_topic("discord:1".into(), MessageTopic::Forum(1));
-        snapshot.compose = "ok".into();
+        snapshot.pane.compose = "ok".into();
         snapshot.send_compose();
         snapshot.select_topic("discord:1".into(), MessageTopic::Forum(2));
-        snapshot.compose = "later".into();
+        snapshot.pane.compose = "later".into();
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Discord,
             state: AccountState::Unlinked,
@@ -12031,7 +12028,7 @@ mod tests {
             conversation: telegram_chat(2, "Bob", 5),
         });
         snapshot.move_inbox_selection(1);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:2"));
         assert!(snapshot.take_scroll_to_focused());
 
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -12045,7 +12042,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(3, "Cy", 7),
         });
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:2"));
         assert!(
             !snapshot.wants_scroll_to_focused(),
             "a row inserted above the highlight does not scroll"
@@ -12068,7 +12065,7 @@ mod tests {
         });
         snapshot.set_search("a".into());
         snapshot.move_inbox_selection(1);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:3"));
         assert_eq!(visible_place(&snapshot, "telegram:3"), Some(1));
         assert!(snapshot.take_scroll_to_focused());
 
@@ -12101,7 +12098,7 @@ mod tests {
             conversation: telegram_chat(3, "Cara", 10),
         });
         snapshot.move_inbox_selection(-1);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:1"));
         assert!(snapshot.take_scroll_to_focused());
 
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -12115,7 +12112,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(1, "Ada", 5),
         });
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:1"));
         assert!(
             !snapshot.wants_scroll_to_focused(),
             "a resort that moves the highlight does not scroll"
@@ -12124,7 +12121,7 @@ mod tests {
         snapshot.set_search("Ada".into());
         assert!(snapshot.take_scroll_to_focused());
         snapshot.set_search(String::new());
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:1"));
         assert!(
             snapshot.take_scroll_to_focused(),
             "clearing a search scrolls the highlight"
@@ -12189,10 +12186,7 @@ mod tests {
     /// A chat with messages 50 and 51 loaded, and its first page done.
     fn chat_with_recent_page(store: &SecretStore) -> Snapshot {
         let mut snapshot = ready_with_chats(store);
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
         for id in [51, 50] {
             snapshot.apply(AdapterEvent::MessageReceived {
                 message: outgoing(1, id, "recent", Delivery::Sent),
@@ -12488,8 +12482,8 @@ mod tests {
         // The same chat id in two protocols.
         snapshot.apply(failed(ProtocolId::Signal, "chat:1"));
         snapshot.apply(failed(ProtocolId::Telegram, "chat:1"));
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_conversation = Some("chat:1".into());
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.conversation = Some("chat:1".into());
         assert_eq!(
             snapshot.older_note(),
             Some(OLDER_PAGE_FAILED_NOTE),
@@ -12497,10 +12491,10 @@ mod tests {
         );
 
         snapshot.end_session(ProtocolId::Signal);
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_conversation = Some("chat:1".into());
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.conversation = Some("chat:1".into());
         assert_eq!(snapshot.older_note(), None, "the Signal session ended");
-        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.pane.protocol = ProtocolId::Telegram;
         assert_eq!(
             snapshot.older_note(),
             Some(OLDER_PAGE_FAILED_NOTE),
@@ -12517,8 +12511,8 @@ mod tests {
             protocol: ProtocolId::Signal,
             state: AccountState::Linked,
         });
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_conversation = Some(chat.into());
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.conversation = Some(chat.into());
         snapshot.apply(AdapterEvent::MessageReceived {
             message: ChatMessage {
                 protocol: ProtocolId::Signal,
@@ -12558,8 +12552,8 @@ mod tests {
             protocol: ProtocolId::Signal,
             state: AccountState::Linked,
         });
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_conversation = Some(chat.into());
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.conversation = Some(chat.into());
         snapshot.apply(AdapterEvent::MessageReceived {
             message: ChatMessage {
                 protocol: ProtocolId::Signal,
@@ -12613,7 +12607,7 @@ mod tests {
         });
         assert_eq!(snapshot.unread_for(ProtocolId::Signal), 1);
         snapshot.extra_visible.insert(ProtocolId::Signal);
-        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.pane.protocol = ProtocolId::Signal;
         snapshot.select_conversation("s1".into());
         snapshot.sync_viewed();
         assert_eq!(snapshot.unread_for(ProtocolId::Signal), 0);
@@ -12766,15 +12760,15 @@ mod tests {
     fn enter_sends_and_shift_enter_keeps_the_line() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "line one".into();
+        snapshot.pane.compose = "line one".into();
         assert!(
             !snapshot.compose_enter(true),
             "Shift+Enter goes to the text field"
         );
-        assert_eq!(snapshot.compose, "line one");
+        assert_eq!(snapshot.pane.compose, "line one");
         assert!(send_texts(&mut snapshot).is_empty());
 
-        snapshot.compose = "line one\nline two".into();
+        snapshot.pane.compose = "line one\nline two".into();
         assert!(snapshot.compose_enter(false));
         assert_eq!(send_texts(&mut snapshot), vec!["line one\nline two"]);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -12782,11 +12776,11 @@ mod tests {
         });
         accept(&mut snapshot, "telegram:1");
         assert!(
-            snapshot.compose.is_empty(),
+            snapshot.pane.compose.is_empty(),
             "cleared once the send is accepted"
         );
 
-        snapshot.compose = "   ".into();
+        snapshot.pane.compose = "   ".into();
         assert!(!snapshot.can_send());
         assert!(
             snapshot.compose_enter(false),
@@ -12800,19 +12794,16 @@ mod tests {
     fn arrow_moves_the_inbox_and_enter_opens_the_chat() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
-        snapshot.compose = "draft for Ada".into();
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        snapshot.pane.compose = "draft for Ada".into();
         snapshot.move_inbox_selection(1);
         assert_eq!(
-            snapshot.selected_conversation.as_deref(),
+            snapshot.pane.conversation.as_deref(),
             Some("telegram:1"),
             "an arrow does not replace the open chat"
         );
-        assert_eq!(snapshot.compose, "draft for Ada");
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert_eq!(snapshot.pane.compose, "draft for Ada");
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:2"));
         assert!(snapshot.take_scroll_to_focused());
         assert!(!snapshot.wants_focus_compose());
         assert!(
@@ -12820,18 +12811,15 @@ mod tests {
             "an arrow does not open the chat"
         );
         snapshot.move_inbox_selection(1);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:2"));
         assert!(
             !snapshot.wants_scroll_to_focused(),
             "the last row does not request another scroll"
         );
         snapshot.move_inbox_selection(-1);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:1"));
         assert!(snapshot.take_scroll_to_focused());
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
         snapshot.select_conversation("telegram:2".into());
         assert!(snapshot.take_focus_compose());
         assert!(
@@ -12848,17 +12836,14 @@ mod tests {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
         snapshot.move_inbox_selection(1);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert_eq!(snapshot.pane.focused_row.as_deref(), Some("telegram:2"));
         snapshot.set_search("Ada".into());
         assert!(
-            snapshot.focused_row.is_none(),
+            snapshot.pane.focused_row.is_none(),
             "the hidden row is not highlighted"
         );
         assert!(snapshot.visible_focused_row().is_none());
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
         assert!(snapshot.take_commands().is_empty());
 
         snapshot.set_search(String::new());
@@ -12874,7 +12859,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             id: "telegram:2".into(),
         });
-        assert!(snapshot.focused_row.is_none());
+        assert!(snapshot.pane.focused_row.is_none());
         assert!(snapshot.visible_focused_row().is_none());
     }
 
@@ -12882,24 +12867,21 @@ mod tests {
     fn picking_a_chat_focuses_compose_and_keeps_drafts_per_chat() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:1")
-        );
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
         assert!(
             !snapshot.take_focus_compose(),
             "auto-select does not steal focus"
         );
-        snapshot.compose = "draft for Ada".into();
+        snapshot.pane.compose = "draft for Ada".into();
         snapshot.select_conversation("telegram:2".into());
         assert!(snapshot.take_focus_compose());
         assert!(!snapshot.take_focus_compose());
-        assert_eq!(snapshot.compose, "");
-        snapshot.compose = "draft for Bob".into();
+        assert_eq!(snapshot.pane.compose, "");
+        snapshot.pane.compose = "draft for Bob".into();
         snapshot.select_conversation("telegram:1".into());
-        assert_eq!(snapshot.compose, "draft for Ada");
+        assert_eq!(snapshot.pane.compose, "draft for Ada");
         snapshot.select_conversation("telegram:2".into());
-        assert_eq!(snapshot.compose, "draft for Bob");
+        assert_eq!(snapshot.pane.compose, "draft for Bob");
         assert!(
             send_texts(&mut snapshot).is_empty(),
             "switching never sends"
@@ -12910,9 +12892,9 @@ mod tests {
     fn a_removed_chat_that_is_not_selected_loses_its_draft() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "draft for Ada".into();
+        snapshot.pane.compose = "draft for Ada".into();
         snapshot.select_conversation("telegram:2".into());
-        snapshot.compose = "draft for Bob".into();
+        snapshot.pane.compose = "draft for Bob".into();
         assert!(
             snapshot
                 .drafts
@@ -12930,11 +12912,14 @@ mod tests {
             "draft gone"
         );
         assert_eq!(
-            snapshot.selected_conversation.as_deref(),
+            snapshot.pane.conversation.as_deref(),
             Some("telegram:2"),
             "the selection stays"
         );
-        assert_eq!(snapshot.compose, "draft for Bob", "the open draft stays");
+        assert_eq!(
+            snapshot.pane.compose, "draft for Bob",
+            "the open draft stays"
+        );
     }
 
     #[test]
@@ -13282,14 +13267,14 @@ mod tests {
     fn failed_send_keeps_the_text_and_retry_queues_one_resend() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hi".into();
+        snapshot.pane.compose = "hi".into();
         snapshot.send_compose();
         assert_eq!(send_texts(&mut snapshot), vec!["hi"]);
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 100, "hi", Delivery::Pending),
         });
         accept(&mut snapshot, "telegram:1");
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
         snapshot.apply(AdapterEvent::MessageReplaced {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
@@ -13297,7 +13282,10 @@ mod tests {
             message: outgoing(1, 101, "hi", Delivery::Failed),
         });
         assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
-        assert_eq!(snapshot.compose, "hi", "failed text goes back to compose");
+        assert_eq!(
+            snapshot.pane.compose, "hi",
+            "failed text goes back to compose"
+        );
         let error = snapshot.error.clone().expect("error block");
         assert_eq!(error.happened, "Message not sent.");
 
@@ -13312,7 +13300,7 @@ mod tests {
         ));
         assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
         assert!(
-            snapshot.compose.is_empty(),
+            snapshot.pane.compose.is_empty(),
             "retry does not leave a copy to send twice"
         );
 
@@ -13323,7 +13311,7 @@ mod tests {
             delivery: Delivery::Failed,
         });
         assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
-        assert_eq!(snapshot.compose, "hi");
+        assert_eq!(snapshot.pane.compose, "hi");
     }
 
     #[test]
@@ -13334,7 +13322,7 @@ mod tests {
             message: outgoing(1, 5, "old", Delivery::Failed),
         });
         assert!(snapshot.error.is_none());
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
         snapshot.retry_send("telegram:1:5");
         assert_eq!(snapshot.take_commands().len(), 1);
     }
@@ -13352,9 +13340,9 @@ mod tests {
             old_id: "telegram:2:100".into(),
             message: outgoing(2, 101, "for Bob", Delivery::Failed),
         });
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
         snapshot.select_conversation("telegram:2".into());
-        assert_eq!(snapshot.compose, "for Bob");
+        assert_eq!(snapshot.pane.compose, "for Bob");
     }
 
     fn at_phone_step(store: &SecretStore) -> Snapshot {
@@ -13624,7 +13612,7 @@ mod tests {
         assert_eq!(no_api.auth, AuthScreen::TelegramApi, "Enter = Advanced");
 
         let mut ready = ready_with_chats(&store);
-        ready.compose = "hi".into();
+        ready.pane.compose = "hi".into();
         ready.center_key(AuthKey::Enter, &store);
         assert!(
             ready.take_commands().is_empty(),
@@ -13774,7 +13762,7 @@ mod tests {
         assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
         assert!(!snapshot.signal_gate_open());
         assert!(snapshot.signal_qr.is_none());
-        assert_eq!(snapshot.selected_protocol, ProtocolId::Signal);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Signal);
         assert!(
             snapshot
                 .accounts
@@ -13879,7 +13867,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Signal, "ada", true),
         });
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -13948,7 +13936,7 @@ mod tests {
             },
         });
         snapshot.select_conversation("ada".into());
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         let _ = snapshot.take_commands();
         assert_eq!(
             snapshot.status_text, "Signal is linked.",
@@ -14001,7 +13989,7 @@ mod tests {
             .expect("account row");
         assert_eq!(row.state, AccountState::Unlinked);
         assert_eq!(row.detail, SIGNAL_DEVICE_REMOVED);
-        assert_eq!(snapshot.selected_conversation.as_deref(), Some("ada"));
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("ada"));
         assert_eq!(snapshot.selected_messages().len(), 1);
         assert_eq!(snapshot.selected_messages()[0].body, "kept");
         assert!(
@@ -14228,7 +14216,7 @@ mod tests {
         assert!(!snapshot.signal_device_removed());
         assert_eq!(snapshot.visible_conversations().len(), 1);
         assert_eq!(snapshot.visible_conversations()[0].id, "ada");
-        assert_eq!(snapshot.selected_conversation.as_deref(), Some("ada"));
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("ada"));
         assert_eq!(snapshot.selected_messages().len(), 1);
         assert_eq!(snapshot.selected_messages()[0].id, "ada:1");
         assert_eq!(snapshot.selected_messages()[0].body, "kept");
@@ -14360,11 +14348,11 @@ mod tests {
         );
 
         snapshot.select_conversation("bea".into());
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         assert!(snapshot.can_send(), "the new number can send");
 
         snapshot.select_retained_signal(1);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         let retained_row = snapshot
             .accounts
             .iter()
@@ -14534,10 +14522,10 @@ mod tests {
                 edited: false,
             },
         });
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_signal_retained = Some(1);
-        snapshot.selected_conversation = Some(id.clone());
-        snapshot.compose = "hello".into();
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.signal_retained = Some(1);
+        snapshot.pane.conversation = Some(id.clone());
+        snapshot.pane.compose = "hello".into();
         assert!(!snapshot.can_send(), "a retained chat cannot send");
         snapshot.load_older_at(Instant::now());
         assert!(
@@ -14598,10 +14586,10 @@ mod tests {
                 message: row(millis, body),
             });
         }
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_signal_retained = Some(1);
-        snapshot.selected_conversation = Some(id.clone());
-        snapshot.compose = "hello".into();
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.signal_retained = Some(1);
+        snapshot.pane.conversation = Some(id.clone());
+        snapshot.pane.compose = "hello".into();
         assert!(!snapshot.can_send(), "a retained chat cannot send");
         let now = Instant::now();
         let asked = |snapshot: &mut Snapshot| {
@@ -14683,8 +14671,8 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Telegram, chat_id, true),
         });
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some(chat_id.into());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some(chat_id.into());
         for (message_id, body) in [("telegram:1:50", "later"), ("telegram:1:40", "earlier")] {
             snapshot.apply(AdapterEvent::MessageReceived {
                 message: ChatMessage {
@@ -14756,9 +14744,9 @@ mod tests {
                 edited: false,
             },
         });
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_signal_retained = Some(1);
-        snapshot.selected_conversation = Some(old_id.clone());
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.signal_retained = Some(1);
+        snapshot.pane.conversation = Some(old_id.clone());
 
         snapshot.apply(AdapterEvent::Status {
             protocol: ProtocolId::Signal,
@@ -14795,11 +14783,8 @@ mod tests {
                 .all(|row| row.signal_retained != Some(1)),
             "slot 1 is not reused for the new account"
         );
-        assert_eq!(snapshot.selected_signal_retained, None);
-        assert_ne!(
-            snapshot.selected_conversation.as_deref(),
-            Some(old_id.as_str())
-        );
+        assert_eq!(snapshot.pane.signal_retained, None);
+        assert_ne!(snapshot.pane.conversation.as_deref(), Some(old_id.as_str()));
     }
 
     /// A store that is still on disk and cannot be read keeps its row.
@@ -14876,7 +14861,7 @@ mod tests {
         );
         assert!(kept.history_unreadable(), "the row is disabled");
         assert_eq!(snapshot.signal_retained_chip_label(1), kept.detail);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         assert!(!snapshot.can_send(), "the row has no Send");
         assert!(snapshot.hides_composer(), "the row has no composer");
         assert!(
@@ -14893,7 +14878,7 @@ mod tests {
                 .is_some_and(|rows| rows.iter().all(|row| row.id != missing_id)),
             "the missing slot's chats go with the row"
         );
-        assert_eq!(snapshot.selected_signal_retained, Some(1));
+        assert_eq!(snapshot.pane.signal_retained, Some(1));
         assert_eq!(snapshot.selected_messages().len(), 1);
         assert_eq!(snapshot.selected_messages()[0].body, "kept");
         let live = snapshot
@@ -15107,7 +15092,7 @@ mod tests {
             },
         });
         snapshot.select_retained_signal(1);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         assert!(!snapshot.can_send());
         assert_eq!(
             snapshot.signal_read_only_reason(),
@@ -15199,7 +15184,7 @@ mod tests {
             conversation: chat(ProtocolId::Signal, &kept_id, false),
         });
         snapshot.select_conversation("ada".into());
-        snapshot.compose = "unsent".into();
+        snapshot.pane.compose = "unsent".into();
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -15214,7 +15199,7 @@ mod tests {
             conversation_id: "ada".into(),
             request,
         });
-        assert_eq!(snapshot.compose, "unsent");
+        assert_eq!(snapshot.pane.compose, "unsent");
 
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Signal,
@@ -15235,10 +15220,10 @@ mod tests {
         );
         snapshot.select_retained_signal(1);
         assert_eq!(
-            snapshot.selected_conversation.as_deref(),
+            snapshot.pane.conversation.as_deref(),
             Some(kept_id.as_str())
         );
-        assert_eq!(snapshot.compose, "unsent");
+        assert_eq!(snapshot.pane.compose, "unsent");
         assert!(!snapshot.can_send(), "the retained row cannot send");
         assert!(
             snapshot
@@ -15633,9 +15618,9 @@ mod tests {
         complete_telegram(&mut snapshot, &store);
         snapshot.apply(saved);
         assert!(snapshot.has_primary_account());
-        assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
         assert_eq!(
-            snapshot.selected_conversation.as_deref(),
+            snapshot.pane.conversation.as_deref(),
             Some("telegram:saved")
         );
         assert_eq!(snapshot.visible_conversations().len(), 1);
@@ -15779,11 +15764,11 @@ mod tests {
     fn compose_text_stays_until_the_adapter_accepts_the_send() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         assert_eq!(send_texts(&mut snapshot), vec!["hello"]);
         assert_eq!(
-            snapshot.compose, "hello",
+            snapshot.pane.compose, "hello",
             "not cleared before the pending row"
         );
         assert!(
@@ -15798,7 +15783,7 @@ mod tests {
         });
         accept(&mut snapshot, "telegram:1");
         assert!(
-            snapshot.compose.is_empty(),
+            snapshot.pane.compose.is_empty(),
             "the pending row means accepted"
         );
         assert!(snapshot.error.is_none());
@@ -15808,11 +15793,11 @@ mod tests {
     fn a_send_in_one_chat_does_not_block_send_in_another() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "for Ada".into();
+        snapshot.pane.compose = "for Ada".into();
         snapshot.send_compose();
         assert!(!snapshot.can_send(), "chat 1 waits for its pending row");
         snapshot.select_conversation("telegram:2".into());
-        snapshot.compose = "for Bob".into();
+        snapshot.pane.compose = "for Bob".into();
         assert!(snapshot.can_send(), "chat 2 is free (PR #40 re-review)");
         snapshot.send_compose();
         assert_eq!(send_texts(&mut snapshot), vec!["for Ada", "for Bob"]);
@@ -15823,18 +15808,18 @@ mod tests {
         accept(&mut snapshot, "telegram:1");
         snapshot.select_conversation("telegram:1".into());
         assert!(
-            snapshot.compose.is_empty(),
+            snapshot.pane.compose.is_empty(),
             "chat 1's draft cleared on accept"
         );
         snapshot.select_conversation("telegram:2".into());
-        assert_eq!(snapshot.compose, "for Bob", "chat 2 still waits");
+        assert_eq!(snapshot.pane.compose, "for Bob", "chat 2 still waits");
     }
 
     #[test]
     fn an_immediate_send_error_keeps_the_text_and_shows_the_error() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         let request = sent_request(&mut snapshot);
         // A stale or other request id does not fail this send.
@@ -15849,7 +15834,10 @@ mod tests {
             conversation_id: "telegram:1".into(),
             request,
         });
-        assert_eq!(snapshot.compose, "hello", "no pending row: the text stays");
+        assert_eq!(
+            snapshot.pane.compose, "hello",
+            "no pending row: the text stays"
+        );
         let error = snapshot.error.clone().expect("error block");
         assert_eq!(error.happened, "Message not sent.");
         assert!(snapshot.can_send(), "the user can send it again");
@@ -15859,7 +15847,7 @@ mod tests {
     fn an_unrelated_telegram_error_keeps_the_send_pending() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         snapshot.take_commands();
         snapshot.apply(AdapterEvent::Status {
@@ -15876,7 +15864,7 @@ mod tests {
             message: outgoing(1, 100, "hello", Delivery::Pending),
         });
         accept(&mut snapshot, "telegram:1");
-        assert!(snapshot.compose.is_empty(), "then accepted as usual");
+        assert!(snapshot.pane.compose.is_empty(), "then accepted as usual");
     }
 
     /// The adapter accepts the in-flight send of `chat` (its own request id).
@@ -15896,14 +15884,17 @@ mod tests {
     fn a_history_message_with_the_same_text_is_not_an_acceptance() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "ok".into();
+        snapshot.pane.compose = "ok".into();
         snapshot.send_compose();
         let request = sent_request(&mut snapshot);
         // History (still loading) has an older outgoing "ok" in this chat.
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 5, "ok", Delivery::Sent),
         });
-        assert_eq!(snapshot.compose, "ok", "history does not accept the send");
+        assert_eq!(
+            snapshot.pane.compose, "ok",
+            "history does not accept the send"
+        );
         assert!(!snapshot.can_send(), "the real send is still in flight");
         // The real send then fails at once: the draft is still there.
         snapshot.apply(AdapterEvent::SendRejected {
@@ -15911,7 +15902,7 @@ mod tests {
             conversation_id: "telegram:1".into(),
             request,
         });
-        assert_eq!(snapshot.compose, "ok");
+        assert_eq!(snapshot.pane.compose, "ok");
         assert_eq!(
             snapshot.error.clone().expect("error").happened,
             "Message not sent."
@@ -16137,16 +16128,12 @@ mod tests {
         });
         assert!(discord_linked(&snapshot));
         if DiscordAdapter::bot_inbox_compiled() {
-            assert_eq!(
-                snapshot.selected_protocol,
-                ProtocolId::Discord,
-                "first link"
-            );
+            assert_eq!(snapshot.pane.protocol, ProtocolId::Discord, "first link");
             assert_eq!(snapshot.visible_conversations().len(), 1);
             assert_eq!(snapshot.unread_for(ProtocolId::Discord), 1);
             assert_eq!(snapshot.center_view(), CenterView::Thread);
         } else {
-            assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+            assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
             assert!(snapshot.visible_conversations().is_empty());
         }
         // A refusal status keeps the link (shell plan 11). Only Account unlinks.
@@ -16212,9 +16199,9 @@ mod tests {
         );
         snapshot.select_protocol(ProtocolId::Discord);
         if DiscordAdapter::bot_inbox_compiled() {
-            assert_eq!(snapshot.selected_protocol, ProtocolId::Discord);
+            assert_eq!(snapshot.pane.protocol, ProtocolId::Discord);
         } else {
-            assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+            assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
         }
     }
 
@@ -16268,11 +16255,11 @@ mod tests {
             .find(|row| row.caps.id == ProtocolId::Telegram)
             .expect("telegram row")
             .state = AccountState::Linked;
-        snapshot.search = "secret-preview-should-not-match-search".into();
+        snapshot.pane.search = "secret-preview-should-not-match-search".into();
         assert!(snapshot.visible_conversations().is_empty());
-        snapshot.search = "you".into();
+        snapshot.pane.search = "you".into();
         assert_eq!(snapshot.visible_conversations().len(), 1);
-        snapshot.search = "saved".into();
+        snapshot.pane.search = "saved".into();
         assert_eq!(snapshot.visible_conversations().len(), 1);
     }
 
@@ -16393,12 +16380,12 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(42, "Ada", 1),
         });
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:42".into());
-        snapshot.compose = " hello ".into();
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:42".into());
+        snapshot.pane.compose = " hello ".into();
         snapshot.send_compose();
         assert_eq!(
-            snapshot.compose, " hello ",
+            snapshot.pane.compose, " hello ",
             "kept until the adapter accepts it"
         );
         assert!(snapshot.selected_messages().is_empty());
@@ -16420,11 +16407,11 @@ mod tests {
     #[test]
     fn send_compose_refuses_before_telegram_is_ready() {
         let mut snapshot = Snapshot::new();
-        snapshot.selected_conversation = Some("telegram:42".into());
-        snapshot.compose = "hello".into();
+        snapshot.pane.conversation = Some("telegram:42".into());
+        snapshot.pane.compose = "hello".into();
         assert!(!snapshot.can_send());
         snapshot.send_compose();
-        assert_eq!(snapshot.compose, "hello");
+        assert_eq!(snapshot.pane.compose, "hello");
         assert!(snapshot.take_commands().is_empty());
         assert!(
             snapshot.error.is_none(),
@@ -16485,10 +16472,7 @@ mod tests {
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(ids, vec!["telegram:9", "telegram:2"]);
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:2")
-        );
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:2"));
         let commands = snapshot.take_commands();
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -16506,8 +16490,8 @@ mod tests {
     fn messages_upsert_replace_and_body_edits_keep_sender() {
         let mut snapshot = Snapshot::new();
         link_telegram(&mut snapshot);
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:4".into());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:4".into());
         snapshot.apply(AdapterEvent::MessageReceived {
             message: ChatMessage {
                 protocol: ProtocolId::Telegram,
@@ -16626,8 +16610,8 @@ mod tests {
     fn deleted_message_ids_leave_the_thread() {
         let mut snapshot = Snapshot::new();
         link_telegram(&mut snapshot);
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:4".into());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:4".into());
         for (id, body) in [("telegram:4:1", "keep"), ("telegram:4:2", "drop")] {
             snapshot.apply(AdapterEvent::MessageReceived {
                 message: ChatMessage {
@@ -16773,7 +16757,7 @@ mod tests {
         snapshot.apply(AdapterEvent::MessageReceived {
             message: telegram_text(1, 7, "hi"),
         });
-        snapshot.compose = "draft".into();
+        snapshot.pane.compose = "draft".into();
         assert!(!snapshot.can_add_account());
 
         snapshot.apply(AdapterEvent::TelegramSessionEnded);
@@ -16784,7 +16768,7 @@ mod tests {
             "the old inbox is gone"
         );
         assert!(snapshot.selected_messages().is_empty());
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
         assert!(
             snapshot.drafts.is_empty(),
             "a remote logout drops every draft"
@@ -16819,7 +16803,7 @@ mod tests {
     fn a_relink_after_telegram_logout_shows_an_empty_compose() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "old account".into();
+        snapshot.pane.compose = "old account".into();
         snapshot.set_draft(
             ProtocolId::Telegram,
             "telegram:2",
@@ -16828,7 +16812,7 @@ mod tests {
         );
         snapshot.apply(AdapterEvent::TelegramSessionEnded);
         assert!(snapshot.drafts.is_empty());
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
 
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::Ready,
@@ -16840,9 +16824,9 @@ mod tests {
             conversation: telegram_chat(2, "Bob", 5),
         });
         snapshot.select_conversation("telegram:1".into());
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
         snapshot.select_conversation("telegram:2".into());
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
     }
 
     #[test]
@@ -17001,8 +16985,8 @@ mod tests {
         snapshot.telegram_phone = "+15550100777".into();
         snapshot.telegram_code = "code-fixture-5521".into();
         snapshot.telegram_2fa = "password-fixture-8d2".into();
-        snapshot.compose = "draft-fixture-3b7".into();
-        snapshot.search = "search-fixture-6e5".into();
+        snapshot.pane.compose = "draft-fixture-3b7".into();
+        snapshot.pane.search = "search-fixture-6e5".into();
         snapshot.drafts.insert(
             (ProtocolId::Telegram, "telegram:2".into(), None),
             "other-draft-fixture-2a9".into(),
@@ -17103,7 +17087,7 @@ mod tests {
                 detail: "reconnect".into(),
             });
         }
-        snapshot.compose = "next".into();
+        snapshot.pane.compose = "next".into();
         assert!(!snapshot.can_send(), "the chat still has a retry in flight");
         snapshot.retry_send("telegram:1:101");
         assert!(snapshot.take_commands().is_empty(), "no second retry");
@@ -17334,12 +17318,12 @@ mod tests {
             CenterView::Thread,
             "no Telegram needed"
         );
-        assert_eq!(snapshot.selected_protocol, ProtocolId::Slack);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
 
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
-        assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("slack:C1"));
         assert!(
             snapshot
                 .take_commands()
@@ -17408,13 +17392,13 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:RW", true),
         });
-        snapshot.compose = "hi".into();
-        snapshot.selected_conversation = Some("slack:RW".into());
+        snapshot.pane.compose = "hi".into();
+        snapshot.pane.conversation = Some("slack:RW".into());
         assert!(snapshot.can_send(), "a linked writable Slack channel");
-        snapshot.selected_conversation = Some("slack:RO".into());
+        snapshot.pane.conversation = Some("slack:RO".into());
         assert!(!snapshot.can_send(), "a read-only channel");
 
-        snapshot.selected_conversation = Some("slack:RW".into());
+        snapshot.pane.conversation = Some("slack:RW".into());
         snapshot.take_commands();
         snapshot.send_compose();
         assert!(snapshot.take_commands().iter().any(|command| matches!(
@@ -17438,11 +17422,11 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
-        snapshot.selected_protocol = ProtocolId::Slack;
-        snapshot.selected_conversation = Some("slack:C1".into());
+        snapshot.pane.protocol = ProtocolId::Slack;
+        snapshot.pane.conversation = Some("slack:C1".into());
         snapshot.history_loading.clear();
         let before = snapshot.status_text.clone();
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         assert_eq!(snapshot.status_line(), SENDING_STATUS);
         let request = snapshot
@@ -17470,11 +17454,11 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:1", true),
         });
-        snapshot.selected_protocol = ProtocolId::Discord;
-        snapshot.selected_conversation = Some("discord:1".into());
+        snapshot.pane.protocol = ProtocolId::Discord;
+        snapshot.pane.conversation = Some("discord:1".into());
         snapshot.history_loading.clear();
         let before = snapshot.status_text.clone();
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         let discord_request = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::SendAccepted {
@@ -17489,15 +17473,15 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(7, "Ada", 1),
         });
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:7".into());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:7".into());
         snapshot.history_loading.clear();
-        snapshot.compose = "wait".into();
+        snapshot.pane.compose = "wait".into();
         snapshot.send_compose();
         let telegram_request = send_request(&mut snapshot);
-        snapshot.selected_protocol = ProtocolId::Discord;
-        snapshot.selected_conversation = Some("discord:1".into());
-        snapshot.compose = "also".into();
+        snapshot.pane.protocol = ProtocolId::Discord;
+        snapshot.pane.conversation = Some("discord:1".into());
+        snapshot.pane.compose = "also".into();
         snapshot.send_compose();
         let discord_request = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::SendAccepted {
@@ -17578,19 +17562,19 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(2, "Bea", 2),
         });
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:1".into());
         snapshot.history_loading.clear();
         snapshot.chat_list_loading.clear();
-        snapshot.compose = "one".into();
+        snapshot.pane.compose = "one".into();
         snapshot.send_compose();
         let first = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 1, "one", Delivery::Pending),
         });
-        snapshot.selected_conversation = Some("telegram:2".into());
+        snapshot.pane.conversation = Some("telegram:2".into());
         snapshot.history_loading.clear();
-        snapshot.compose = "two".into();
+        snapshot.pane.compose = "two".into();
         snapshot.send_compose();
         let second = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17637,19 +17621,19 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(2, "Bea", 2),
         });
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:1".into());
         snapshot.history_loading.clear();
         snapshot.chat_list_loading.clear();
-        snapshot.compose = "one".into();
+        snapshot.pane.compose = "one".into();
         snapshot.send_compose();
         let first = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 1, "one", Delivery::Pending),
         });
-        snapshot.selected_conversation = Some("telegram:2".into());
+        snapshot.pane.conversation = Some("telegram:2".into());
         snapshot.history_loading.clear();
-        snapshot.compose = "two".into();
+        snapshot.pane.compose = "two".into();
         snapshot.send_compose();
         let second = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17741,17 +17725,17 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(2, "Bea", 2),
         });
-        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.pane.conversation = Some("telegram:1".into());
         snapshot.history_loading.clear();
-        snapshot.compose = "one".into();
+        snapshot.pane.compose = "one".into();
         snapshot.send_compose();
         let first = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 1, "one", Delivery::Pending),
         });
-        snapshot.selected_conversation = Some("telegram:2".into());
+        snapshot.pane.conversation = Some("telegram:2".into());
         snapshot.history_loading.clear();
-        snapshot.compose = "two".into();
+        snapshot.pane.compose = "two".into();
         snapshot.send_compose();
         let second = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17759,9 +17743,9 @@ mod tests {
         });
         snapshot.age_sends_for_test(crate::sends::SEND_TIMEOUT);
         assert!(snapshot.expire_sends());
-        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.pane.conversation = Some("telegram:1".into());
         snapshot.history_loading.clear();
-        snapshot.compose = "newer".into();
+        snapshot.pane.compose = "newer".into();
         snapshot.send_compose();
         let newer = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::SendAccepted {
@@ -17863,7 +17847,7 @@ mod tests {
     fn a_pending_row_binds_to_its_own_telegram_send() {
         let mut snapshot = telegram_ready();
         let older = accepted_telegram_send(&mut snapshot, "telegram:1", "one");
-        snapshot.compose = "two".into();
+        snapshot.pane.compose = "two".into();
         snapshot.send_compose();
         let newer = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17895,9 +17879,9 @@ mod tests {
     #[test]
     fn a_queued_telegram_id_goes_with_its_request() {
         let mut snapshot = telegram_ready();
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:1".into());
-        snapshot.compose = "one".into();
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:1".into());
+        snapshot.pane.compose = "one".into();
         snapshot.send_compose();
         let request = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17935,9 +17919,9 @@ mod tests {
     #[test]
     fn a_late_accept_after_a_late_expiry_pump_binds_its_row() {
         let mut snapshot = telegram_ready();
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:1".into());
-        snapshot.compose = "one".into();
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:1".into());
+        snapshot.pane.compose = "one".into();
         snapshot.send_compose();
         let request = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17964,8 +17948,8 @@ mod tests {
     }
 
     fn start_telegram_retry(snapshot: &mut Snapshot, chat: &str, message_id: &str) -> u64 {
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some(chat.to_owned());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some(chat.to_owned());
         snapshot.history_loading.clear();
         snapshot.chat_list_loading.clear();
         snapshot.retry_send(message_id);
@@ -18056,11 +18040,11 @@ mod tests {
     }
 
     fn accepted_telegram_send(snapshot: &mut Snapshot, chat: &str, body: &str) -> u64 {
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some(chat.to_owned());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some(chat.to_owned());
         snapshot.history_loading.clear();
         snapshot.chat_list_loading.clear();
-        snapshot.compose = body.to_owned();
+        snapshot.pane.compose = body.to_owned();
         snapshot.send_compose();
         let request = send_request(snapshot);
         snapshot.apply(AdapterEvent::SendAccepted {
@@ -18076,11 +18060,11 @@ mod tests {
     /// `SendAccepted`. Returns the request.
     fn pending_telegram_send(snapshot: &mut Snapshot, chat: i64, id: i64, body: &str) -> u64 {
         let conversation_id = format!("telegram:{chat}");
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some(conversation_id.clone());
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some(conversation_id.clone());
         snapshot.history_loading.clear();
         snapshot.chat_list_loading.clear();
-        snapshot.compose = body.to_owned();
+        snapshot.pane.compose = body.to_owned();
         snapshot.send_compose();
         let request = send_request(snapshot);
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -18108,14 +18092,14 @@ mod tests {
         });
         snapshot.history_loading.clear();
 
-        snapshot.selected_protocol = ProtocolId::Telegram;
-        snapshot.selected_conversation = Some("telegram:7".into());
-        snapshot.compose = "from telegram".into();
+        snapshot.pane.protocol = ProtocolId::Telegram;
+        snapshot.pane.conversation = Some("telegram:7".into());
+        snapshot.pane.compose = "from telegram".into();
         snapshot.send_compose();
         let telegram_request = send_request(&mut snapshot);
-        snapshot.selected_protocol = ProtocolId::Discord;
-        snapshot.selected_conversation = Some("discord:1".into());
-        snapshot.compose = "from discord".into();
+        snapshot.pane.protocol = ProtocolId::Discord;
+        snapshot.pane.conversation = Some("discord:1".into());
+        snapshot.pane.compose = "from discord".into();
         snapshot.send_compose();
         let discord_request = send_request(&mut snapshot);
 
@@ -18138,7 +18122,7 @@ mod tests {
             conversation_id: "telegram:7".into(),
             request: telegram_request,
         });
-        snapshot.compose = "again".into();
+        snapshot.pane.compose = "again".into();
         snapshot.send_compose();
         let later_discord = send_request(&mut snapshot);
         snapshot.apply(AdapterEvent::SendAccepted {
@@ -18179,7 +18163,7 @@ mod tests {
         });
         snapshot.select_protocol(ProtocolId::Discord);
         snapshot.select_conversation("telegram:1".into());
-        snapshot.compose = "to discord".into();
+        snapshot.pane.compose = "to discord".into();
         snapshot.send_compose();
         let request = snapshot
             .sends
@@ -18192,13 +18176,16 @@ mod tests {
             conversation_id: "telegram:1".into(),
             request,
         });
-        assert_eq!(snapshot.compose, "to discord");
+        assert_eq!(snapshot.pane.compose, "to discord");
         snapshot.apply(AdapterEvent::SendAccepted {
             protocol: ProtocolId::Discord,
             conversation_id: "telegram:1".into(),
             request,
         });
-        assert!(snapshot.compose.is_empty(), "Discord accepted its own send");
+        assert!(
+            snapshot.pane.compose.is_empty(),
+            "Discord accepted its own send"
+        );
     }
 
     #[test]
@@ -18296,7 +18283,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
-        snapshot.compose = "hi".into();
+        snapshot.pane.compose = "hi".into();
         snapshot.send_compose();
         snapshot.refresh_visible();
         assert_eq!(snapshot.thread_state(), ThreadState::Loading);
@@ -18308,7 +18295,7 @@ mod tests {
         });
         assert!(snapshot.protocol_linked(ProtocolId::Slack));
         assert_eq!(snapshot.visible_conversations().len(), 1);
-        assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("slack:C1"));
         assert_eq!(
             snapshot.thread_state(),
             ThreadState::Empty,
@@ -18330,7 +18317,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:9", true),
         });
-        snapshot.compose = "hi".into();
+        snapshot.pane.compose = "hi".into();
         snapshot.send_compose();
         snapshot.apply(AdapterEvent::Notice {
             protocol: ProtocolId::Discord,
@@ -18382,7 +18369,7 @@ mod tests {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
         snapshot.select_protocol(ProtocolId::Slack);
-        snapshot.compose = "slack text".into();
+        snapshot.pane.compose = "slack text".into();
         snapshot.send_compose();
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
@@ -18391,7 +18378,7 @@ mod tests {
         assert!(!snapshot.conversations.contains_key(&ProtocolId::Slack));
         assert!(!snapshot.sends.in_flight(ProtocolId::Slack, "slack:C1"));
         assert_eq!(
-            snapshot.selected_protocol,
+            snapshot.pane.protocol,
             ProtocolId::Telegram,
             "the next linked protocol takes the selection"
         );
@@ -18622,7 +18609,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
-        snapshot.compose = "hi".into();
+        snapshot.pane.compose = "hi".into();
         snapshot.send_compose();
         let request = snapshot
             .sends
@@ -18641,11 +18628,11 @@ mod tests {
             request,
         });
         assert!(
-            snapshot.compose.is_empty(),
+            snapshot.pane.compose.is_empty(),
             "the answer applied while Linking"
         );
         assert!(!snapshot.sends.in_flight(ProtocolId::Slack, "slack:C1"));
-        snapshot.compose = "next".into();
+        snapshot.pane.compose = "next".into();
         assert!(!snapshot.can_send(), "new sends wait for Linked");
 
         snapshot.apply(AdapterEvent::Account {
@@ -18664,7 +18651,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
-        snapshot.compose = "hi".into();
+        snapshot.pane.compose = "hi".into();
         snapshot.send_compose();
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
@@ -18699,8 +18686,8 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
-        snapshot.selected_conversation = Some("discord:1:2".into());
-        snapshot.compose = "keep me".into();
+        snapshot.pane.conversation = Some("discord:1:2".into());
+        snapshot.pane.compose = "keep me".into();
         snapshot.set_draft(
             ProtocolId::Discord,
             "discord:9:9",
@@ -18743,7 +18730,7 @@ mod tests {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
         snapshot.select_conversation("discord:1:2".into());
-        assert_eq!(snapshot.compose, "keep me");
+        assert_eq!(snapshot.pane.compose, "keep me");
     }
 
     /// A later accepted send of the same text must not come back on unlink.
@@ -18755,8 +18742,8 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
-        snapshot.selected_conversation = Some("discord:1:2".into());
-        snapshot.compose = "keep me".into();
+        snapshot.pane.conversation = Some("discord:1:2".into());
+        snapshot.pane.compose = "keep me".into();
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -18794,7 +18781,7 @@ mod tests {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
         snapshot.select_conversation("discord:1:2".into());
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
     }
 
     /// A 401 on a retry unlinks. The failed row's text stays in the draft
@@ -18807,7 +18794,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
-        snapshot.selected_conversation = Some("discord:1:2".into());
+        snapshot.pane.conversation = Some("discord:1:2".into());
         snapshot.apply(AdapterEvent::MessageReceived {
             message: ChatMessage {
                 protocol: ProtocolId::Discord,
@@ -18853,7 +18840,7 @@ mod tests {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
         snapshot.select_conversation("discord:1:2".into());
-        assert_eq!(snapshot.compose, "keep me");
+        assert_eq!(snapshot.pane.compose, "keep me");
     }
 
     /// Send 'A' is rejected and stays in compose. A later retry of row 'B'
@@ -18866,8 +18853,8 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
-        snapshot.selected_conversation = Some("discord:1:2".into());
-        snapshot.compose = "A".into();
+        snapshot.pane.conversation = Some("discord:1:2".into());
+        snapshot.pane.compose = "A".into();
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -18882,7 +18869,7 @@ mod tests {
             conversation_id: "discord:1:2".into(),
             request,
         });
-        assert_eq!(snapshot.compose, "A");
+        assert_eq!(snapshot.pane.compose, "A");
         snapshot.apply(AdapterEvent::MessageReceived {
             message: ChatMessage {
                 protocol: ProtocolId::Discord,
@@ -18928,7 +18915,7 @@ mod tests {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
         });
         snapshot.select_conversation("discord:1:2".into());
-        assert_eq!(snapshot.compose, "A");
+        assert_eq!(snapshot.pane.compose, "A");
     }
 
     /// Codex P2 (PR #68): unlinking one protocol keeps the draft of the same
@@ -18954,7 +18941,7 @@ mod tests {
             state: AccountState::Unlinked,
         });
         snapshot.select_conversation("telegram:2".into());
-        assert_eq!(snapshot.compose, "telegram draft", "no data loss");
+        assert_eq!(snapshot.pane.compose, "telegram draft", "no data loss");
     }
 
     /// A draft stays with its protocol when the user switches protocols.
@@ -18968,11 +18955,11 @@ mod tests {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
         snapshot.select_protocol(ProtocolId::Telegram);
-        snapshot.compose = "for telegram:1".into();
+        snapshot.pane.compose = "for telegram:1".into();
         snapshot.select_protocol(ProtocolId::Slack);
-        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.pane.compose.is_empty());
         snapshot.select_protocol(ProtocolId::Telegram);
-        assert_eq!(snapshot.compose, "for telegram:1");
+        assert_eq!(snapshot.pane.compose, "for telegram:1");
     }
 
     /// Codex P2 (PR #68): the fake adapter links before its rows, so a
@@ -19026,7 +19013,7 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: discord_guild_placeholder(),
         });
-        assert_eq!(snapshot.selected_conversation, None);
+        assert_eq!(snapshot.pane.conversation, None);
         assert!(
             open_chats(&mut snapshot).is_empty(),
             "no OpenChat for a placeholder"
@@ -19037,14 +19024,11 @@ mod tests {
             "not on a click either"
         );
 
-        snapshot.selected_conversation = None;
+        snapshot.pane.conversation = None;
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:real", true),
         });
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("discord:real")
-        );
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("discord:real"));
         assert_eq!(
             open_chats(&mut snapshot),
             vec![(ProtocolId::Discord, "discord:real".to_owned())]
@@ -19060,23 +19044,23 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
-        assert_eq!(snapshot.selected_protocol, ProtocolId::Slack);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
         complete_telegram(&mut snapshot, &store);
         assert!(snapshot.telegram_ready());
         assert_eq!(
-            snapshot.selected_protocol,
+            snapshot.pane.protocol,
             ProtocolId::Slack,
             "the user's choice stays"
         );
-        assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("slack:C1"));
 
         // With no session in the selected protocol, Telegram Ready selects
         // Telegram. Start on Slack, so the check needs the rule (qa L3).
         let mut fresh = shell_with(&[ProtocolId::Slack]);
-        fresh.selected_protocol = ProtocolId::Slack;
+        fresh.pane.protocol = ProtocolId::Slack;
         assert!(!fresh.has_session(ProtocolId::Slack));
         complete_telegram(&mut fresh, &store);
-        assert_eq!(fresh.selected_protocol, ProtocolId::Telegram);
+        assert_eq!(fresh.pane.protocol, ProtocolId::Telegram);
     }
 
     /// #70 case 3: a chat opened while Linking loads when Linked arrives.
@@ -19416,7 +19400,7 @@ mod tests {
     /// Sends "hello" in the selected chat and lets it expire. Returns the
     /// request id.
     fn expired_send(snapshot: &mut Snapshot) -> u64 {
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         let request = snapshot
             .sends
@@ -19453,7 +19437,7 @@ mod tests {
         let mut snapshot = ready_with_chats(&store);
         expired_send(&mut snapshot);
         assert!(snapshot.can_send(), "the chat is unlocked");
-        assert_eq!(snapshot.compose, "hello", "the text stays");
+        assert_eq!(snapshot.pane.compose, "hello", "the text stays");
         assert_eq!(
             snapshot.error.as_ref().map(|error| error.why.as_str()),
             Some("Telegram did not answer in time.")
@@ -19469,7 +19453,7 @@ mod tests {
         let mut snapshot = ready_with_chats(&store);
         let request = expired_send(&mut snapshot);
         late_answer(&mut snapshot, request, true);
-        assert_eq!(snapshot.compose, "", "the sent text is cleared");
+        assert_eq!(snapshot.pane.compose, "", "the sent text is cleared");
         assert!(snapshot.error.is_none(), "the timeout error goes");
     }
 
@@ -19480,9 +19464,9 @@ mod tests {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
         let request = expired_send(&mut snapshot);
-        snapshot.compose = "hello again".into();
+        snapshot.pane.compose = "hello again".into();
         late_answer(&mut snapshot, request, true);
-        assert_eq!(snapshot.compose, "hello again");
+        assert_eq!(snapshot.pane.compose, "hello again");
     }
 
     /// PR #81 review: a late accept for a chat the user left clears only its
@@ -19507,12 +19491,12 @@ mod tests {
         let request = expired_send(&mut snapshot);
         let error = snapshot.error.clone();
         late_answer(&mut snapshot, request, false);
-        assert_eq!(snapshot.compose, "hello");
+        assert_eq!(snapshot.pane.compose, "hello");
         assert_eq!(snapshot.error, error);
         assert!(snapshot.can_send());
         // A later accept for the same request finds nothing either.
         late_answer(&mut snapshot, request, true);
-        assert_eq!(snapshot.compose, "hello");
+        assert_eq!(snapshot.pane.compose, "hello");
     }
 
     /// #69: an unanswered retry sets its row back to Failed.
@@ -19601,14 +19585,14 @@ mod tests {
     /// Two sends in two chats, both expired in one pump. Returns the two
     /// request ids: Ada's (telegram:1) and Bob's (telegram:2, selected).
     fn two_expired_sends(snapshot: &mut Snapshot) -> (u64, u64) {
-        snapshot.compose = "to ada".into();
+        snapshot.pane.compose = "to ada".into();
         snapshot.send_compose();
         let ada = snapshot
             .sends
             .request_of(ProtocolId::Telegram, "telegram:1")
             .expect("send to Ada");
         snapshot.select_conversation("telegram:2".into());
-        snapshot.compose = "to bob".into();
+        snapshot.pane.compose = "to bob".into();
         snapshot.send_compose();
         let bob = snapshot
             .sends
@@ -19674,7 +19658,7 @@ mod tests {
     fn a_timeout_in_another_chat_names_its_draft() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         snapshot.select_conversation("telegram:2".into());
         snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
@@ -19697,14 +19681,14 @@ mod tests {
         });
         snapshot.select_protocol(ProtocolId::Telegram);
         snapshot.select_conversation("telegram:1".into());
-        snapshot.compose = "to ada".into();
+        snapshot.pane.compose = "to ada".into();
         snapshot.send_compose();
         snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
         assert!(snapshot.error.is_some());
 
         snapshot.select_protocol(ProtocolId::Slack);
         snapshot.select_conversation("slack:C1".into());
-        snapshot.compose = "to slack".into();
+        snapshot.pane.compose = "to slack".into();
         snapshot.send_compose();
 
         snapshot.apply(AdapterEvent::Account {
@@ -19760,7 +19744,7 @@ mod tests {
         });
         snapshot.history_loading.clear();
         snapshot.status_text = "Telegram is ready.".into();
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         assert_eq!(snapshot.status_line(), SENDING_STATUS);
         snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
@@ -19828,7 +19812,7 @@ mod tests {
         snapshot.history_loading.clear();
         snapshot.select_protocol(ProtocolId::Slack);
         snapshot.history_loading.clear();
-        snapshot.compose = "hi".into();
+        snapshot.pane.compose = "hi".into();
         snapshot.send_compose();
         assert_eq!(
             snapshot.loading_line(ProtocolId::Slack),
@@ -19938,7 +19922,7 @@ mod tests {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
         snapshot.select_conversation("slack:C1".into());
-        snapshot.compose = text.into();
+        snapshot.pane.compose = text.into();
         snapshot.send_compose();
         snapshot
             .sends
@@ -19975,7 +19959,7 @@ mod tests {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
         snapshot.select_conversation("slack:C1".into());
-        assert_eq!(snapshot.compose, "hello", "the text is back");
+        assert_eq!(snapshot.pane.compose, "hello", "the text is back");
     }
 
     /// #135: a session end keeps the pending text only when the chat's text
@@ -19984,7 +19968,7 @@ mod tests {
     fn a_session_end_does_not_overwrite_other_text_with_a_pending_send() {
         let mut snapshot = shell_with(&[ProtocolId::Slack]);
         slack_send_in_flight(&mut snapshot, "hello");
-        snapshot.compose = "something else".into();
+        snapshot.pane.compose = "something else".into();
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
             state: AccountState::Unlinked,
@@ -20021,7 +20005,7 @@ mod tests {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
         });
         snapshot.select_conversation("slack:C1".into());
-        assert_eq!(snapshot.compose, "hello", "the text is back");
+        assert_eq!(snapshot.pane.compose, "hello", "the text is back");
     }
 
     /// #135 keeps the R73 rule: a Telegram session end drops every draft,
@@ -20030,7 +20014,7 @@ mod tests {
     fn a_telegram_session_end_still_drops_a_pending_send_text() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         snapshot.send_compose();
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Telegram,
@@ -20042,7 +20026,7 @@ mod tests {
                 .keys()
                 .any(|(owner, _, _)| *owner == ProtocolId::Telegram)
         );
-        assert_eq!(snapshot.compose, "");
+        assert_eq!(snapshot.pane.compose, "");
     }
 
     /// qa Low on #135 (#138): a retry in flight when the session ends
@@ -20104,7 +20088,7 @@ mod tests {
     #[test]
     fn an_unlinked_discord_account_that_was_never_linked_stays_idle() {
         let mut snapshot = Snapshot::new();
-        let selected = snapshot.selected_protocol;
+        let selected = snapshot.pane.protocol;
         let discord = snapshot
             .accounts
             .iter()
@@ -20116,7 +20100,7 @@ mod tests {
             state: AccountState::Unlinked,
         });
         assert!(!snapshot.protocol_linked(ProtocolId::Discord));
-        assert_eq!(snapshot.selected_protocol, selected);
+        assert_eq!(snapshot.pane.protocol, selected);
         assert!(snapshot.error.is_none());
         let discord = snapshot
             .accounts

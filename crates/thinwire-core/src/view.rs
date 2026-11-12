@@ -143,7 +143,7 @@ impl View<'_> {
     #[must_use]
     pub fn showing_topic_list(&self) -> bool {
         self.selected_conversation_row()
-            .is_some_and(|row| row.has_topics && self.selected_topic.is_none())
+            .is_some_and(|row| row.has_topics && self.pane.topic.is_none())
     }
 
     /// Placeholder of the compose field.

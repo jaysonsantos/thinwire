@@ -645,9 +645,7 @@ impl StripContent {
             line: strip_status(snapshot, &line)
                 .map(|text| (text.to_owned(), load_failure_text(&line).is_some())),
             notice,
-            note: snapshot
-                .notice(snapshot.selected_protocol)
-                .map(str::to_owned),
+            note: snapshot.notice(snapshot.pane.protocol).map(str::to_owned),
             error: if snapshot.auth == AuthScreen::Idle {
                 snapshot.error.clone()
             } else {
@@ -1144,7 +1142,7 @@ fn chat_column(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &
 /// Header of the chat list: the account name, its risk notice, the busy
 /// state, and the search field. Ban risk opens the same README text as Unofficial.
 fn account_info(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
-    let protocol = snapshot.selected_protocol;
+    let protocol = snapshot.pane.protocol;
     let palette = theme::palette(ui);
     ui.horizontal(|ui| {
         ui.add_space(theme::ROW_INSET.x);
@@ -1170,7 +1168,7 @@ fn account_info(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         });
     });
     ui.add_space(space::XS);
-    if let Some(text) = search_field(ui, &snapshot.search) {
+    if let Some(text) = search_field(ui, &snapshot.pane.search) {
         out.push(Intent::SetSearch(text.into()));
     }
     ui.add_space(space::S);
@@ -1673,7 +1671,7 @@ fn inbox(
             };
         }
         InboxState::NoMatch => {
-            let query = snapshot.search.trim();
+            let query = snapshot.pane.search.trim();
             empty_note(ui, &format!("No chats match '{query}'."));
             return DrawnInbox {
                 anchor: None,
@@ -1704,8 +1702,8 @@ fn inbox(
             mute,
             avatar,
         } = row;
-        let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
-        let focused = snapshot.focused_row.as_deref() == Some(id.as_str());
+        let selected = snapshot.pane.conversation.as_deref() == Some(id.as_str());
+        let focused = snapshot.pane.focused_row.as_deref() == Some(id.as_str());
         let response = inbox_row(
             ui,
             protocol,
@@ -2615,7 +2613,7 @@ fn thread(
     thread_header(ui, snapshot, out);
     let palette = theme::palette(ui);
     let signal_removed =
-        snapshot.signal_device_removed() && snapshot.selected_protocol.is(ProtocolKind::Signal);
+        snapshot.signal_device_removed() && snapshot.pane.protocol.is(ProtocolKind::Signal);
     if snapshot.signal_read_only_reason().is_some() || signal_removed {
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::S as i8))
@@ -2652,7 +2650,7 @@ fn thread(
     };
     // A one-to-one chat has one other person, so it keeps the one color.
     let person_colors = is_group && snapshot.person_colors();
-    let actions = snapshot.message_actions(snapshot.selected_protocol);
+    let actions = snapshot.message_actions(snapshot.pane.protocol);
     let selection = snapshot.selected_for_forward();
     let selecting = !selection.is_empty();
     let thread = snapshot.selected_messages();
@@ -2699,7 +2697,7 @@ fn thread(
     // An unreadable history row has no composer and no Send control.
     let hide_compose = snapshot.hides_composer();
     let row_height = ui.text_style_height(&egui::TextStyle::Body);
-    let compose_rows = compose_line_count(&snapshot.compose);
+    let compose_rows = compose_line_count(&snapshot.pane.compose);
     let compose_height = compose_row_height(row_height, COMPOSE_MAX_ROWS);
     let reserve = if hide_compose {
         0.0
@@ -2728,9 +2726,9 @@ fn thread(
         ui.ctx(),
         ui.scope_id().with("thread-fade"),
         egui::Id::unique((
-            snapshot.selected_protocol,
-            &snapshot.selected_conversation,
-            snapshot.selected_topic,
+            snapshot.pane.protocol,
+            &snapshot.pane.conversation,
+            snapshot.pane.topic,
             state == ThreadState::Rows,
         )),
         motion::FADE,
@@ -2877,14 +2875,15 @@ fn thread(
         && older == OlderState::Idle
         && snapshot.older_can_ask()
         && let Some((protocol, conversation_id)) = snapshot
-            .selected_conversation
+            .pane
+            .conversation
             .clone()
-            .map(|id| (snapshot.selected_protocol, id))
+            .map(|id| (snapshot.pane.protocol, id))
     {
         out.push(Intent::LoadOlderMessages {
             protocol,
             conversation_id,
-            topic: snapshot.selected_topic,
+            topic: snapshot.pane.topic,
         });
     }
     if let Some(message_id) = retry {
@@ -2893,7 +2892,7 @@ fn thread(
 
     if !hide_compose {
         compose(ui, snapshot, hints, compose_height, out);
-        if snapshot.sends_media(snapshot.selected_protocol) {
+        if snapshot.sends_media(snapshot.pane.protocol) {
             super::attach::drop_hint(ui, ui.max_rect());
         }
     }
@@ -3180,10 +3179,7 @@ struct Bubble<'a> {
 
 /// Scroll id of the open thread. A topic keeps its own offset.
 fn thread_salt(snapshot: &View<'_>) -> String {
-    match (
-        snapshot.selected_conversation.as_deref(),
-        snapshot.selected_topic,
-    ) {
+    match (snapshot.pane.conversation.as_deref(), snapshot.pane.topic) {
         (Some(id), Some(topic)) => topic_mute_id(id, topic),
         (Some(id), None) => id.to_owned(),
         (None, _) => String::new(),
@@ -4303,19 +4299,20 @@ fn compose(
     // The chat this frame drew. Drafts and sends name it, so a click on
     // another chat in the same frame cannot move them (PR #48 review).
     let chat = snapshot
-        .selected_conversation
+        .pane
+        .conversation
         .clone()
-        .map(|id| (snapshot.selected_protocol, id, snapshot.selected_topic));
+        .map(|id| (snapshot.pane.protocol, id, snapshot.pane.topic));
     let closed = snapshot.topic_closed();
     // A closed topic already disables this field. Sending is off after the
     // phone removes the device, so the field uses that same switch.
-    let sending_off = snapshot.selected_protocol.is(ProtocolKind::Signal)
+    let sending_off = snapshot.pane.protocol.is(ProtocolKind::Signal)
         && (snapshot.signal_device_removed() || snapshot.signal_read_only_reason().is_some());
     let compose_open = !closed && !sending_off;
     // Dropped and pasted photos and videos go to the tray of this thread.
     // This runs before the field, so a paste of files adds no text.
     if compose_open
-        && snapshot.sends_media(snapshot.selected_protocol)
+        && snapshot.sends_media(snapshot.pane.protocol)
         && let Some(thread) = chat.as_ref()
     {
         let focused = ui.memory(|memory| memory.has_focus(compose_id));
@@ -4383,7 +4380,7 @@ fn compose(
                 let width = (ui.available_width() - SEND_MIN_HEIGHT - space::S).max(0.0);
                 let visible = compose_row_height(
                     ui.text_style_height(&egui::TextStyle::Body),
-                    compose_line_count(&snapshot.compose),
+                    compose_line_count(&snapshot.pane.compose),
                 )
                 .min(max_height);
                 egui::ScrollArea::vertical()
@@ -4399,7 +4396,7 @@ fn compose(
                         } else {
                             "Message"
                         };
-                        if let Some(text) = edited(ui, &snapshot.compose, name, |text| {
+                        if let Some(text) = edited(ui, &snapshot.pane.compose, name, |text| {
                             egui::TextEdit::multiline(text)
                                 .id(compose_id)
                                 .frame(field)
@@ -4845,7 +4842,7 @@ mod tests {
         };
 
         for rows in 1..=COMPOSE_MAX_ROWS {
-            snapshot.compose = compose_body(rows);
+            snapshot.pane.compose = compose_body(rows);
             let mut output = ctx.run_ui(input.clone(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let spacing = ui.spacing().item_spacing.y;
@@ -4879,7 +4876,7 @@ mod tests {
                     // The scroll cap must hold the field, including its margin.
                     // A short cap clips lines 4 and 5.
                     let cap = compose_row_height(row_height, rows);
-                    let mut body = snapshot.compose.clone();
+                    let mut body = snapshot.pane.compose.clone();
                     let palette = theme::palette(ui);
                     let field = egui::Frame::new()
                         .inner_margin(egui::Margin::symmetric(space::M as i8, space::M as i8))
@@ -4902,7 +4899,7 @@ mod tests {
         }
 
         for rows in [1, COMPOSE_MAX_ROWS] {
-            snapshot.compose = compose_body(rows);
+            snapshot.pane.compose = compose_body(rows);
             let mut output = ctx.run_ui(input.clone(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let origin = ui.cursor().min;
@@ -4917,7 +4914,7 @@ mod tests {
                             let row_height = ui.text_style_height(&egui::TextStyle::Body);
                             let reserve = compose_reserve(
                                 row_height,
-                                compose_line_count(&snapshot.compose),
+                                compose_line_count(&snapshot.pane.compose),
                                 spacing,
                             );
                             let available = ui.available_height();
@@ -5312,7 +5309,7 @@ mod tests {
         // A note of the selected protocol shows the strip too.
         snapshot.status_text = "Recent messages loaded.".into();
         snapshot.apply(thinwire_protocol::AdapterEvent::Notice {
-            protocol: snapshot.selected_protocol,
+            protocol: snapshot.pane.protocol,
             text: "Read-only channel.".into(),
         });
         assert!(status_strip_visible(&snapshot, None));
@@ -5858,7 +5855,7 @@ mod tests {
             detail: signal_retained_unreadable_detail(1),
         });
         snapshot.select_retained_signal(1);
-        snapshot.compose = "hello".into();
+        snapshot.pane.compose = "hello".into();
         let kept = snapshot
             .accounts
             .iter()

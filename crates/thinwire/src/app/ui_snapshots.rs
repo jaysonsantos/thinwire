@@ -891,7 +891,7 @@ mod signal_removed {
         field.type_text("nope");
         harness.run();
         assert!(
-            harness.state().core.view().compose.is_empty(),
+            harness.state().core.view().pane.compose.is_empty(),
             "sending is off: the message input takes no text"
         );
         let link = harness

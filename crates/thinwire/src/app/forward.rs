@@ -38,7 +38,7 @@ pub(crate) fn selection_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Ve
     if count == 0 {
         return;
     }
-    let Some(conversation_id) = snapshot.selected_conversation.clone() else {
+    let Some(conversation_id) = snapshot.pane.conversation.clone() else {
         return;
     };
     let palette = theme::palette(ui);
@@ -59,7 +59,7 @@ pub(crate) fn selection_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Ve
             }
             if ui.button("Forward…").clicked() {
                 out.push(Intent::OpenForward {
-                    protocol: snapshot.selected_protocol,
+                    protocol: snapshot.pane.protocol,
                     conversation_id,
                     message_id: None,
                 });

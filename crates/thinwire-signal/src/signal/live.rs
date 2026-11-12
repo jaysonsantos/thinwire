@@ -7523,9 +7523,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             snapshot.apply(event);
         }
         snapshot.select_retained_signal(1);
-        snapshot.selected_protocol = ProtocolId::Signal;
-        snapshot.selected_conversation = Some(chat_id.clone());
-        snapshot.compose = "hello".into();
+        snapshot.pane.protocol = ProtocolId::Signal;
+        snapshot.pane.conversation = Some(chat_id.clone());
+        snapshot.pane.compose = "hello".into();
         assert!(!snapshot.can_send(), "a retained chat cannot send");
         assert_eq!(
             snapshot.selected_messages().len(),

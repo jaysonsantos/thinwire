@@ -177,8 +177,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 .snapshot
                 .remove_attachment(protocol, &conversation_id, topic, index),
             Intent::CloseTopic { conversation_id } => {
-                if state.snapshot.selected_conversation.as_deref() == Some(conversation_id.as_str())
-                {
+                if state.snapshot.pane.conversation.as_deref() == Some(conversation_id.as_str()) {
                     state.snapshot.close_open_topic();
                 }
             }
@@ -392,10 +391,7 @@ fn a_click_on_the_account_name_selects_the_account() {
         .expect("the name label of the WhatsApp row");
     let at = egui::pos2(name.center().x, name.center().y);
     click_at(&mut harness, at);
-    assert_eq!(
-        harness.state().snapshot.selected_protocol,
-        ProtocolId::WhatsApp
-    );
+    assert_eq!(harness.state().snapshot.pane.protocol, ProtocolId::WhatsApp);
     let telegram = harness
         .query_all(
             By::new()
@@ -409,10 +405,7 @@ fn a_click_on_the_account_name_selects_the_account() {
         &mut harness,
         egui::pos2(telegram.center().x, telegram.center().y),
     );
-    assert_eq!(
-        harness.state().snapshot.selected_protocol,
-        ProtocolId::Telegram
-    );
+    assert_eq!(harness.state().snapshot.pane.protocol, ProtocolId::Telegram);
 }
 
 /// ADR 0014: Add account opens a menu of the services, also with a linked
@@ -638,9 +631,9 @@ fn back_and_the_breadcrumb_open_the_topic_list() {
         .get_by_role_and_label(egui::accesskit::Role::Button, "Back to topics")
         .click();
     harness.run_steps(3);
-    assert_eq!(harness.state().snapshot.selected_topic, None);
+    assert_eq!(harness.state().snapshot.pane.topic, None);
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:9")
     );
     assert!(
@@ -666,7 +659,7 @@ fn back_and_the_breadcrumb_open_the_topic_list() {
         .expect("the breadcrumb");
     crumb.click();
     harness.run_steps(3);
-    assert_eq!(harness.state().snapshot.selected_topic, None);
+    assert_eq!(harness.state().snapshot.pane.topic, None);
 }
 
 /// A press and a release of the main button at one point. The new account
@@ -978,13 +971,13 @@ fn a_click_on_the_preview_opens_that_chat() {
     let mut harness = harness(InboxUi::ready());
     harness.run();
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1")
     );
     harness.get_by_label("seen from Bob").click();
     harness.step();
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:2")
     );
     harness.get_by_role_and_label(egui::accesskit::Role::Button, "Bob");
@@ -997,12 +990,12 @@ fn arrows_move_the_highlight_and_enter_opens_it() {
     harness.key_press(egui::Key::ArrowDown);
     harness.step();
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1"),
         "an arrow does not replace the open chat"
     );
     assert_eq!(
-        harness.state().snapshot.focused_row.as_deref(),
+        harness.state().snapshot.pane.focused_row.as_deref(),
         Some("telegram:2")
     );
     assert!(harness.state_mut().snapshot.take_scroll_to_focused());
@@ -1016,7 +1009,7 @@ fn arrows_move_the_highlight_and_enter_opens_it() {
     harness.key_press(egui::Key::Enter);
     harness.step();
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1"),
         "Enter on a thread control does not open the highlighted chat"
     );
@@ -1046,14 +1039,14 @@ fn tab_to_a_row_then_enter_opens_it() {
     for _ in 0..40 {
         harness.key_press(egui::Key::Tab);
         harness.step();
-        if harness.state().snapshot.focused_row.as_deref() == Some("telegram:2") {
+        if harness.state().snapshot.pane.focused_row.as_deref() == Some("telegram:2") {
             landed = true;
             break;
         }
     }
     assert!(landed, "Tab reaches Bob and moves the highlight");
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1"),
         "Tab does not open the chat"
     );
@@ -1062,7 +1055,7 @@ fn tab_to_a_row_then_enter_opens_it() {
     harness.step();
     assert_eq!(harness.state().selects, 1, "Enter sends one open");
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:2")
     );
 }
@@ -1102,13 +1095,13 @@ fn arrow_down_twice_keeps_the_highlight_on_row_3() {
     harness.key_press(egui::Key::ArrowDown);
     harness.step();
     assert_eq!(
-        harness.state().snapshot.focused_row.as_deref(),
+        harness.state().snapshot.pane.focused_row.as_deref(),
         Some("telegram:3")
     );
     harness.step();
     harness.step();
     assert_eq!(
-        harness.state().snapshot.focused_row.as_deref(),
+        harness.state().snapshot.pane.focused_row.as_deref(),
         Some("telegram:3"),
         "the highlight stays on row 3"
     );
@@ -1357,7 +1350,7 @@ fn selected_messages_forward_through_the_chat_picker() {
 fn a_person_who_types_shows_over_the_compose_field() {
     let mut state = InboxUi::ready();
     assert_eq!(
-        state.snapshot.selected_conversation.as_deref(),
+        state.snapshot.pane.conversation.as_deref(),
         Some("telegram:1")
     );
     for (chat, who, name) in [
@@ -1452,7 +1445,7 @@ fn text_fields_have_names_and_take_a_set_value() {
     assert_eq!(atspi_name(&search).as_deref(), Some("Search chats"));
     search.set_text_value_accesskit("bo");
     harness.run();
-    assert_eq!(harness.state_mut().snapshot.search, "bo");
+    assert_eq!(harness.state_mut().snapshot.pane.search, "bo");
 
     let compose =
         harness.get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Message");
@@ -1941,14 +1934,14 @@ fn a_click_on_a_mention_opens_the_chat_of_that_person() {
     click_at(&mut harness, egui::pos2(cy.left() + 6.0, cy.center().y));
     assert_eq!(harness.state().selects, 0, "no chat for this mention");
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1")
     );
     let bob = run_of(&harness, "@Bob");
     click_at(&mut harness, egui::pos2(bob.left() + 6.0, bob.center().y));
     assert_eq!(harness.state().selects, 1);
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:2")
     );
 }
@@ -2124,7 +2117,7 @@ fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
     for _ in 0..40 {
         harness.key_press(egui::Key::Tab);
         harness.step();
-        if harness.state().snapshot.focused_row.as_deref() == Some("telegram:1") {
+        if harness.state().snapshot.pane.focused_row.as_deref() == Some("telegram:1") {
             tabbed = true;
             break;
         }
@@ -2136,7 +2129,7 @@ fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
         "widget focus is on the Tab row"
     );
     assert_eq!(
-        harness.state().snapshot.focused_row.as_deref(),
+        harness.state().snapshot.pane.focused_row.as_deref(),
         Some("telegram:1"),
         "the highlight is on the Tab row"
     );
@@ -2145,7 +2138,7 @@ fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
     harness.key_press(egui::Key::ArrowDown);
     harness.step();
     assert_eq!(
-        harness.state().snapshot.focused_row.as_deref(),
+        harness.state().snapshot.pane.focused_row.as_deref(),
         Some("telegram:3")
     );
     let cara = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Cara");
@@ -2159,7 +2152,7 @@ fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
         "an arrow does not open the chat"
     );
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1"),
         "an arrow leaves Ada open"
     );
@@ -2168,7 +2161,7 @@ fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
     harness.step();
     assert_eq!(harness.state().selects, 1, "Enter sends one open");
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:3")
     );
 }
@@ -2297,7 +2290,7 @@ fn a_message_in_another_chat_keeps_the_open_chat_and_the_composer() {
         conversation: ada_row,
     });
     assert!(!state.snapshot.wants_scroll_to_selected());
-    state.snapshot.compose = "draft for Bob".into();
+    state.snapshot.pane.compose = "draft for Bob".into();
     let mut harness = harness(state);
     harness.run();
     harness
@@ -2323,20 +2316,20 @@ fn a_message_in_another_chat_keeps_the_open_chat_and_the_composer() {
         .snapshot
         .apply(AdapterEvent::ConversationUpsert { conversation: ada });
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:2")
     );
-    assert_eq!(harness.state().snapshot.compose, "draft for Bob");
+    assert_eq!(harness.state().snapshot.pane.compose, "draft for Bob");
     assert!(!harness.state().snapshot.wants_scroll_to_selected());
     assert!(!harness.state().snapshot.wants_focus_compose());
     harness.step();
 
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:2"),
         "Ada's message does not open Ada"
     );
-    assert_eq!(harness.state().snapshot.compose, "draft for Bob");
+    assert_eq!(harness.state().snapshot.pane.compose, "draft for Bob");
     assert!(
         harness.ctx.memory(|memory| memory.has_focus(compose)),
         "the composer keeps focus"
@@ -2379,7 +2372,7 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
         conversation_id: "telegram:1".into(),
         store_cursor: None,
     });
-    state.snapshot.compose = "draft for Ada".into();
+    state.snapshot.pane.compose = "draft for Ada".into();
     let mut harness = harness(state);
     harness.run();
     let start = row_top(&harness, "Ada");
@@ -2421,10 +2414,10 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
             conversation: jumped,
         });
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1")
     );
-    assert_eq!(harness.state().snapshot.compose, "draft for Ada");
+    assert_eq!(harness.state().snapshot.pane.compose, "draft for Ada");
     assert!(!harness.state().snapshot.wants_scroll_to_selected());
     assert!(!harness.state().snapshot.wants_scroll_to_focused());
     harness.hover_at(point);
@@ -2437,10 +2430,10 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
     );
     assert!((after.top() - held.top()).abs() < 2.0);
     assert_eq!(
-        harness.state().snapshot.selected_conversation.as_deref(),
+        harness.state().snapshot.pane.conversation.as_deref(),
         Some("telegram:1")
     );
-    assert_eq!(harness.state().snapshot.compose, "draft for Ada");
+    assert_eq!(harness.state().snapshot.pane.compose, "draft for Ada");
 }
 
 /// The text that the last frame put on the clipboard.
@@ -2466,7 +2459,7 @@ fn type_in_compose(harness: &mut Harness<'static, InboxUi>, text: &str) {
         .get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Message")
         .type_text(text);
     harness.run();
-    assert_eq!(harness.state().snapshot.compose, text);
+    assert_eq!(harness.state().snapshot.pane.compose, text);
 }
 
 /// Run the Edit items of the macOS menu bar in one frame, as the app does
@@ -2498,23 +2491,23 @@ fn the_edit_menu_selects_copies_cuts_and_pastes_in_the_compose_field() {
         "",
     );
     assert_eq!(copied(&harness).as_deref(), Some("hello world"));
-    assert_eq!(harness.state().snapshot.compose, "hello world");
+    assert_eq!(harness.state().snapshot.pane.compose, "hello world");
 
     menu_edit(&mut harness, &[EditCommand::Cut], "");
     assert_eq!(copied(&harness).as_deref(), Some("hello world"));
     harness.run();
-    assert_eq!(harness.state().snapshot.compose, "");
+    assert_eq!(harness.state().snapshot.pane.compose, "");
 
     menu_edit(&mut harness, &[EditCommand::Paste], "pasted\r\ntext");
     harness.run();
-    assert_eq!(harness.state().snapshot.compose, "pasted\ntext");
+    assert_eq!(harness.state().snapshot.pane.compose, "pasted\ntext");
 
     menu_edit(&mut harness, &[EditCommand::Undo], "");
     harness.run();
-    assert_eq!(harness.state().snapshot.compose, "");
+    assert_eq!(harness.state().snapshot.pane.compose, "");
     menu_edit(&mut harness, &[EditCommand::Redo], "");
     harness.run();
-    assert_eq!(harness.state().snapshot.compose, "pasted\ntext");
+    assert_eq!(harness.state().snapshot.pane.compose, "pasted\ntext");
 }
 
 /// Linux and Windows have no menu bar: egui-winit makes the events of
@@ -2536,9 +2529,9 @@ fn ctrl_keys_select_copy_cut_and_paste_in_the_compose_field() {
     harness.step();
     assert_eq!(copied(&harness).as_deref(), Some("one two"));
     harness.run();
-    assert_eq!(harness.state().snapshot.compose, "");
+    assert_eq!(harness.state().snapshot.pane.compose, "");
 
     harness.event(egui::Event::Paste("three".into()));
     harness.run();
-    assert_eq!(harness.state().snapshot.compose, "three");
+    assert_eq!(harness.state().snapshot.pane.compose, "three");
 }
