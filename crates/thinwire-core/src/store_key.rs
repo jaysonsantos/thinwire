@@ -242,6 +242,131 @@ fn read_os_key(account: &str) -> LoadStoreKey {
     }
 }
 
+/// Why the stores of a helper were not opened. The app maps this to the
+/// account row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreProtectFail {
+    /// The keychain refused the read. The store was not moved.
+    KeychainDenied,
+    /// The encrypted store did not open. The store files were moved aside.
+    /// `helper.lock` stays in the session folder.
+    WrongKey,
+    /// The store files could not be moved aside. They were left in place.
+    /// Nothing was deleted.
+    NotMoved,
+    /// The keychain cannot keep a key. The store was not moved.
+    NotSaved,
+    /// The export or the row check failed. The plaintext store stays.
+    EncryptFailed,
+}
+
+impl StoreProtectFail {
+    /// The result of a move of the store files: `moved` is true when every
+    /// file left the session folder.
+    #[must_use]
+    pub const fn after_move(moved: bool) -> Self {
+        if moved {
+            Self::WrongKey
+        } else {
+            Self::NotMoved
+        }
+    }
+}
+
+/// The key that opens the stores of one helper, from the keychain entry
+/// `account`. `encrypted_present` is true when a store file is already
+/// encrypted. `move_aside` moves the store files out of the session folder
+/// and says if every file moved. It runs only for a key that is missing
+/// while an encrypted file is there.
+///
+/// # Errors
+///
+/// [`StoreProtectFail`] for a keychain that refuses the read or cannot keep
+/// a key, and for a missing key of an encrypted store. It is never
+/// [`StoreProtectFail::EncryptFailed`].
+pub fn resolve_store_key(
+    account: &str,
+    encrypted_present: bool,
+    move_aside: impl FnOnce() -> bool,
+) -> Result<StoreKey, StoreProtectFail> {
+    resolve_with(
+        load_store_key(account),
+        encrypted_present,
+        || create_store_key(account),
+        move_aside,
+    )
+}
+
+/// [`resolve_store_key`] with the keychain read and the key creation as
+/// parameters.
+fn resolve_with(
+    loaded: LoadStoreKey,
+    encrypted_present: bool,
+    create: impl FnOnce() -> Result<StoreKey, CreateStoreKeyError>,
+    move_aside: impl FnOnce() -> bool,
+) -> Result<StoreKey, StoreProtectFail> {
+    match store_key_action(&loaded, encrypted_present) {
+        StoreKeyAction::Open => match loaded {
+            LoadStoreKey::Found(key) => Ok(key),
+            LoadStoreKey::Missing | LoadStoreKey::NotSaved | LoadStoreKey::Unavailable => {
+                Err(StoreProtectFail::KeychainDenied)
+            }
+        },
+        StoreKeyAction::Denied => Err(StoreProtectFail::KeychainDenied),
+        StoreKeyAction::NotSaved => Err(StoreProtectFail::NotSaved),
+        StoreKeyAction::MoveAside => Err(StoreProtectFail::after_move(move_aside())),
+        StoreKeyAction::Create => create().map_err(|error| match error {
+            CreateStoreKeyError::NotSaved => StoreProtectFail::NotSaved,
+            CreateStoreKeyError::Unavailable => StoreProtectFail::KeychainDenied,
+        }),
+    }
+}
+
+/// The store key of one helper process, read from the keychain one time.
+/// Each later open of a store uses the same bytes.
+pub struct SessionKey(std::sync::OnceLock<[u8; 32]>);
+
+impl SessionKey {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    /// The key of the keychain entry `account`. `None` when the entry has
+    /// no key or the read fails: the next call reads again.
+    #[must_use]
+    pub fn saved(&self, account: &str) -> Option<[u8; 32]> {
+        if let Some(key) = self.0.get() {
+            return Some(*key);
+        }
+        match load_store_key(account) {
+            LoadStoreKey::Found(key) => Some(self.keep(key.bytes())),
+            LoadStoreKey::Missing | LoadStoreKey::NotSaved | LoadStoreKey::Unavailable => None,
+        }
+    }
+
+    /// Keep `key` for this process, with no keychain read. The first key
+    /// stays. A test build of a helper uses a fixed key.
+    pub fn keep(&self, key: [u8; 32]) -> [u8; 32] {
+        *self.0.get_or_init(|| key)
+    }
+}
+
+impl Default for SessionKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The bytes do not show.
+impl fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionKey")
+            .field("read", &self.0.get().is_some())
+            .finish()
+    }
+}
+
 fn wipe(text: &mut String) {
     let width = text.len();
     text.clear();
@@ -252,6 +377,88 @@ fn wipe(text: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved(
+        loaded: LoadStoreKey,
+        encrypted_present: bool,
+        moved: bool,
+    ) -> (Result<[u8; 32], StoreProtectFail>, bool, bool) {
+        let created = std::cell::Cell::new(false);
+        let asked_move = std::cell::Cell::new(false);
+        let key = resolve_with(
+            loaded,
+            encrypted_present,
+            || {
+                created.set(true);
+                Ok(StoreKey([7; 32]))
+            },
+            || {
+                asked_move.set(true);
+                moved
+            },
+        );
+        (key.map(|key| key.bytes()), created.get(), asked_move.get())
+    }
+
+    #[test]
+    fn a_found_key_opens_the_store_and_changes_nothing() {
+        for encrypted in [false, true] {
+            let (key, created, moved) =
+                resolved(LoadStoreKey::Found(StoreKey([3; 32])), encrypted, true);
+            assert_eq!(key, Ok([3; 32]));
+            assert!(!created && !moved);
+        }
+    }
+
+    #[test]
+    fn a_denied_read_and_a_keychain_that_cannot_save_never_move_the_store() {
+        for encrypted in [false, true] {
+            let (key, created, moved) = resolved(LoadStoreKey::Unavailable, encrypted, true);
+            assert_eq!(key, Err(StoreProtectFail::KeychainDenied));
+            assert!(!created && !moved);
+            let (key, created, moved) = resolved(LoadStoreKey::NotSaved, encrypted, true);
+            assert_eq!(key, Err(StoreProtectFail::NotSaved));
+            assert!(!created && !moved);
+        }
+    }
+
+    #[test]
+    fn a_missing_key_of_an_encrypted_store_moves_it_aside_and_creates_no_key() {
+        let (key, created, moved) = resolved(LoadStoreKey::Missing, true, true);
+        assert_eq!(key, Err(StoreProtectFail::WrongKey));
+        assert!(!created && moved);
+        let (key, created, moved) = resolved(LoadStoreKey::Missing, true, false);
+        assert_eq!(key, Err(StoreProtectFail::NotMoved));
+        assert!(!created && moved);
+    }
+
+    #[test]
+    fn a_missing_key_with_no_encrypted_store_creates_a_key() {
+        let (key, created, moved) = resolved(LoadStoreKey::Missing, false, true);
+        assert_eq!(key, Ok([7; 32]));
+        assert!(created && !moved);
+        let refused = |error| {
+            resolve_with(LoadStoreKey::Missing, false, || Err(error), || true)
+                .map(|key| key.bytes())
+        };
+        assert_eq!(
+            refused(CreateStoreKeyError::NotSaved),
+            Err(StoreProtectFail::NotSaved)
+        );
+        assert_eq!(
+            refused(CreateStoreKeyError::Unavailable),
+            Err(StoreProtectFail::KeychainDenied)
+        );
+    }
+
+    #[test]
+    fn the_session_key_keeps_its_first_value() {
+        let key = SessionKey::new();
+        assert_eq!(key.keep([1; 32]), [1; 32]);
+        assert_eq!(key.keep([2; 32]), [1; 32]);
+        assert_eq!(key.saved("an entry that is not read"), Some([1; 32]));
+        assert_eq!(format!("{key:?}"), "SessionKey { read: true }");
+    }
 
     #[test]
     fn a_memory_keychain_does_not_save_the_session_key() {

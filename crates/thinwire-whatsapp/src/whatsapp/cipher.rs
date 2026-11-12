@@ -6,39 +6,21 @@
 //! The helper program does not.
 
 use std::path::Path;
-use std::sync::OnceLock;
 
 use diesel::prelude::RunQueryDsl;
 use whatsapp_rust::store::{SqliteDatabase, SqliteDatabaseConfig, SqliteStore};
 
+use thinwire_core::SessionKey;
 #[cfg(not(test))]
-use thinwire_core::{
-    CreateStoreKeyError, LoadStoreKey, StoreKeyAction, WHATSAPP_STORE_KEY_ACCOUNT,
-    create_store_key, load_store_key, store_key_action,
-};
+use thinwire_core::WHATSAPP_STORE_KEY_ACCOUNT;
 use thinwire_protocol::{
     MigrateOptions, PrepareError, is_encrypted_store, move_stores_aside, prepare_file,
     store_sibling,
 };
 
-/// Why the store was not opened. The app maps this to the account row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProtectFail {
-    /// The keychain refused the read. The store was not moved.
-    KeychainDenied,
-    /// The encrypted store did not open. The store files were moved aside.
-    /// `helper.lock` stays in the session folder.
-    WrongKey,
-    /// The store files could not be moved aside. They were left in place.
-    /// Nothing was deleted.
-    NotMoved,
-    /// The keychain cannot keep a key. The store was not moved.
-    NotSaved,
-    /// The export or the row check failed. The plaintext store stays.
-    EncryptFailed,
-}
+pub(super) use thinwire_core::StoreProtectFail as ProtectFail;
 
-static SESSION_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+static SESSION_KEY: SessionKey = SessionKey::new();
 
 /// Copy `device.sqlite` to SQLCipher when it is plaintext.
 ///
@@ -50,7 +32,7 @@ pub(super) fn protect_store(path: &Path) -> Result<(), ProtectFail> {
         || store_sibling(path, ".enc-new").exists()
         || store_sibling(path, ".plain-old").exists();
     let key = resolve_key(encrypted, path)?;
-    let _ = SESSION_KEY.set(key);
+    SESSION_KEY.keep(key);
     match prepare_file(path, &key, MigrateOptions::default()) {
         Ok(_) => Ok(()),
         Err(PrepareError::WrongKey) => Err(move_store(path)),
@@ -95,30 +77,14 @@ pub(super) fn cache_key() -> Result<[u8; 32], ()> {
     session_key()
 }
 
+/// The key of this helper process: the keychain entry, read one time. A
+/// test build has a fixed key and reads no keychain.
 fn session_key() -> Result<[u8; 32], ()> {
-    if let Some(key) = SESSION_KEY.get() {
-        return Ok(*key);
-    }
-    remember_key()
-}
-
-#[cfg(test)]
-fn remember_key() -> Result<[u8; 32], ()> {
-    let key = test_key();
-    let _ = SESSION_KEY.set(key);
-    Ok(key)
-}
-
-#[cfg(not(test))]
-fn remember_key() -> Result<[u8; 32], ()> {
-    match load_store_key(&super::path::account_key_name(WHATSAPP_STORE_KEY_ACCOUNT)) {
-        LoadStoreKey::Found(key) => {
-            let bytes = key.bytes();
-            let _ = SESSION_KEY.set(bytes);
-            Ok(bytes)
-        }
-        LoadStoreKey::Missing | LoadStoreKey::NotSaved | LoadStoreKey::Unavailable => Err(()),
-    }
+    #[cfg(test)]
+    let key = Some(SESSION_KEY.keep(test_key()));
+    #[cfg(not(test))]
+    let key = SESSION_KEY.saved(&super::path::account_key_name(WHATSAPP_STORE_KEY_ACCOUNT));
+    key.ok_or(())
 }
 
 #[cfg(test)]
@@ -133,36 +99,22 @@ fn test_key() -> [u8; 32] {
 
 #[cfg(not(test))]
 fn resolve_key(encrypted: bool, path: &Path) -> Result<[u8; 32], ProtectFail> {
-    let loaded = load_store_key(&super::path::account_key_name(WHATSAPP_STORE_KEY_ACCOUNT));
-    match store_key_action(&loaded, encrypted) {
-        StoreKeyAction::Open => match loaded {
-            LoadStoreKey::Found(key) => Ok(key.bytes()),
-            LoadStoreKey::Missing | LoadStoreKey::NotSaved | LoadStoreKey::Unavailable => {
-                Err(ProtectFail::KeychainDenied)
-            }
-        },
-        StoreKeyAction::Denied => Err(ProtectFail::KeychainDenied),
-        StoreKeyAction::NotSaved => Err(ProtectFail::NotSaved),
-        StoreKeyAction::MoveAside => Err(move_store(path)),
-        StoreKeyAction::Create => {
-            match create_store_key(&super::path::account_key_name(WHATSAPP_STORE_KEY_ACCOUNT)) {
-                Ok(key) => Ok(key.bytes()),
-                Err(CreateStoreKeyError::NotSaved) => Err(ProtectFail::NotSaved),
-                Err(CreateStoreKeyError::Unavailable) => Err(ProtectFail::KeychainDenied),
-            }
-        }
-    }
+    let account = super::path::account_key_name(WHATSAPP_STORE_KEY_ACCOUNT);
+    thinwire_core::resolve_store_key(&account, encrypted, || store_moved(path))
+        .map(|key| key.bytes())
 }
 
 fn move_store(store: &Path) -> ProtectFail {
-    let Some(dir) = store.parent().filter(|dir| dir.exists()) else {
-        return ProtectFail::NotMoved;
-    };
-    if move_stores_aside(dir).is_ok() {
-        ProtectFail::WrongKey
-    } else {
-        ProtectFail::NotMoved
-    }
+    ProtectFail::after_move(store_moved(store))
+}
+
+/// Move the files of the folder of `store` aside. `false` when that folder
+/// is not there, or when a file did not move.
+fn store_moved(store: &Path) -> bool {
+    store
+        .parent()
+        .filter(|dir| dir.exists())
+        .is_some_and(|dir| move_stores_aside(dir).is_ok())
 }
 
 fn wipe(text: &mut String) {
@@ -392,7 +344,7 @@ mod tests {
         let dir = temp_dir("new");
         let path = dir.join("device.sqlite");
         let url = path.to_str().expect("url").to_string();
-        let _ = SESSION_KEY.set(test_key());
+        SESSION_KEY.keep(test_key());
         let store = open_store(&url).await.expect("open");
         drop(store);
         assert!(path.is_file());

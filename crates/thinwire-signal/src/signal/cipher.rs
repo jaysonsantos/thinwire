@@ -7,38 +7,20 @@
 //! the OS keychain and refuses a keychain that cannot save.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use super::path::{PENDING_FILE, RETAINED_DIR, SQLITE_FILE};
 
 #[cfg(not(test))]
-use thinwire_core::{
-    CreateStoreKeyError, LoadStoreKey, SIGNAL_STORE_KEY_ACCOUNT, StoreKeyAction, create_store_key,
-    load_store_key, store_key_action,
-};
+use thinwire_core::SIGNAL_STORE_KEY_ACCOUNT;
+use thinwire_core::SessionKey;
 use thinwire_protocol::{
     MigrateOptions, PrepareError, is_encrypted_store, move_stores_aside, prepare_file,
     store_sibling,
 };
 
-/// Why the stores were not opened. The app maps this to the account row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProtectFail {
-    /// The keychain refused the read. The store was not moved.
-    KeychainDenied,
-    /// The encrypted store did not open. The store files were moved aside.
-    /// `helper.lock` stays in the session folder.
-    WrongKey,
-    /// The store files could not be moved aside. They were left in place.
-    /// Nothing was deleted.
-    NotMoved,
-    /// The keychain cannot keep a key. The store was not moved.
-    NotSaved,
-    /// The export or the row check failed. The plaintext store stays.
-    EncryptFailed,
-}
+pub(super) use thinwire_core::StoreProtectFail as ProtectFail;
 
-static SESSION_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+static SESSION_KEY: SessionKey = SessionKey::new();
 
 /// Copy every existing store to SQLCipher, then keep the key for later opens.
 ///
@@ -52,7 +34,7 @@ pub(super) fn protect_session(dir: &Path) -> Result<(), ProtectFail> {
         .iter()
         .any(|path| !is_retained(dir, path) && is_encrypted_store(path));
     let key = resolve_key(encrypted_live, dir)?;
-    let _ = SESSION_KEY.set(key);
+    SESSION_KEY.keep(key);
     for path in &files {
         match prepare_file(path, &key, MigrateOptions::default()) {
             Ok(_) => {}
@@ -99,30 +81,14 @@ pub(super) fn raw_key_sql() -> Result<String, ()> {
     session_key().map(|key| thinwire_protocol::raw_key_literal(&key))
 }
 
+/// The key of this helper process: the keychain entry, read one time. A
+/// test build has a fixed key and reads no keychain.
 fn session_key() -> Result<[u8; 32], ()> {
-    if let Some(key) = SESSION_KEY.get() {
-        return Ok(*key);
-    }
-    remember_key()
-}
-
-#[cfg(test)]
-fn remember_key() -> Result<[u8; 32], ()> {
-    let key = test_key();
-    let _ = SESSION_KEY.set(key);
-    Ok(key)
-}
-
-#[cfg(not(test))]
-fn remember_key() -> Result<[u8; 32], ()> {
-    match load_store_key(&super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT)) {
-        LoadStoreKey::Found(key) => {
-            let bytes = key.bytes();
-            let _ = SESSION_KEY.set(bytes);
-            Ok(bytes)
-        }
-        LoadStoreKey::Missing | LoadStoreKey::NotSaved | LoadStoreKey::Unavailable => Err(()),
-    }
+    #[cfg(test)]
+    let key = Some(SESSION_KEY.keep(test_key()));
+    #[cfg(not(test))]
+    let key = SESSION_KEY.saved(&super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT));
+    key.ok_or(())
 }
 
 #[cfg(test)]
@@ -137,25 +103,11 @@ fn test_key() -> [u8; 32] {
 
 #[cfg(not(test))]
 fn resolve_key(encrypted_present: bool, dir: &Path) -> Result<[u8; 32], ProtectFail> {
-    let loaded = load_store_key(&super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT));
-    match store_key_action(&loaded, encrypted_present) {
-        StoreKeyAction::Open => match loaded {
-            LoadStoreKey::Found(key) => Ok(key.bytes()),
-            LoadStoreKey::Missing | LoadStoreKey::NotSaved | LoadStoreKey::Unavailable => {
-                Err(ProtectFail::KeychainDenied)
-            }
-        },
-        StoreKeyAction::Denied => Err(ProtectFail::KeychainDenied),
-        StoreKeyAction::NotSaved => Err(ProtectFail::NotSaved),
-        StoreKeyAction::MoveAside => Err(move_aside(dir)),
-        StoreKeyAction::Create => {
-            match create_store_key(&super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT)) {
-                Ok(key) => Ok(key.bytes()),
-                Err(CreateStoreKeyError::NotSaved) => Err(ProtectFail::NotSaved),
-                Err(CreateStoreKeyError::Unavailable) => Err(ProtectFail::KeychainDenied),
-            }
-        }
-    }
+    let account = super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT);
+    thinwire_core::resolve_store_key(&account, encrypted_present, || {
+        thinwire_protocol::move_stores_aside(dir).is_ok()
+    })
+    .map(|key| key.bytes())
 }
 
 fn store_files(dir: &Path) -> Vec<PathBuf> {
@@ -193,11 +145,7 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn move_aside(dir: &Path) -> ProtectFail {
-    if move_stores_aside(dir).is_ok() {
-        ProtectFail::WrongKey
-    } else {
-        ProtectFail::NotMoved
-    }
+    ProtectFail::after_move(move_stores_aside(dir).is_ok())
 }
 
 #[cfg(test)]
