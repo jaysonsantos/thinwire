@@ -4519,7 +4519,7 @@ mod tests {
         use super::{bubble_ink, egui, theme};
 
         for palette in [&theme::Palette::LIGHT, &theme::Palette::DARK] {
-            let person = egui::Color32::from_rgb(1, 2, 3);
+            let person = theme::person_fill("Ada", false);
             // Only emoji: no fill, and the marks have the inks of the thread.
             let emoji = bubble_ink(palette, true, true, Some(person));
             assert_eq!(emoji.fill, egui::Color32::TRANSPARENT);
