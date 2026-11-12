@@ -546,14 +546,30 @@ fn hints_count_as_used_only_where_their_widget_draws() {
     let ui_fn = &src[src.find("fn ui(").expect("ui")..];
     let ui_fn = &ui_fn[..ui_fn.find("\n    fn ").expect("next fn")];
     let draw = ui_fn.find("ui::draw(").expect("draw");
-    let take = ui_fn
-        .find("self.core.take_focus_compose()")
-        .expect("take focus");
-    assert!(draw < take, "the core hint clears after the draw");
-    assert!(ui_fn.contains("if hints.used_focus_compose()"));
-    assert!(ui_fn.contains("if hints.used_scroll_to_selected()"));
+    let settle = ui_fn.find("hints.settle(&mut self.core)").expect("settle");
+    assert!(draw < settle, "the core hint clears after the draw");
 
     let ui = include_str!("ui.rs");
+    let settle = &ui[ui.find("fn settle(").expect("settle")..];
+    let settle = &settle[..settle.find("\n    }\n").expect("end")];
+    for (used, take) in [
+        ("self.used_focus_compose", "core.take_focus_compose()"),
+        (
+            "self.used_scroll_to_selected",
+            "core.take_scroll_to_selected()",
+        ),
+        (
+            "self.used_scroll_to_focused",
+            "core.take_scroll_to_focused()",
+        ),
+        (
+            "self.used_scroll_to_message",
+            "core.take_scroll_to_message()",
+        ),
+    ] {
+        let at = settle.find(used).expect(used);
+        assert!(settle[at..].contains(take), "{take} only when it was used");
+    }
     assert_eq!(ui.matches("hints.take_focus_compose()").count(), 1);
     let compose = &ui[ui.find("fn compose(").expect("compose")..];
     assert!(compose.contains("hints.take_focus_compose()"));

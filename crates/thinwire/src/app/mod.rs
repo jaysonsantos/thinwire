@@ -740,18 +740,7 @@ impl eframe::App for ThinwireApp {
         ui::draw(ui, &view, &mut hints, &mut self.player, &mut self.intents);
         ui::draw_other_pane(ui, &mut self.core, &mut self.player, &mut self.intents);
         // Clear a hint only after its widget used it (qa L1).
-        if hints.used_focus_compose() {
-            self.core.take_focus_compose();
-        }
-        if hints.used_scroll_to_selected() {
-            self.core.take_scroll_to_selected();
-        }
-        if hints.used_scroll_to_focused() {
-            self.core.take_scroll_to_focused();
-        }
-        if hints.used_scroll_to_message() {
-            self.core.take_scroll_to_message();
-        }
+        hints.settle(&mut self.core);
         self.notification_intents(ui.ctx());
         for intent in self.intents.drain(..) {
             self.core.dispatch(intent);

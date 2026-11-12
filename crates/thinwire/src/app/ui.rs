@@ -151,14 +151,22 @@ impl Hints {
         self.scroll_to_selected
     }
 
-    /// The focus hint was used this frame. The app clears it in the core.
-    pub(crate) const fn used_focus_compose(&self) -> bool {
-        self.used_focus_compose
-    }
-
-    /// The scroll hint was used this frame. The app clears it in the core.
-    pub(crate) const fn used_scroll_to_selected(&self) -> bool {
-        self.used_scroll_to_selected
+    /// Clear in the core each hint that its widget used in this frame. A
+    /// hint that no widget used stays, so a widget that draws later still
+    /// gets it (qa L1). The app calls it one time, after the draw.
+    pub(crate) fn settle(&self, core: &mut thinwire_core::Core) {
+        if self.used_focus_compose {
+            core.take_focus_compose();
+        }
+        if self.used_scroll_to_selected {
+            core.take_scroll_to_selected();
+        }
+        if self.used_scroll_to_focused {
+            core.take_scroll_to_focused();
+        }
+        if self.used_scroll_to_message {
+            core.take_scroll_to_message();
+        }
     }
 
     /// Call only where the inbox rows draw.
@@ -167,18 +175,15 @@ impl Hints {
         self.scroll_to_focused
     }
 
-    /// The keyboard-highlight scroll hint was used this frame.
-    pub(crate) const fn used_scroll_to_focused(&self) -> bool {
-        self.used_scroll_to_focused
-    }
-
     /// Call only where the thread rows draw.
     pub(crate) fn take_scroll_to_message(&mut self) -> Option<String> {
         self.used_scroll_to_message = self.scroll_to_message.is_some();
         self.scroll_to_message.clone()
     }
 
-    /// The reply-jump scroll hint was used this frame.
+    /// The reply-jump scroll hint was used this frame. Only the test
+    /// harness reads it: the app calls [`Self::settle`].
+    #[cfg(test)]
     pub(crate) const fn used_scroll_to_message(&self) -> bool {
         self.used_scroll_to_message
     }
