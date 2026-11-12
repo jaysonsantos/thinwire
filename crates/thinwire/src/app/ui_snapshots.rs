@@ -63,6 +63,7 @@ fn draw(ui: &mut egui::Ui, state: &mut Scene) {
     let view = state.core.view();
     let mut player = super::audio::Player::new();
     ui::draw(ui, &view, &mut state.hints, &mut player, &mut out);
+    ui::draw_other_pane(ui, &mut state.core, &mut player, &mut out);
     state.photo_box_height = ui.data(|data| {
         data.get_temp(egui::Id::unique("thinwire-photo-box-height"))
             .unwrap_or(0.0)
@@ -193,6 +194,7 @@ shots! {
     status_notice => StatusNotice,
     several_protocols => SeveralProtocols,
     collapsed_rail => CollapsedRail,
+    split_view => SplitView,
     muted_inbox => MutedInbox,
     muted_here => MutedHere,
     muted_by_protocol => MutedByProtocol,
@@ -965,7 +967,7 @@ mod notify_badge {
         // painter of `ui`, and a layer painter has no such clip.
         let painter = &ui.ctx().layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
-            egui::Id::new("notify_picture"),
+            egui::Id::unique("notify_picture"),
         ));
         let full = Rect::from_min_size(Pos2::ZERO, Vec2::splat(SIDE));
         // One pixel over each edge: the picture has no soft border.
@@ -1020,7 +1022,7 @@ mod notify_badge {
         // painter of `ui`, and a layer painter has no such clip.
         let painter = &ui.ctx().layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
-            egui::Id::new("notify_picture"),
+            egui::Id::unique("notify_picture"),
         ));
         let full = Rect::from_min_size(Pos2::ZERO, Vec2::splat(ALONE_SIDE));
         let ink = theme::protocol_tile(*protocol);

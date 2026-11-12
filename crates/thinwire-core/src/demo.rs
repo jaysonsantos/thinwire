@@ -111,6 +111,9 @@ pub enum Scenario {
     SeveralProtocols,
     /// Telegram and Slack with the account sidebar collapsed to its icons.
     CollapsedRail,
+    /// The split view: Telegram in the left pane and Slack in the right
+    /// pane, which has the focus.
+    SplitView,
     /// Muted chats in the inbox (#153): one muted in thinwire, one muted in
     /// Telegram. A chat with no mute is open: its header shows Mute.
     MutedInbox,
@@ -141,7 +144,7 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
@@ -160,6 +163,7 @@ impl Scenario {
         Self::StatusNotice,
         Self::SeveralProtocols,
         Self::CollapsedRail,
+        Self::SplitView,
         Self::MutedInbox,
         Self::MutedHere,
         Self::MutedByProtocol,
@@ -195,6 +199,7 @@ impl Scenario {
             Self::StatusNotice => "status_notice",
             Self::SeveralProtocols => "several_protocols",
             Self::CollapsedRail => "collapsed_rail",
+            Self::SplitView => "split_view",
             Self::MutedInbox => "muted_inbox",
             Self::MutedHere => "muted_here",
             Self::MutedByProtocol => "muted_by_protocol",
@@ -309,12 +314,15 @@ impl Scenario {
                 protocol: ProtocolId::Telegram,
                 text: "Older chats load in the background.".into(),
             }),
-            Self::SeveralProtocols | Self::CollapsedRail => {
+            Self::SeveralProtocols | Self::CollapsedRail | Self::SplitView => {
                 setup.scripts.push(slack_linked());
                 setup.visible.push(ProtocolId::Slack);
                 setup.intents.push(select(ADA));
                 if self == Self::CollapsedRail {
                     setup.intents.push(Intent::SetRailCollapsed(true));
+                }
+                if self == Self::SplitView {
+                    setup.intents.push(Intent::OpenSplit(ProtocolId::Slack));
                 }
             }
             Self::MutedInbox | Self::MutedHere | Self::MutedByProtocol => {
@@ -1062,6 +1070,7 @@ fn showcase_thread() -> Vec<ChatMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SplitSide;
     use crate::mutes::ChatMute;
     use crate::state::{AuthScreen, OlderState};
 
@@ -1121,6 +1130,109 @@ mod tests {
         assert_eq!(core.view().now(), Clock::fixed_utc(NOW).now());
     }
 
+    fn draft(protocol: ProtocolId, chat: &str, text: &str) -> Intent {
+        Intent::SetDraft {
+            protocol,
+            conversation_id: chat.into(),
+            topic: None,
+            text: crate::SecretText::new(text),
+        }
+    }
+
+    /// The focus moves between the panes. Each pane keeps its account, its
+    /// chat, its search, and the draft of its thread.
+    #[test]
+    fn each_pane_of_the_split_keeps_its_chat_and_its_draft() {
+        let runtime = runtime();
+        let mut core = Scenario::SplitView.build(runtime.handle());
+        core.dispatch(draft(ProtocolId::Slack, SLACK_GENERAL, "to slack"));
+        core.dispatch(Intent::SetSearch(crate::SecretText::new("gen")));
+
+        core.dispatch(Intent::FocusOtherPane);
+        let view = core.view();
+        assert_eq!(view.split(), Some(SplitSide::Left));
+        assert_eq!(view.selected_protocol, ProtocolId::Telegram);
+        assert_eq!(view.selected_conversation.as_deref(), Some(ADA));
+        assert_eq!(view.compose, "");
+        assert_eq!(view.search, "");
+        assert_eq!(
+            view.split_other_chat(),
+            Some((ProtocolId::Slack, SLACK_GENERAL, None))
+        );
+        core.dispatch(draft(ProtocolId::Telegram, ADA, "to ada"));
+
+        core.dispatch(Intent::FocusOtherPane);
+        let view = core.view();
+        assert_eq!(view.split(), Some(SplitSide::Right));
+        assert_eq!(view.selected_protocol, ProtocolId::Slack);
+        assert_eq!(view.selected_conversation.as_deref(), Some(SLACK_GENERAL));
+        assert_eq!(view.compose, "to slack");
+        assert_eq!(view.search, "gen");
+    }
+
+    /// A draw of the other pane sees its chat and its draft, and changes
+    /// nothing.
+    #[test]
+    fn a_look_at_the_other_pane_changes_nothing() {
+        let runtime = runtime();
+        let mut core = Scenario::SplitView.build(runtime.handle());
+        core.dispatch(Intent::FocusOtherPane);
+        core.dispatch(draft(ProtocolId::Telegram, ADA, "to ada"));
+        core.dispatch(Intent::FocusOtherPane);
+        core.dispatch(draft(ProtocolId::Slack, SLACK_GENERAL, "to slack"));
+        let before = summary(&core);
+
+        let seen = core.with_other_pane(|view| {
+            (
+                view.selected_protocol,
+                view.selected_conversation.clone(),
+                view.compose.clone(),
+                view.selected_messages().len(),
+            )
+        });
+        assert_eq!(
+            seen,
+            Some((
+                ProtocolId::Telegram,
+                Some(ADA.into()),
+                "to ada".into(),
+                PAGE
+            ))
+        );
+        assert_eq!(summary(&core), before);
+        let view = core.view();
+        assert_eq!(view.selected_protocol, ProtocolId::Slack);
+        assert_eq!(view.compose, "to slack");
+        assert_eq!(view.split(), Some(SplitSide::Right));
+    }
+
+    /// Close keeps the pane with the focus. With no split, the other pane
+    /// does not draw and the focus intent does nothing.
+    #[test]
+    fn a_closed_split_is_one_pane() {
+        let runtime = runtime();
+        let mut core = Scenario::SplitView.build(runtime.handle());
+        core.dispatch(Intent::CloseSplit);
+        assert_eq!(core.view().split(), None);
+        assert_eq!(core.view().selected_protocol, ProtocolId::Slack);
+        assert_eq!(core.with_other_pane(|_| ()), None);
+        core.dispatch(Intent::FocusOtherPane);
+        assert_eq!(core.view().selected_protocol, ProtocolId::Slack);
+    }
+
+    /// With the split open, "Open in split" of another account changes
+    /// the pane with the focus. The other pane stays.
+    #[test]
+    fn a_second_open_changes_the_pane_with_the_focus() {
+        let runtime = runtime();
+        let mut core = Scenario::SplitView.build(runtime.handle());
+        core.dispatch(Intent::OpenSplit(ProtocolId::Telegram));
+        let view = core.view();
+        assert_eq!(view.split(), Some(SplitSide::Right));
+        assert_eq!(view.selected_protocol, ProtocolId::Telegram);
+        assert_eq!(view.split_other_protocol(), Some(ProtocolId::Telegram));
+    }
+
     /// Each scenario reaches its screen. One runtime serves all of them.
     #[test]
     fn every_scenario_reaches_its_screen() {
@@ -1147,6 +1259,15 @@ mod tests {
                 Scenario::CollapsedRail => {
                     assert_eq!(view.selected_messages().len(), PAGE, "{name}");
                     assert!(view.rail_collapsed(), "{name}");
+                }
+                Scenario::SplitView => {
+                    assert_eq!(view.split(), Some(SplitSide::Right), "{name}");
+                    assert_eq!(view.selected_protocol, ProtocolId::Slack, "{name}");
+                    assert_eq!(
+                        view.split_other_chat(),
+                        Some((ProtocolId::Telegram, ADA, None)),
+                        "{name}"
+                    );
                 }
                 Scenario::LongChatLoadingOlder => {
                     assert_eq!(view.older_state(), OlderState::Loading, "{name}");

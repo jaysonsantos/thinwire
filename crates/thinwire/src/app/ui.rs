@@ -59,6 +59,10 @@ const BRAND_MARK: f32 = 26.0;
 /// Width the chat list opens at, and when the window is narrow.
 const LIST_WIDTH: f32 = 312.0;
 const LIST_WIDTH_NARROW: f32 = 256.0;
+/// Width of the chat list of a pane of the split view, and its least
+/// width: each pane has half of the window.
+const LIST_WIDTH_SPLIT: f32 = 216.0;
+const LIST_WIDTH_SPLIT_MIN: f32 = 168.0;
 /// Below this window width the two side columns open narrower, so the thread
 /// keeps room for a readable line.
 const NARROW_WINDOW: f32 = 960.0;
@@ -118,6 +122,9 @@ pub(crate) struct Hints {
     used_scroll_to_message: bool,
     /// Snapshot only. See [`Hints::show_open_mute_menus`].
     open_mute_menus: bool,
+    /// This draw is the pane of the split view that does not have the
+    /// focus: it takes no key of the window.
+    passive: bool,
 }
 
 impl Hints {
@@ -206,8 +213,22 @@ pub(crate) fn draw(
     }
     status_strip(ui, snapshot, out);
     account_rail(ui, snapshot, out);
-    chat_column(ui, snapshot, hints, out);
-    center_panel(ui, snapshot, hints, player, out);
+    super::split::remember(ui.ctx(), snapshot.split().is_some());
+    match snapshot.split() {
+        None => {
+            chat_column(ui, snapshot, hints, out);
+            center_panel(ui, snapshot, hints, player, out);
+        }
+        // The pane with the focus. The app draws the other pane after
+        // this, with the view of that pane (`draw_other_pane`).
+        Some(active) => {
+            let rect = super::split::layout(ui, active);
+            super::split::pane(ui, rect, active, true, |ui| {
+                chat_column(ui, snapshot, hints, out);
+                center_panel(ui, snapshot, hints, player, out);
+            });
+        }
+    }
     notice_review(ui, snapshot, out);
     super::links::confirm(ui);
     super::photos::overlay(ui, snapshot.selected_messages());
@@ -216,6 +237,38 @@ pub(crate) fn draw(
     super::unlink::dialog(ui.ctx(), out);
     super::chat_details::dialog(ui.ctx(), snapshot, out);
     super::forward::picker(ui.ctx(), snapshot, out);
+}
+
+/// Draw the pane of the split view that does not have the focus. Call it
+/// after [`draw`], in the same frame. Every action in that pane first
+/// gives it the focus, so the core applies the action to the right chat.
+pub(crate) fn draw_other_pane(
+    ui: &mut egui::Ui,
+    core: &mut thinwire_core::Core,
+    player: &mut Player,
+    out: &mut Vec<Intent>,
+) {
+    let Some((rect, side)) = super::split::other(ui.ctx()) else {
+        return;
+    };
+    let mut asked = Vec::new();
+    let drawn = core.with_other_pane(|snapshot| {
+        let mut hints = Hints {
+            passive: true,
+            ..Hints::default()
+        };
+        super::split::pane(ui, rect, side, false, |ui| {
+            chat_column(ui, snapshot, &mut hints, &mut asked);
+            center_panel(ui, snapshot, &mut hints, player, &mut asked);
+        });
+    });
+    if drawn.is_none() {
+        return;
+    }
+    if !asked.is_empty() || super::split::pressed(ui.ctx(), rect) {
+        out.push(Intent::FocusOtherPane);
+        out.append(&mut asked);
+    }
 }
 
 /// Single-line or multiline text bound to a core value. A change becomes an
@@ -1058,14 +1111,27 @@ fn extra_account_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<
 /// Middle column: the selected account's chats, at the full height of the window.
 fn chat_column(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     let palette = theme::palette(ui);
-    egui::Panel::left("chats")
+    // Each pane of the split view has a chat list of its own.
+    let split = snapshot.split().is_some();
+    let id = if split {
+        ui.scope_id().with("chats")
+    } else {
+        egui::Id::unique("chats")
+    };
+    egui::Panel::left(id)
         .resizable(true)
-        .default_size(if narrow_window(ui) {
+        .default_size(if split {
+            LIST_WIDTH_SPLIT
+        } else if narrow_window(ui) {
             LIST_WIDTH_NARROW
         } else {
             LIST_WIDTH
         })
-        .size_range(LIST_WIDTH_NARROW..=480.0)
+        .size_range(if split {
+            LIST_WIDTH_SPLIT_MIN..=LIST_WIDTH
+        } else {
+            LIST_WIDTH_NARROW..=480.0
+        })
         .frame(theme::list_frame(palette))
         .show(ui, |ui| {
             account_info(ui, snapshot, out);
@@ -1720,7 +1786,9 @@ fn inbox(
             clicked = Some(id);
         }
     }
-    inbox_keys(ui, snapshot, inbox_list_id, out);
+    if !hints.passive {
+        inbox_keys(ui, snapshot, inbox_list_id, out);
+    }
     let key_moved = out
         .iter()
         .any(|intent| matches!(intent, Intent::MoveInbox { .. }));
@@ -2334,8 +2402,8 @@ fn center_panel(
         // Keys first, before a text field can take Enter. One press, one action.
         let (enter, escape) = ui.input(|input| {
             (
-                input.key_pressed(egui::Key::Enter),
-                input.key_pressed(egui::Key::Escape),
+                !hints.passive && input.key_pressed(egui::Key::Enter),
+                !hints.passive && input.key_pressed(egui::Key::Escape),
             )
         });
         if escape {
@@ -4224,7 +4292,14 @@ fn compose(
     max_height: f32,
     out: &mut Vec<Intent>,
 ) {
-    let compose_id = egui::Id::unique("thread-compose");
+    // Menus and keys give the focus to "thread-compose": the field of the
+    // pane with the focus. The other pane of the split view has an id of
+    // its own.
+    let compose_id = if hints.passive {
+        egui::Id::unique("thread-compose-other")
+    } else {
+        egui::Id::unique("thread-compose")
+    };
     // The chat this frame drew. Drafts and sends name it, so a click on
     // another chat in the same frame cannot move them (PR #48 review).
     let chat = snapshot

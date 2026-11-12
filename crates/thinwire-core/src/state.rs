@@ -591,6 +591,54 @@ type OlderPageKey = (ProtocolId, String, Option<MessageTopic>);
 /// An older page that brought nothing new: the anchor, when, and how many times.
 type OlderRetry = (String, Instant, u32);
 
+/// The side of a pane in the split view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitSide {
+    Left,
+    Right,
+}
+
+impl SplitSide {
+    const fn other(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
+/// What one pane of the split view shows. `Debug` prints no chat id and no
+/// search text.
+#[derive(Clone, PartialEq, Eq)]
+struct PaneView {
+    protocol: ProtocolId,
+    signal_retained: Option<u32>,
+    conversation: Option<String>,
+    topic: Option<MessageTopic>,
+    search: String,
+}
+
+impl std::fmt::Debug for PaneView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneView")
+            .field("protocol", &self.protocol)
+            .field("has_chat", &self.conversation.is_some())
+            .finish()
+    }
+}
+
+/// The split view. The `selected_*` fields of the snapshot are the pane
+/// with the focus, and `other` is the second pane.
+#[derive(Debug)]
+struct Split {
+    other: PaneView,
+    /// The side of the pane with the focus.
+    active: SplitSide,
+    /// The compose text and the keyboard highlight of the pane with the
+    /// focus, while the frontend draws the other pane (`peek_other_pane`).
+    peeked: Option<(String, Option<String>)>,
+}
+
 pub struct Snapshot {
     pub accounts: Vec<AccountRow>,
     conversations: HashMap<ProtocolId, Vec<Conversation>>,
@@ -854,6 +902,9 @@ pub struct Snapshot {
     /// Signal number, or another protocol. The number is a slot, not an
     /// account id.
     selected_signal_retained: Option<u32>,
+    /// The split view: the pane that does not have the focus. `None` is
+    /// one pane.
+    split: Option<Split>,
     /// Slots this retained publish has sent. A slot whose store could not
     /// be read is in the set too, so its row stays. `None` when no publish
     /// is open. A helper that has stopped, and an account end, clear it.
@@ -1204,6 +1255,7 @@ impl Snapshot {
             #[cfg(feature = "signal-local")]
             signal_checking: false,
             selected_signal_retained: None,
+            split: None,
             retained_publish: None,
         }
     }
@@ -2453,6 +2505,143 @@ impl Snapshot {
         self.selected_signal_retained = Some(slot);
         self.focused_row = None;
         self.ensure_conversation_selection();
+    }
+
+    /// What the pane with the focus shows now.
+    fn pane_view(&self) -> PaneView {
+        PaneView {
+            protocol: self.selected_protocol,
+            signal_retained: self.selected_signal_retained,
+            conversation: self.selected_conversation.clone(),
+            topic: self.selected_topic,
+            search: self.search.clone(),
+        }
+    }
+
+    /// The side of the pane with the focus. `None` is one pane.
+    #[must_use]
+    pub fn split(&self) -> Option<SplitSide> {
+        self.split.as_ref().map(|split| split.active)
+    }
+
+    /// The account of the pane that does not have the focus.
+    #[must_use]
+    pub fn split_other_protocol(&self) -> Option<ProtocolId> {
+        self.split.as_ref().map(|split| split.other.protocol)
+    }
+
+    /// The chat and topic of the pane that does not have the focus.
+    #[must_use]
+    pub fn split_other_chat(&self) -> Option<(ProtocolId, &str, Option<MessageTopic>)> {
+        let other = &self.split.as_ref()?.other;
+        Some((other.protocol, other.conversation.as_deref()?, other.topic))
+    }
+
+    /// Show `protocol` in a second pane, on the right, and give it the
+    /// focus. The pane on the left keeps the account and the chat that are
+    /// open now. With a split already open, the pane with the focus changes
+    /// to `protocol`.
+    pub fn open_split(&mut self, protocol: ProtocolId) {
+        if !self.account_surface_visible(protocol) {
+            return;
+        }
+        if self.split.is_none() {
+            self.split = Some(Split {
+                other: self.pane_view(),
+                active: SplitSide::Right,
+                peeked: None,
+            });
+            // Each pane has its own search.
+            self.set_search(String::new());
+        }
+        self.select_protocol(protocol);
+    }
+
+    /// Go back to one pane: the pane with the focus stays.
+    pub fn close_split(&mut self) {
+        self.split = None;
+    }
+
+    /// Give the focus to the other pane. Its account, chat, topic, and
+    /// search become the selection, with the same steps as a click on that
+    /// account and that chat: the draft of each thread stays with it.
+    pub fn focus_other_pane(&mut self) {
+        let Some(split) = self.split.take() else {
+            return;
+        };
+        let here = self.pane_view();
+        let there = split.other;
+        match there.signal_retained {
+            Some(slot) => self.select_retained_signal(slot),
+            None => self.select_protocol(there.protocol),
+        }
+        if self.selected_protocol == there.protocol
+            && let Some(id) = there.conversation
+            && self.conversation(there.protocol, &id).is_some()
+        {
+            let opened = there
+                .topic
+                .is_some_and(|topic| self.select_topic(id.clone(), topic));
+            if !opened {
+                self.select_conversation(id);
+            }
+        }
+        self.set_search(there.search);
+        self.split = Some(Split {
+            other: here,
+            active: split.active.other(),
+            peeked: None,
+        });
+    }
+
+    /// Close the split when the account of its other pane is gone.
+    pub(crate) fn check_split(&mut self) {
+        let Some(protocol) = self.split_other_protocol() else {
+            return;
+        };
+        let listed = self.accounts.iter().any(|row| row.caps.id == protocol);
+        if !listed || !self.account_surface_visible(protocol) {
+            self.split = None;
+        }
+    }
+
+    /// Change the selection to the other pane, or back, for one draw of the
+    /// frontend. It moves no draft and sends no command: the second call
+    /// puts every value back. The compose text of the other pane is the
+    /// draft of its thread.
+    pub(crate) fn peek_other_pane(&mut self) {
+        let Some(mut split) = self.split.take() else {
+            return;
+        };
+        let here = self.pane_view();
+        let there = std::mem::replace(&mut split.other, here);
+        self.selected_protocol = there.protocol;
+        self.selected_signal_retained = there.signal_retained;
+        self.selected_conversation = there.conversation;
+        self.selected_topic = there.topic;
+        self.search = there.search;
+        match split.peeked.take() {
+            Some((compose, focused_row)) => {
+                self.compose = compose;
+                self.focused_row = focused_row;
+            }
+            None => {
+                let draft = self
+                    .selected_conversation
+                    .as_ref()
+                    .and_then(|id| {
+                        self.drafts
+                            .get(&(self.selected_protocol, id.clone(), self.selected_topic))
+                    })
+                    .cloned()
+                    .unwrap_or_default();
+                split.peeked = Some((
+                    std::mem::replace(&mut self.compose, draft),
+                    self.focused_row.take(),
+                ));
+            }
+        }
+        self.split = Some(split);
     }
 
     /// The open account row is selected in the switcher.

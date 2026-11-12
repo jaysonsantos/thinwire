@@ -150,6 +150,9 @@ pub(crate) fn attach(row: &egui::Response, account: &AccountRow) {
 enum RowAsk {
     Link(ProtocolId),
     Remove(ProtocolId),
+    /// Show the account in a second pane (the split view).
+    Split(ProtocolId),
+    CloseSplit,
 }
 
 fn row_ask_id() -> egui::Id {
@@ -157,6 +160,25 @@ fn row_ask_id() -> egui::Id {
 }
 
 fn menu(ui: &mut egui::Ui, account: ProtocolId, linked: bool, removable: bool) {
+    // The split view: this account in a second pane, next to the pane
+    // that is open now.
+    let (label, name, ask) = if super::split::is_open(ui.ctx()) {
+        ("Close split", "Close split".to_owned(), RowAsk::CloseSplit)
+    } else {
+        (
+            "Open in split",
+            format!("Open in split: {}", account.label()),
+            RowAsk::Split(account),
+        )
+    };
+    let item = ui.button(label);
+    item.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+    if item.clicked() {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(row_ask_id(), ask));
+        ui.close();
+    }
+    ui.separator();
     for (label, up) in [("Move up", true), ("Move down", false)] {
         let item = ui.button(label);
         item.widget_info(|| {
@@ -235,6 +257,8 @@ pub(crate) fn dialog(ctx: &egui::Context, out: &mut Vec<Intent>) {
         out.push(match ask {
             RowAsk::Link(account) => Intent::LinkAccount(account),
             RowAsk::Remove(account) => Intent::RemoveAccount(account),
+            RowAsk::Split(account) => Intent::OpenSplit(account),
+            RowAsk::CloseSplit => Intent::CloseSplit,
         });
     }
     let moved = ctx.data(|data| data.get_temp::<MoveAsk>(move_id()));

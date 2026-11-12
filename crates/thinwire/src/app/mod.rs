@@ -23,6 +23,7 @@ mod photos;
 mod reduce_motion;
 #[cfg(feature = "signal-local")]
 mod signal_gate;
+mod split;
 pub mod startup;
 mod theme;
 mod theme_mode;
@@ -737,6 +738,7 @@ impl eframe::App for ThinwireApp {
         let mut hints = ui::Hints::from_view(&view);
         menu_bar::set_about_build(ui.ctx(), self.updates.build());
         ui::draw(ui, &view, &mut hints, &mut self.player, &mut self.intents);
+        ui::draw_other_pane(ui, &mut self.core, &mut self.player, &mut self.intents);
         // Clear a hint only after its widget used it (qa L1).
         if hints.used_focus_compose() {
             self.core.take_focus_compose();

@@ -682,6 +682,21 @@ impl Core {
         }
     }
 
+    /// Run `draw` with a view of the other pane of the split view: its
+    /// account, chat, topic, search, and draft are the selection of that
+    /// view. Nothing else changes, and the selection is back when this
+    /// returns. `None` with no split.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
+    pub fn with_other_pane<T>(&mut self, draw: impl FnOnce(&View<'_>) -> T) -> Option<T> {
+        self.state.check_split();
+        self.state.split()?;
+        self.state.peek_other_pane();
+        let drawn = draw(&self.view());
+        self.state.peek_other_pane();
+        Some(drawn)
+    }
+
     /// Apply the adapter events that arrived and run time-based checks.
     /// Returns true when the state changed: an event was applied, a send
     /// with no answer expired, a forum notice that waited for its topic
@@ -891,6 +906,7 @@ impl Core {
             window_focused: self.notify.window_focused(),
             viewed: self.state.viewed(),
             viewed_topic: self.state.viewed_topic(),
+            also_shown: self.state.split_other_chat(),
             has_session: self.state.has_session(message.protocol),
             muted_here: self
                 .settings
@@ -1060,6 +1076,9 @@ impl Core {
                 }
             }
             Intent::SetRailCollapsed(collapsed) => self.settings.set_rail_collapsed(collapsed),
+            Intent::OpenSplit(protocol) => self.state.open_split(protocol),
+            Intent::CloseSplit => self.state.close_split(),
+            Intent::FocusOtherPane => self.state.focus_other_pane(),
             Intent::MoveAccount { account, up } => {
                 if self.state.move_account(account, up) {
                     self.settings.set_account_order(self.state.account_order());

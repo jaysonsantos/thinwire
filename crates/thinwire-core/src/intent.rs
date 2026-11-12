@@ -121,6 +121,13 @@ pub enum Intent {
     /// Collapse the account sidebar to its icons, or expand it. Disk I/O
     /// runs off the caller thread.
     SetRailCollapsed(bool),
+    /// Split view: show this account in a second pane, on the right, and
+    /// give that pane the focus. Each pane has its own chat list and thread.
+    OpenSplit(ProtocolId),
+    /// Split view: go back to one pane. The pane with the focus stays.
+    CloseSplit,
+    /// Split view: give the focus to the other pane.
+    FocusOtherPane,
     /// Move one account one place up or down in the account sidebar. The
     /// order is saved. Disk I/O runs off the caller thread.
     MoveAccount { account: ProtocolId, up: bool },

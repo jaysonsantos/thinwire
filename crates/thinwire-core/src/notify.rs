@@ -121,6 +121,9 @@ pub(crate) struct NotifyContext<'a> {
     pub viewed: Option<(ProtocolId, &'a str)>,
     /// The open topic, when `viewed` is a forum or a bot chat.
     pub viewed_topic: Option<thinwire_protocol::MessageTopic>,
+    /// The thread in the other pane of the split view. The user sees it,
+    /// so it does not notify. It stays unread until its pane has the focus.
+    pub also_shown: Option<(ProtocolId, &'a str, Option<thinwire_protocol::MessageTopic>)>,
     pub has_session: bool,
     /// The chat of the message is muted in thinwire (#153).
     pub muted_here: bool,
@@ -173,7 +176,13 @@ pub(crate) fn decide(
     }
     let seen = ctx.viewed == Some((message.protocol, message.conversation_id.as_str()))
         && message.topic == ctx.viewed_topic;
-    if ctx.window_focused && seen {
+    let shown = ctx.also_shown
+        == Some((
+            message.protocol,
+            message.conversation_id.as_str(),
+            message.topic,
+        ));
+    if ctx.window_focused && (seen || shown) {
         return Err(SkipReason::Viewed);
     }
     if message.sent_at != 0 && ctx.now - message.sent_at > STALE_AFTER_SECS {
@@ -501,6 +510,7 @@ mod tests {
             muted_here: false,
             now: NOW,
             viewed_topic: None,
+            also_shown: None,
             topic_muted: false,
             topic_name: None,
         }
@@ -539,6 +549,26 @@ mod tests {
                 "both: {protocol}"
             );
         }
+    }
+
+    /// The thread in the other pane of the split view does not notify
+    /// while the window has the focus.
+    #[test]
+    fn the_other_pane_of_the_split_does_not_notify() {
+        let row = chat(ProtocolId::Slack, "c:1");
+        let live = message(ProtocolId::Slack, "c:1", "hi");
+        let shown = |focused: bool| NotifyContext {
+            also_shown: Some((ProtocolId::Slack, "c:1", None)),
+            ..ctx(Some((ProtocolId::Telegram, "t:1")), focused)
+        };
+        assert_eq!(
+            decide(&live, Some(&row), &shown(true)),
+            Err(SkipReason::Viewed)
+        );
+        assert_eq!(decide(&live, Some(&row), &shown(false)), Ok(()));
+        let other = message(ProtocolId::Slack, "c:2", "hi");
+        let other_row = chat(ProtocolId::Slack, "c:2");
+        assert_eq!(decide(&other, Some(&other_row), &shown(true)), Ok(()));
     }
 
     #[test]
