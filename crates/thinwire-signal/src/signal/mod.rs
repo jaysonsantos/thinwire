@@ -30,6 +30,8 @@ mod live;
 mod media;
 #[cfg(feature = "signal-local")]
 mod owner;
+#[cfg(feature = "signal-local")]
+mod retained_files;
 
 #[cfg(feature = "signal-local")]
 use std::sync::Arc;
