@@ -274,6 +274,110 @@ fn settle_photo(harness: &mut Harness<'_, Scene>) {
 
 /// Row menus for Mute, Unmute, and a disabled "Muted in Telegram" (#206).
 /// Milo is the open chat, so the muted unread ring sits on the selected row.
+/// A press in a pane of the split view moves the focus there. The pane
+/// that the user left keeps its edit, and its field shows the edit text.
+mod split_focus {
+    use super::*;
+    use thinwire_core::{ProtocolId, SplitSide};
+
+    /// The frame of [`draw`], and it applies every intent, as the app does.
+    fn draw_live(ui: &mut egui::Ui, state: &mut Scene) {
+        theme::install(ui.ctx());
+        if !ui.style().text_styles.contains_key(&theme::row_title()) {
+            return;
+        }
+        let mut out = Vec::new();
+        let view = state.core.view();
+        let mut player = super::super::audio::Player::new();
+        ui::draw(ui, &view, &mut state.hints, &mut player, &mut out);
+        ui::draw_other_pane(ui, &mut state.core, &mut player, &mut out);
+        for intent in out {
+            state.core.dispatch(intent);
+        }
+    }
+
+    fn press(harness: &mut Harness<'_, Scene>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        harness.run_steps(2);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run_steps(3);
+    }
+
+    fn fields(harness: &Harness<'_, Scene>, name: &str) -> usize {
+        harness
+            .query_all(By::new().role(Role::MultilineTextInput).label(name))
+            .count()
+    }
+
+    #[test]
+    fn a_press_in_the_other_pane_keeps_the_edit() {
+        let (runtime, mut built) = scene(Scenario::SplitView, ThemeMode::Light);
+        // The Telegram pane, on the left, gets the focus and starts an edit.
+        built.core.dispatch(Intent::FocusOtherPane);
+        let (chat, message, body) = {
+            let view = built.core.view();
+            let row = view
+                .selected_messages()
+                .iter()
+                .find(|row| thinwire_core::state::can_edit(row))
+                .expect("an own text message");
+            (
+                view.pane.conversation.clone().expect("an open chat"),
+                row.id.clone(),
+                row.body.clone(),
+            )
+        };
+        built.core.dispatch(Intent::EditMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat,
+            message_id: message,
+        });
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 720.0])
+            .wgpu()
+            .build_ui_state(draw_live, built);
+        harness.run_steps(4);
+        assert_eq!(fields(&harness, "Edit message"), 1);
+        assert_eq!(fields(&harness, "Message"), 1);
+        harness.get_by_role_and_label(Role::Button, "Cancel edit");
+
+        // An empty place of the chat list of each pane.
+        let left = egui::pos2(320.0, 500.0);
+        let right = egui::pos2(760.0, 500.0);
+        press(&mut harness, right);
+        {
+            let view = harness.state().core.view();
+            assert_eq!(view.split(), Some(SplitSide::Right));
+            assert_eq!(view.pane.protocol, ProtocolId::Slack);
+            assert!(view.edit_target().is_none());
+            assert_eq!(view.pane.compose, "");
+        }
+        assert_eq!(fields(&harness, "Edit message"), 1, "the edit stays");
+        assert_eq!(fields(&harness, "Message"), 1);
+        settle_images(&mut harness);
+        harness.snapshot("split_view_edit-light-1100x720");
+
+        press(&mut harness, left);
+        {
+            let view = harness.state().core.view();
+            assert_eq!(view.split(), Some(SplitSide::Left));
+            assert_eq!(view.pane.protocol, ProtocolId::Telegram);
+            assert!(view.edit_target().is_some());
+            assert_eq!(view.pane.compose, body);
+        }
+        assert_eq!(fields(&harness, "Edit message"), 1);
+        drop(harness);
+        drop(runtime);
+    }
+}
+
 mod mute_menu {
     use super::*;
 

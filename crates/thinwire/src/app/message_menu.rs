@@ -274,11 +274,17 @@ pub(crate) fn reply_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<In
                 });
             },
         );
-        if ui
-            .add(egui::Button::new("✕").frame(false))
-            .on_hover_text(hover)
-            .clicked()
-        {
+        // The fonts of the app have no cross glyph, so the mark is painted.
+        // Its name for a screen reader is the action.
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, hover));
+        let ink = if response.hovered() {
+            palette.text
+        } else {
+            palette.text2
+        };
+        super::icons::cross(ui.painter(), rect.center(), 24.0, ink);
+        if response.on_hover_text(hover).clicked() {
             out.push(cancel);
         }
     });

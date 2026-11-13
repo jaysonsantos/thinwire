@@ -29,6 +29,26 @@ pub(crate) fn plus(painter: &egui::Painter, center: Pos2, size: f32, color: Colo
     );
 }
 
+/// A cross: cancel a reply or an edit.
+pub(crate) fn cross(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new(1.75, color);
+    let half = size * 0.26;
+    painter.line_segment(
+        [
+            center - Vec2::new(half, half),
+            center + Vec2::new(half, half),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-half, half),
+            center + Vec2::new(half, -half),
+        ],
+        stroke,
+    );
+}
+
 /// A gear drawn as a ring with eight teeth: settings.
 pub(crate) fn gear(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let stroke = Stroke::new(1.5, color);
