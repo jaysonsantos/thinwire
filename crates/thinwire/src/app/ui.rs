@@ -239,6 +239,7 @@ pub(crate) fn draw(
     super::photos::overlay(ui, snapshot.selected_messages());
     player.video_overlay(ui, snapshot.selected_messages());
     super::message_menu::delete_dialog(ui.ctx(), out);
+    super::emoji_picker::dialog(ui.ctx(), snapshot, out);
     super::unlink::dialog(ui.ctx(), out);
     super::chat_details::dialog(ui.ctx(), snapshot, out);
     super::forward::picker(ui.ctx(), snapshot, out);
@@ -2419,6 +2420,7 @@ fn center_panel(
         });
         if escape {
             let closed = super::message_menu::take_escape(ui.ctx())
+                || super::emoji_picker::take_escape(ui.ctx())
                 || super::unlink::take_escape(ui.ctx())
                 || super::chat_details::take_escape(ui.ctx())
                 || player.take_video_escape()

@@ -135,7 +135,20 @@ pub struct Settings {
     /// The accounts in the order of the sidebar, after the user moved one.
     /// Empty: the order of the build.
     account_order: Vec<thinwire_protocol::ProtocolId>,
+    /// The emoji that the user picked last in the emoji picker (#515), the
+    /// newest first. [`RECENT_EMOJI_MAX`] at most.
+    recent_emoji: Vec<String>,
 }
+
+/// The largest number of recent emoji.
+pub const RECENT_EMOJI_MAX: usize = 16;
+
+/// The longest emoji that the settings keep, in bytes. One emoji with
+/// joiners and selectors is shorter.
+const EMOJI_MAX_BYTES: usize = 64;
+
+/// Settings key of the recent emoji.
+const RECENT_EMOJI_KEY: &str = "recent_emoji";
 
 /// Settings key of the accounts after account 0.
 const ACCOUNTS_KEY: &str = "accounts";
@@ -186,6 +199,7 @@ impl Settings {
         let whatsapp_gate_version = read_u64(&path, WHATSAPP_GATE_VERSION_KEY).unwrap_or(0);
         let extra_accounts = read_accounts(&path, ACCOUNTS_KEY, false);
         let account_order = read_accounts(&path, ACCOUNT_ORDER_KEY, true);
+        let recent_emoji = read_recent_emoji(&path);
         Self {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
@@ -206,6 +220,7 @@ impl Settings {
             whatsapp_gate_version,
             extra_accounts,
             account_order,
+            recent_emoji,
         }
     }
 
@@ -233,6 +248,7 @@ impl Settings {
             whatsapp_gate_version: 0,
             extra_accounts: Vec::new(),
             account_order: Vec::new(),
+            recent_emoji: Vec::new(),
         }
     }
 
@@ -271,6 +287,31 @@ impl Settings {
             self.account_order = order;
             self.persist_pending = true;
         }
+    }
+
+    /// The emoji that the user picked last in the emoji picker, the newest
+    /// first.
+    #[must_use]
+    pub fn recent_emoji(&self) -> &[String] {
+        &self.recent_emoji
+    }
+
+    /// Put `emoji` first in the recent emoji. The list keeps
+    /// [`RECENT_EMOJI_MAX`] at most. A text that is not one short word with
+    /// no letter and no digit changes nothing. Disk persist is queued.
+    pub fn use_emoji(&mut self, emoji: &str) {
+        if !storable_emoji(emoji)
+            || self
+                .recent_emoji
+                .first()
+                .is_some_and(|first| first == emoji)
+        {
+            return;
+        }
+        self.recent_emoji.retain(|known| known != emoji);
+        self.recent_emoji.insert(0, emoji.to_owned());
+        self.recent_emoji.truncate(RECENT_EMOJI_MAX);
+        self.persist_pending = true;
     }
 
     /// Remember one more account. Account 0 and a known account change
@@ -506,6 +547,12 @@ impl Settings {
                 .collect();
             text.push_str(&format!("{ACCOUNT_ORDER_KEY} = \"{}\"\n", keys.join(",")));
         }
+        if !self.recent_emoji.is_empty() {
+            text.push_str(&format!(
+                "{RECENT_EMOJI_KEY} = \"{}\"\n",
+                self.recent_emoji.join(",")
+            ));
+        }
         // Keep the helper paths of the user when another setting changes.
         for (key, path) in [
             (WHATSAPP_HELPER_KEY, &self.whatsapp_helper),
@@ -569,6 +616,43 @@ fn read_accounts(
         }
     }
     accounts
+}
+
+/// A text that the recent emoji can keep: short, with no space, no letter,
+/// no digit, and no character that has a meaning in the settings line.
+fn storable_emoji(emoji: &str) -> bool {
+    !emoji.is_empty()
+        && emoji.len() <= EMOJI_MAX_BYTES
+        && !emoji.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || c.is_alphanumeric()
+                || matches!(c, '"' | '\\' | ',' | '\'' | '#' | '=')
+        })
+}
+
+/// The `recent_emoji = "👍,🎉"` line, the newest first. A bad entry and a
+/// repeat are skipped.
+fn read_recent_emoji(path: &std::path::Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Some(value) = contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        (key.trim() == RECENT_EMOJI_KEY).then(|| value.trim().trim_matches('"').to_owned())
+    }) else {
+        return Vec::new();
+    };
+    let mut recent: Vec<String> = Vec::new();
+    for emoji in value.split(',').map(str::trim) {
+        if storable_emoji(emoji)
+            && recent.len() < RECENT_EMOJI_MAX
+            && !recent.iter().any(|known| known == emoji)
+        {
+            recent.push(emoji.to_owned());
+        }
+    }
+    recent
 }
 
 /// A `key = true|false` line. Anything else is `None`.
@@ -871,6 +955,44 @@ mod tests {
             Settings::load_from(path).notifications(),
             "a bad value is on"
         );
+    }
+
+    #[test]
+    fn the_recent_emoji_persist_newest_first_and_stay_short() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.recent_emoji().is_empty());
+        settings.use_emoji("❤️");
+        settings.use_emoji("👍");
+        // Not an emoji: it does not go into the file.
+        settings.use_emoji("a\"b");
+        settings.use_emoji("");
+        assert_eq!(settings.recent_emoji(), ["👍", "❤️"]);
+        settings.persist_now().expect("persist");
+        let mut loaded = Settings::load_from(path.clone());
+        assert_eq!(loaded.recent_emoji(), ["👍", "❤️"]);
+        // The newest emoji again changes nothing and writes nothing.
+        loaded.use_emoji("👍");
+        assert!(loaded.take_persist_job().is_none());
+        // An older emoji moves to the front.
+        loaded.use_emoji("❤️");
+        assert_eq!(loaded.recent_emoji(), ["❤️", "👍"]);
+
+        let flags = ["🇧🇷", "🇩🇪", "🇯🇵"];
+        for index in 0..RECENT_EMOJI_MAX + 4 {
+            let emoji = format!("{}{}", flags[index % 3], "\u{fe0f}".repeat(index / 3));
+            loaded.use_emoji(&emoji);
+        }
+        assert_eq!(loaded.recent_emoji().len(), RECENT_EMOJI_MAX);
+        loaded.persist_now().expect("persist");
+        assert_eq!(
+            Settings::load_from(path.clone()).recent_emoji(),
+            loaded.recent_emoji()
+        );
+
+        std::fs::write(&path, "recent_emoji = \"👍, x,👍,,🎉\"\n").expect("write");
+        assert_eq!(Settings::load_from(path).recent_emoji(), ["👍", "🎉"]);
+        assert!(Settings::in_memory().recent_emoji().is_empty());
     }
 
     #[test]

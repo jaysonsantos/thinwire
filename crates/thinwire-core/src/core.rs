@@ -1091,6 +1091,7 @@ impl Core {
                 }
             }
             Intent::SetPersonColors(on) => self.settings.set_person_colors(on),
+            Intent::UseEmoji(emoji) => self.settings.use_emoji(&emoji),
             Intent::SetChatMute {
                 protocol,
                 conversation_id,

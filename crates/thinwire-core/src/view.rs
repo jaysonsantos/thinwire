@@ -66,6 +66,13 @@ impl View<'_> {
         self.settings.person_colors()
     }
 
+    /// The emoji that the user picked last in the emoji picker, the newest
+    /// first.
+    #[must_use]
+    pub fn recent_emoji(&self) -> &[String] {
+        self.settings.recent_emoji()
+    }
+
     /// Settings switch: the other people of a chat see when the user types.
     #[must_use]
     pub fn send_typing(&self) -> bool {

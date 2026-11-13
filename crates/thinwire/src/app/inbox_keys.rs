@@ -153,6 +153,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::SetRailCollapsed(collapsed) => state.settings.set_rail_collapsed(collapsed),
             Intent::SetSendTyping(on) => state.settings.set_send_typing(on),
             Intent::SetPersonColors(on) => state.settings.set_person_colors(on),
+            Intent::UseEmoji(emoji) => state.settings.use_emoji(&emoji),
             Intent::MoveAccount { account, up } => {
                 if state.snapshot.move_account(account, up) {
                     state
@@ -1215,6 +1216,87 @@ fn a_right_click_opens_the_message_menu_and_delete_asks() {
         harness.query_by_label("Also delete for everyone").is_none(),
         "the question closed"
     );
+}
+
+/// #515: "More reactions" in the message menu opens the emoji picker. The
+/// search finds an emoji by its name, a click sends the reaction and keeps
+/// the emoji as a recent one, and Esc closes the picker.
+#[test]
+fn more_reactions_opens_the_emoji_picker_and_a_click_reacts() {
+    use egui::accesskit::Role;
+
+    fn open_picker(harness: &mut Harness<'static, InboxUi>) {
+        harness
+            .get_by_role_and_label(Role::Pane, "Their line")
+            .click_secondary();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "More reactions")
+            .click();
+        harness.run();
+    }
+
+    let mut state = InboxUi::ready();
+    state.settings = Settings::in_memory();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message("telegram:1:8", "Their line", 1_790_299_000),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    open_picker(&mut harness);
+    assert!(harness.query_by_label("Reply").is_none(), "the menu closed");
+    assert!(harness.query_by_label("Recent").is_none(), "no pick yet");
+    for group in [
+        "Smileys",
+        "People",
+        "Animals and nature",
+        "Food",
+        "Activities",
+        "Travel",
+        "Objects",
+        "Symbols",
+        "Flags",
+    ] {
+        harness.get_by_label(group);
+    }
+
+    harness
+        .get_by_role_and_label(Role::TextInput, "Search emoji")
+        .set_text_value_accesskit("PARTY POP");
+    harness.run();
+    assert!(harness.query_by_label("Smileys").is_none(), "only matches");
+    harness.get_by_role_and_label(Role::Button, "🎉").click();
+    harness.run();
+    assert_eq!(
+        harness.state_mut().message_intents,
+        vec![Intent::React {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:8".into(),
+            emoji: "🎉".into(),
+            add: true,
+        }]
+    );
+    assert_eq!(harness.state().settings.recent_emoji(), ["🎉"]);
+    assert!(
+        harness.query_by_label("Search emoji").is_none(),
+        "the picker closed"
+    );
+
+    open_picker(&mut harness);
+    harness.get_by_label("Recent");
+    assert_eq!(
+        harness.query_all_by_label("🎉").count(),
+        2,
+        "in Recent and in its group"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.query_by_label("Search emoji").is_none(),
+        "Esc closed the picker"
+    );
+    assert_eq!(harness.state().message_intents.len(), 1);
 }
 
 /// The chevron collapses the sidebar to the account tiles. A tile still

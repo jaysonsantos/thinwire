@@ -6,6 +6,8 @@ mod audio;
 mod auth;
 mod chat_details;
 mod dock;
+mod emoji_picker;
+mod emoji_table;
 mod files;
 mod forward;
 mod icons;

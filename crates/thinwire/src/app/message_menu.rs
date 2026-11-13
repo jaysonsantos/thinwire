@@ -1,6 +1,6 @@
 //! The menu of one message: a right click on its bubble. It offers only what
 //! the protocol of the message allows (`MessageActions`): reply, an emoji
-//! reaction, copy, edit, forward, select (to forward more than one), and
+//! reaction (six emoji, and "More reactions" for the picker), copy, edit, forward, select (to forward more than one), and
 //! delete. The reactions of a message show under
 //! its bubble, and a reply shows the message it answers.
 
@@ -12,6 +12,9 @@ use super::theme::{self, radius, space};
 
 /// The emoji row of the menu.
 pub(crate) const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+/// The side of the "More reactions" icon after the emoji row.
+const MORE_SIDE: f32 = 22.0;
 
 /// The longest quote of a replied message, in characters.
 const QUOTE_CHARS: usize = 80;
@@ -86,6 +89,29 @@ fn menu(ui: &mut egui::Ui, target: &Target<'_>, actions: MessageActions, out: &m
                     out.push(target.react(emoji, !mine));
                     ui.close();
                 }
+            }
+            // The fonts of the app have no plus icon, so the mark is
+            // painted. The picker opens over the window.
+            let side = ui.spacing().interact_size.y.max(MORE_SIDE);
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "More reactions")
+            });
+            let visuals = ui.style().interact(&response);
+            if response.hovered() || response.has_focus() {
+                ui.painter()
+                    .rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+            }
+            super::icons::plus(ui.painter(), rect.center(), MORE_SIDE, visuals.text_color());
+            if response.on_hover_text("More reactions").clicked() {
+                super::emoji_picker::open(
+                    ui.ctx(),
+                    target.protocol,
+                    target.conversation_id,
+                    target.message_id,
+                );
+                ui.close();
             }
         });
         ui.separator();

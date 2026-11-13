@@ -138,6 +138,10 @@ pub enum Intent {
     /// Settings: one bubble color for each other person of a chat (#581),
     /// or one color for all of them. Disk I/O runs off the caller thread.
     SetPersonColors(bool),
+    /// The user picked this emoji in the emoji picker (#515): it goes first
+    /// in the recent emoji. The reaction is a separate [`Self::React`]. Disk
+    /// I/O runs off the caller thread.
+    UseEmoji(String),
     /// Mute or unmute one chat in thinwire (#153). A protocol mute wins:
     /// an unmute here never unmutes it. Disk I/O runs off the caller thread.
     SetChatMute {

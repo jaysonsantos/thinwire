@@ -422,6 +422,53 @@ mod mute_menu {
     }
 }
 
+/// #515: the emoji picker of a reaction, open over the window, with two
+/// recent emoji.
+mod emoji_picker {
+    use super::*;
+
+    fn shoot_open(theme: ThemeMode) {
+        let name = format!("emoji_picker-{}-1100x720", theme_slug(theme));
+        let (runtime, mut built) = scene(Scenario::LongChat, theme);
+        for emoji in ["👍", "🎉"] {
+            built.core.dispatch(Intent::UseEmoji(emoji.to_owned()));
+        }
+        let (protocol, conversation_id, message_id) = {
+            let view = built.core.view();
+            let message = view.selected_messages().last().expect("a message");
+            (
+                message.protocol,
+                message.conversation_id.clone(),
+                message.id.clone(),
+            )
+        };
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 720.0])
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        super::super::emoji_picker::open(&harness.ctx, protocol, &conversation_id, &message_id);
+        harness.run();
+        settle_images(&mut harness);
+        harness.get_by_role_and_label(Role::TextInput, "Search emoji");
+        harness.get_by_label("Recent");
+        harness.get_by_label("Smileys");
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot_open(ThemeMode::Light);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot_open(ThemeMode::Dark);
+    }
+}
+
 /// The Settings button at the foot of the sidebar, clicked: the menu opens
 /// above it with Refresh, the theme choice, and the notification switches.
 mod settings_menu {
