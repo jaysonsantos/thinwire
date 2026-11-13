@@ -98,7 +98,7 @@ dirs.workspace = true
 getrandom = "0.4"
 # SQLCipher amalgamation plus vendored OpenSSL. `default-features = false`
 # keeps the vanilla bundled SQLite feature off. Only `session-cipher` links it.
-rusqlite = { version = "0.41", optional = true, default-features = false, features = [
+rusqlite = { version = "0.42", optional = true, default-features = false, features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 # The wire lines to a helper process (ADR 0013). MIT, no AGPL code.
