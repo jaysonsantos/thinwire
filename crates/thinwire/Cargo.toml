@@ -52,6 +52,7 @@ ui-snapshots = ["egui_kittest/snapshot", "egui_kittest/wgpu"]
 chrono.workspace = true
 eframe.workspace = true
 egui.workspace = true
+fontique.workspace = true
 # Image decode for chat photos. jpeg, png, and webp only. eframe stays on
 # glow (ADR 0002): do not enable wgpu here.
 egui_extras = { version = "0.37", default-features = false, features = [

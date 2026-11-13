@@ -20,6 +20,8 @@
           pkgs = nixpkgs.legacyPackages.${system};
           guiLibs = pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.libGL
+            # `fontique` opens it at run time, for the fonts of the system.
+            pkgs.fontconfig.lib
             pkgs.libxkbcommon
             pkgs.vulkan-loader
             pkgs.wayland

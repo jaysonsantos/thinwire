@@ -37,7 +37,10 @@ todo = "deny"
 # through the eframe feature of the same name. Emoji left that set for
 # `monochrome_emoji_fonts` (Noto Emoji and emoji-icon-font). The shell
 # keeps that fallback after Inter, which is the coverage 0.36 shipped.
-# `system_fonts` stays off: it would load host fonts and move the layout.
+# `system_fonts` is on: for a character that no font of the app has (CJK,
+# Arabic, and so on), eframe finds a font of the OS. A character that a font
+# of the app has does not use it, so the layout of that text does not move.
+# The color emoji font of the OS is a different step: `theme::system_emoji`.
 # `clipboard` must stay on. Without it, egui-winit keeps a copy or a cut
 # inside the app, and no other app can paste it.
 eframe = { version = "0.37", default-features = false, features = [
@@ -46,10 +49,17 @@ eframe = { version = "0.37", default-features = false, features = [
   "default_fonts",
   "glow",
   "links",
+  "system_fonts",
   "wayland",
   "x11",
 ] }
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+# The font list of the OS, for the color emoji font (`theme::system_emoji`).
+# `egui_system_font_provider` links it with the same features.
+fontique = { version = "0.11.1", default-features = false, features = [
+  "fontconfig-dlopen",
+  "system",
+] }
 # Local time for message timestamps. `clock` reads the OS time zone.
 chrono = { version = "0.4", default-features = false, features = [
   "clock",

@@ -50,6 +50,7 @@ use thinwire_core::{Core, CoreConfig, Intent};
 use thinwire_notify::Notifier;
 
 pub use theme::install as install_theme;
+pub use theme::install_system_emoji;
 pub use theme_mode::apply as apply_theme;
 pub use thinwire_core::settings::Settings;
 

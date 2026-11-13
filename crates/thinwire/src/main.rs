@@ -35,6 +35,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             app::install_theme(&cc.egui_ctx);
+            app::install_system_emoji(&cc.egui_ctx);
             let settings = app::Settings::load();
             // First paint follows the stored mode. Missing file → System (ADR 0005).
             app::apply_theme(&cc.egui_ctx, settings.theme());

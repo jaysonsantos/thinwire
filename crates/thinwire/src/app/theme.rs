@@ -646,10 +646,18 @@ fn text_styles() -> BTreeMap<TextStyle, FontId> {
     .into()
 }
 
+/// Font key of the color emoji font of the OS.
+const SYSTEM_EMOJI: &str = "system-emoji";
+
 /// egui default fonts with Inter first. The egui fonts stay as fallback
 /// for emoji and symbols. Monospace stays Hack.
+///
+/// `emoji` is the color emoji font of the OS. It goes after Inter and
+/// before the egui fonts, so text keeps Inter and an emoji gets its colors.
+/// The monochrome emoji fonts of egui stay last, for a system with no emoji
+/// font.
 #[must_use]
-fn fonts() -> FontDefinitions {
+fn fonts(emoji: Option<FontData>) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let fallback = fonts
         .families
@@ -669,6 +677,16 @@ fn fonts() -> FontDefinitions {
         family.extend(fallback.iter().cloned());
         fonts.families.insert((weight.family)(), family);
     }
+    if let Some(emoji) = emoji {
+        fonts
+            .font_data
+            .insert(SYSTEM_EMOJI.to_owned(), Arc::new(emoji));
+        // The text font of each family stays first: an emoji font has
+        // digits too, and they must not replace the digits of the text.
+        for family in fonts.families.values_mut() {
+            family.insert(family.len().min(1), SYSTEM_EMOJI.to_owned());
+        }
+    }
     fonts
 }
 
@@ -677,10 +695,67 @@ fn fonts() -> FontDefinitions {
 pub fn install(ctx: &egui::Context) {
     // Still images only. The loader decodes off the UI thread.
     egui_extras::install_image_loaders(ctx);
-    ctx.set_fonts(fonts());
+    ctx.set_fonts(fonts(None));
     for theme in [Theme::Dark, Theme::Light] {
         ctx.set_style_of(theme, style(Palette::of(theme), theme));
     }
+}
+
+/// Find the color emoji font of the OS and use it for emoji. Call once in
+/// the real app, after [`install`]. Tests do not call it, so a snapshot does
+/// not change with the fonts of the host.
+///
+/// The list of the system fonts can take some hundred milliseconds, so the
+/// work is on its own thread. Until it ends, and on a system with no emoji
+/// font, an emoji shows in one color.
+pub fn install_system_emoji(ctx: &egui::Context) {
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("system-emoji".to_owned())
+        .spawn(move || {
+            if let Some(emoji) = system_emoji() {
+                ctx.set_fonts(fonts(Some(emoji)));
+                ctx.request_repaint();
+            }
+        });
+    if spawned.is_err() {
+        tracing::debug!(target: "thinwire::ui", "the emoji font thread did not start");
+    }
+}
+
+/// The emoji font that the OS names for its generic emoji family: Apple
+/// Color Emoji, Segoe UI Emoji, or the fontconfig answer (Noto Color Emoji
+/// on most Linux systems). The file is memory-mapped, not copied.
+fn system_emoji() -> Option<FontData> {
+    use fontique::{
+        Collection, CollectionOptions, GenericFamily, QueryFamily, QueryStatus, SourceCache,
+    };
+
+    /// A character that only an emoji font has.
+    const PROBE: u32 = 0x1F600;
+
+    let mut collection = Collection::new(CollectionOptions {
+        shared: false,
+        system_fonts: true,
+    });
+    let mut cache = SourceCache::default();
+    let mut query = collection.query(&mut cache);
+    query.set_families([QueryFamily::Generic(GenericFamily::Emoji)]);
+    let mut found = None;
+    query.matches_with(|font| {
+        let has_probe = font
+            .charmap()
+            .is_some_and(|charmap| charmap.map(PROBE).is_some_and(|glyph| glyph != 0));
+        if has_probe {
+            found = Some(font.clone());
+            QueryStatus::Stop
+        } else {
+            QueryStatus::Continue
+        }
+    });
+    let font = found?;
+    let (blob, _id) = font.blob.into_raw_parts();
+    Some(FontData::from_blob(blob, font.index))
 }
 
 fn style(palette: &Palette, theme: Theme) -> egui::Style {
@@ -1096,7 +1171,7 @@ mod tests {
             styles.get(&row_title()),
             Some(&FontId::new(size::BODY, medium()))
         );
-        let fonts = fonts();
+        let fonts = fonts(None);
         for family in [FontFamily::Proportional, medium(), semibold()] {
             let first = fonts.families.get(&family).and_then(|list| list.first());
             assert!(
@@ -1151,5 +1226,31 @@ mod tests {
                 assert!(!source.contains(needle), "{file} has {needle}");
             }
         }
+    }
+
+    #[test]
+    fn the_system_emoji_font_goes_after_the_text_font_of_each_family() {
+        let plain = fonts(None);
+        assert!(!plain.font_data.contains_key(SYSTEM_EMOJI));
+
+        let with_emoji = fonts(Some(FontData::from_static(INTER)));
+        assert_eq!(with_emoji.families.len(), plain.families.len());
+        for (name, family) in &with_emoji.families {
+            let before = &plain.families[name];
+            assert_eq!(family[0], before[0], "{name:?} keeps its text font first");
+            assert_eq!(family[1], SYSTEM_EMOJI, "{name:?}");
+            assert_eq!(
+                &family[2..],
+                &before[1..],
+                "{name:?} keeps its fallback fonts"
+            );
+        }
+    }
+
+    /// Run by hand: it reads the fonts of this computer.
+    #[test]
+    #[ignore = "the result changes with the fonts of the host"]
+    fn this_host_has_a_color_emoji_font() {
+        assert!(system_emoji().is_some());
     }
 }
