@@ -1090,6 +1090,7 @@ impl Core {
                     self.state.stop_typing(Instant::now());
                 }
             }
+            Intent::SetUnreadBadge(on) => self.settings.set_unread_badge(on),
             Intent::SetPersonColors(on) => self.settings.set_person_colors(on),
             Intent::UseEmoji(emoji) => self.settings.use_emoji(&emoji),
             Intent::SetChatMute {
@@ -4646,6 +4647,39 @@ mod tests {
             "for Ada only",
             "chat 1 keeps its draft"
         );
+    }
+
+    /// The badge count (#513) is the unread count of the chats that are
+    /// not muted. The switch off gives 0, and on gives the count again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_badge_count_skips_muted_chats_and_follows_its_switch() {
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        assert_eq!(core.view().badge_count(), 0, "nothing is unread");
+        // Chat 1 is open, so chats 2 to 4 have the unread messages.
+        for (id, unread, muted) in [(2, 3, false), (3, 4, false), (4, 5, true)] {
+            let mut chat = telegram_chat(id, "Chat", 10 - id);
+            chat.unread = unread;
+            chat.muted = muted;
+            core.state
+                .apply(AdapterEvent::ConversationUpsert { conversation: chat });
+        }
+        assert!(core.view().unread_badge(), "the default is on");
+        assert_eq!(core.view().badge_count(), 7, "a protocol mute is out");
+        core.dispatch(Intent::SetChatMute {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:3".into(),
+            muted: true,
+        });
+        assert_eq!(core.view().badge_count(), 3, "a thinwire mute is out");
+        core.dispatch(Intent::SetUnreadBadge(false));
+        assert!(!core.view().unread_badge());
+        assert_eq!(core.view().badge_count(), 0, "off shows no badge");
+        assert_eq!(core.view().unread_total(), 3, "the title keeps its count");
+        core.dispatch(Intent::SetUnreadBadge(true));
+        assert_eq!(core.view().badge_count(), 3);
     }
 
     /// The typing switch (#510): on, a draft of the open chat sends

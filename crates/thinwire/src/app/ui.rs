@@ -550,6 +550,17 @@ fn notification_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<In
     {
         out.push(Intent::SetNotificationPreview(!hide));
     }
+    // The unread count on the Dock or the launcher (#513). Windows has no
+    // badge yet, so it has no switch.
+    if thinwire_notify::BadgeCount::SUPPORTED {
+        let mut badge = snapshot.unread_badge();
+        if ui
+            .checkbox(&mut badge, "Show unread count on the app icon")
+            .changed()
+        {
+            out.push(Intent::SetUnreadBadge(badge));
+        }
+    }
 }
 
 /// Settings switch for the outgoing typing state (#510).

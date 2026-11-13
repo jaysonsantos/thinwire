@@ -27,7 +27,8 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 
 # `CloseNotification` by id: notify-rust closes only through the handle
-# that the click waiter owns. Same zbus as the keychain; no new major.
+# that the click waiter owns. Also the launcher signal of the unread count
+# (#513). Same zbus as the keychain; no new major.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = [
   "async-io",
@@ -51,7 +52,17 @@ windows-registry = "0.100"
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = "0.3"
 # The running macOS version (NSProcessInfo), safe API. Already in the lock.
-objc2-foundation = { version = "0.3", features = ["NSProcessInfo"] }
+# `NSString` is the text of the Dock badge.
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
+# The Dock badge with the unread count (#513), safe API. Same versions as
+# the AppKit bindings of the app in Cargo.lock: no second copy.
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSDockTile",
+  "NSResponder",
+] }
 
 [lints]
 workspace = true

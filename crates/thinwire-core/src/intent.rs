@@ -135,6 +135,9 @@ pub enum Intent {
     /// (#510). Off also stops a typing state that still shows. Disk I/O
     /// runs off the caller thread.
     SetSendTyping(bool),
+    /// Settings: show the unread count on the Dock or the launcher (#513).
+    /// Disk I/O runs off the caller thread.
+    SetUnreadBadge(bool),
     /// Settings: one bubble color for each other person of a chat (#581),
     /// or one color for all of them. Disk I/O runs off the caller thread.
     SetPersonColors(bool),

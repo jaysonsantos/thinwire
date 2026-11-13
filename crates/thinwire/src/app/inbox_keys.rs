@@ -152,6 +152,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::CancelForward => state.snapshot.cancel_forward(),
             Intent::SetRailCollapsed(collapsed) => state.settings.set_rail_collapsed(collapsed),
             Intent::SetSendTyping(on) => state.settings.set_send_typing(on),
+            Intent::SetUnreadBadge(on) => state.settings.set_unread_badge(on),
             Intent::SetPersonColors(on) => state.settings.set_person_colors(on),
             Intent::UseEmoji(emoji) => state.settings.use_emoji(&emoji),
             Intent::MoveAccount { account, up } => {
@@ -1464,6 +1465,18 @@ fn a_person_who_types_shows_over_the_compose_field() {
     harness.get_by_label("Show others when I type").click();
     harness.run();
     assert!(!harness.state().settings.send_typing());
+    // The same menu has the switch of the unread count on the app icon
+    // (#513), on an OS that has a badge.
+    if thinwire_notify::BadgeCount::SUPPORTED {
+        assert!(harness.state().settings.unread_badge());
+        harness.get_by_label("Settings").click();
+        harness.run();
+        harness
+            .get_by_label("Show unread count on the app icon")
+            .click();
+        harness.run();
+        assert!(!harness.state().settings.unread_badge());
+    }
     // The same menu has the "Message colors" choice (#581).
     assert!(!harness.state().settings.person_colors());
     harness.get_by_label("Settings").click();

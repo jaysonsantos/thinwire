@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use thinwire_core::notify::NotifyKey;
 use thinwire_core::{Core, CoreConfig, Intent};
-use thinwire_notify::Notifier;
+use thinwire_notify::{BadgeCount, Notifier};
 
 pub use theme::install as install_theme;
 pub use theme::install_system_emoji;
@@ -60,12 +60,15 @@ pub use thinwire_core::settings::Settings;
 /// adapters derive their own shutdown bounds from this limit.
 const SHUTDOWN_TIMEOUT: Duration = thinwire_protocol::APP_CLOSE_LIMIT;
 /// Wait after the close deadline before the watchdog flushes and exits.
-/// The normal exit path needs at most the notification flush and
-/// [`EXIT_FLOOR`] inside this window, so the watchdog does not cut it short.
+/// The normal exit path needs at most the notification flush, the badge
+/// flush, and [`EXIT_FLOOR`] inside this window, so the watchdog does not
+/// cut it short.
 const WATCHDOG_MARGIN: Duration = Duration::from_millis(1500);
 // The watchdog never cuts the normal exit path short.
-const _: () =
-    assert!(WATCHDOG_MARGIN.as_millis() > NOTIFY_FLUSH_LIMIT.as_millis() + EXIT_FLOOR.as_millis());
+const _: () = assert!(
+    WATCHDOG_MARGIN.as_millis()
+        > NOTIFY_FLUSH_LIMIT.as_millis() + BADGE_FLUSH_LIMIT.as_millis() + EXIT_FLOOR.as_millis()
+);
 /// From the close deadline until the watchdog calls `process::exit`.
 /// It waits [`WATCHDOG_MARGIN`], runs the keychain flush, then sleeps
 /// [`EXIT_FLOOR`]. The single-instance lock stays held until that exit, so
@@ -410,6 +413,8 @@ pub struct ThinwireApp {
     watchdog: bool,
     /// OS notifications on their own thread (#32).
     notifier: Notifier,
+    /// The unread count on the Dock icon or the launcher entry (#513).
+    badge: BadgeCount,
     updates: thinwire::update::Updates,
     /// The native menu bar. macOS only.
     #[cfg(target_os = "macos")]
@@ -454,6 +459,7 @@ impl ThinwireApp {
             close_gate: CloseGate::Open,
             watchdog: false,
             notifier,
+            badge: BadgeCount::new(),
             updates,
             #[cfg(target_os = "macos")]
             native_menu,
@@ -507,6 +513,20 @@ impl ThinwireApp {
             self.last_unread = Some(unread);
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(unread)));
         }
+    }
+
+    /// The unread count on the Dock icon or the launcher entry (#513), for
+    /// the chats that are not muted. `BadgeCount` sends only a new count.
+    /// A close removes the badge: the process can live for some seconds
+    /// after its window is gone. `logic()` calls it, on the main thread,
+    /// also while the window is hidden.
+    fn update_badge(&mut self) {
+        let count = if self.close_gate == CloseGate::Open {
+            self.core.view().badge_count()
+        } else {
+            0
+        };
+        self.badge.set(count);
     }
 
     /// Hide the window on the first close and hold the process until the
@@ -610,6 +630,9 @@ impl ThinwireApp {
 
 /// Longest wait at exit for the last notification dismisses.
 const NOTIFY_FLUSH_LIMIT: Duration = Duration::from_millis(500);
+/// Longest wait at exit until the launcher has the cleared unread count
+/// (#513). The close already removed the badge, so this wait is short.
+const BADGE_FLUSH_LIMIT: Duration = Duration::from_millis(200);
 
 /// Window focus for the notification rules. The platform value wins, then
 /// the last focus event of this frame, then the last known value. Unknown
@@ -723,6 +746,7 @@ impl eframe::App for ThinwireApp {
         self.core.pump();
         self.run_menu_commands(ctx);
         self.handle_close(ctx, frame);
+        self.update_badge();
         self.raise_for_show(ctx, frame);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
             ctx.request_repaint();
@@ -779,6 +803,8 @@ impl ThinwireApp {
         // and give the OS a short time, so none stays after exit.
         self.notifier.send(self.core.take_notify());
         self.notifier.flush(NOTIFY_FLUSH_LIMIT);
+        // No unread count stays on the Dock or the launcher after exit.
+        self.badge.clear(BADGE_FLUSH_LIMIT);
         self.core.flush_keychain();
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(exit_budget(self.exit_deadline, Instant::now()));

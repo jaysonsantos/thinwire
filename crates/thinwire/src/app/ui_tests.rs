@@ -698,6 +698,34 @@ fn focus_is_known_before_live_messages_and_unknown_counts_as_unfocused() {
     assert!(exit.contains("self.notifier.flush(NOTIFY_FLUSH_LIMIT)"));
 }
 
+/// #513: the count goes to the Dock or the launcher after the close of
+/// this frame, so a close removes the badge at once. The exit clears it
+/// again, with a short wait.
+#[test]
+fn the_unread_badge_follows_the_count_and_goes_at_a_close() {
+    let app = include_str!("mod.rs");
+    let logic = &app[app.find("fn logic(").expect("logic")..];
+    let logic = &logic[..logic.find("\n    }\n").expect("end")];
+    let pump = logic.find("self.core.pump()").expect("pump");
+    let close = logic.find("self.handle_close(").expect("close");
+    let badge = logic.find("self.update_badge()").expect("badge");
+    assert!(pump < close && close < badge);
+    let update = &app[app.find("fn update_badge(").expect("update")..];
+    let update = &update[..update.find("\n    }\n").expect("end")];
+    assert!(update.contains("self.close_gate == CloseGate::Open"));
+    assert!(update.contains("badge_count()"));
+    let exit = &app[app.find("fn finish_exit(").expect("exit")..];
+    let exit = &exit[..exit.find("\n    }\n").expect("end")];
+    assert!(exit.contains("self.badge.clear(BADGE_FLUSH_LIMIT)"));
+
+    // The Settings switch shows only where the OS has a badge.
+    let ui = include_str!("ui.rs");
+    let control = &ui[ui.find("fn notification_control(").expect("switches")..];
+    let control = &control[..control.find("\nfn ").expect("next")];
+    assert!(control.contains("BadgeCount::SUPPORTED"));
+    assert!(control.contains("Intent::SetUnreadBadge("));
+}
+
 /// A signed-in snapshot with no load running.
 fn settled(store: &SecretStore) -> Snapshot {
     let mut snapshot = ready_with_chats(store);

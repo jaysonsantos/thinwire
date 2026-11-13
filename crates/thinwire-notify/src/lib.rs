@@ -14,6 +14,9 @@
 //!   `Thinwire.app`: the same as Windows (#161). With no bundle id
 //!   (`cargo run`), show only through `notify-rust`.
 //!
+//! The unread count on the Dock icon or the launcher entry is module
+//! `badge_count` (#513). It has no part in the notification thread.
+//!
 //! No log line holds a title, a sender, or message text. A failed OS call
 //! waits and tries the next command; notifications turn off for the run
 //! only after `MAX_FAILURES_IN_A_ROW` failures in a row.
@@ -22,11 +25,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub use badge_count::BadgeCount;
 pub use pipe::{INBOX_LIMIT, MAX_DISMISS_TRIES, MAX_FAILURES_IN_A_ROW, RETRY_AFTER, RETRY_MAX};
 pub use thinwire_core::notify::{Notification, NotifyCommand, NotifyKey};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod badge;
+mod badge_count;
 #[cfg(target_os = "macos")]
 mod macos;
 mod pipe;

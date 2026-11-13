@@ -107,6 +107,25 @@ impl View<'_> {
         self.state.unread_total(self.settings.chat_mutes())
     }
 
+    /// Settings switch: the Dock or the launcher shows the unread count
+    /// (#513).
+    #[must_use]
+    pub fn unread_badge(&self) -> bool {
+        self.settings.unread_badge()
+    }
+
+    /// The count for the Dock or the launcher (#513):
+    /// [`Self::unread_total`], or 0 when the switch is off. 0 shows no
+    /// badge.
+    #[must_use]
+    pub fn badge_count(&self) -> u32 {
+        if self.settings.unread_badge() {
+            self.unread_total()
+        } else {
+            0
+        }
+    }
+
     /// The badge of one inbox row. A forum sums unmuted topics.
     #[must_use]
     pub fn display_unread(&self, row: &Conversation) -> u32 {

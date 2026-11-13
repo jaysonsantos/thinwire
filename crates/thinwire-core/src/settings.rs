@@ -105,6 +105,8 @@ pub struct Settings {
     rail_collapsed: bool,
     /// Tell the other people of a chat when the user types (#510). Default on.
     send_typing: bool,
+    /// Show the unread count on the Dock or the launcher (#513). Default on.
+    unread_badge: bool,
     /// Each other person of a chat has a bubble color (#581). Default off:
     /// one color for the user and one for the other people.
     person_colors: bool,
@@ -162,6 +164,9 @@ const RAIL_COLLAPSED_KEY: &str = "rail_collapsed";
 /// Settings key of the outgoing typing state.
 const SEND_TYPING_KEY: &str = "send_typing";
 
+/// Settings key of the unread count on the Dock or the launcher.
+const UNREAD_BADGE_KEY: &str = "unread_badge";
+
 /// Settings key of the bubble color for each person.
 const PERSON_COLORS_KEY: &str = "person_colors";
 
@@ -206,6 +211,7 @@ impl Settings {
             notification_preview: read_bool(&path, "notification_preview").unwrap_or(true),
             rail_collapsed: read_bool(&path, RAIL_COLLAPSED_KEY).unwrap_or(false),
             send_typing: read_bool(&path, SEND_TYPING_KEY).unwrap_or(true),
+            unread_badge: read_bool(&path, UNREAD_BADGE_KEY).unwrap_or(true),
             person_colors: read_bool(&path, PERSON_COLORS_KEY).unwrap_or(false),
             path,
             persist_pending: false,
@@ -234,6 +240,7 @@ impl Settings {
             notification_preview: true,
             rail_collapsed: false,
             send_typing: true,
+            unread_badge: true,
             person_colors: false,
             path: PathBuf::new(),
             persist_pending: false,
@@ -416,6 +423,20 @@ impl Settings {
         }
     }
 
+    /// The Dock or the launcher shows the unread count (#513).
+    #[must_use]
+    pub const fn unread_badge(&self) -> bool {
+        self.unread_badge
+    }
+
+    /// Show the unread count, or hide it. Disk persist is queued.
+    pub fn set_unread_badge(&mut self, on: bool) {
+        if self.unread_badge != on {
+            self.unread_badge = on;
+            self.persist_pending = true;
+        }
+    }
+
     /// Each other person of a chat has a bubble color.
     #[must_use]
     pub const fn person_colors(&self) -> bool {
@@ -515,6 +536,9 @@ impl Settings {
         }
         if !self.send_typing {
             text.push_str(&format!("{SEND_TYPING_KEY} = false\n"));
+        }
+        if !self.unread_badge {
+            text.push_str(&format!("{UNREAD_BADGE_KEY} = false\n"));
         }
         if self.person_colors {
             text.push_str(&format!("{PERSON_COLORS_KEY} = true\n"));
@@ -1012,6 +1036,25 @@ mod tests {
         );
         assert!(!Settings::load_from(path).person_colors());
         assert!(!Settings::in_memory().person_colors());
+    }
+
+    #[test]
+    fn the_unread_badge_switch_persists_and_defaults_on() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.unread_badge());
+        settings.set_unread_badge(false);
+        settings.persist_now().expect("save");
+        assert!(!Settings::load_from(path.clone()).unread_badge());
+        settings.set_unread_badge(true);
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains(UNREAD_BADGE_KEY),
+            "the default writes no key"
+        );
+        assert!(Settings::load_from(path).unread_badge());
+        assert!(Settings::in_memory().unread_badge());
     }
 
     #[test]
