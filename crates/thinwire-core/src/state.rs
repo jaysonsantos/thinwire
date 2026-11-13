@@ -607,6 +607,10 @@ pub struct Pane {
     pub compose: String,
     /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
     pub focused_row: Option<String>,
+    /// The own message that the compose field edits. Enter saves the edit,
+    /// and Esc puts the draft of the thread back. `compose` has the edit
+    /// text, also while the pane does not have the focus.
+    editing: Option<EditTarget>,
 }
 
 impl Pane {
@@ -619,6 +623,7 @@ impl Pane {
             search: String::new(),
             compose: String::new(),
             focused_row: None,
+            editing: None,
         }
     }
 }
@@ -637,8 +642,9 @@ impl std::fmt::Debug for Pane {
 /// `other` is the second pane.
 #[derive(Debug)]
 struct Split {
-    /// The second pane. Its compose text is empty and it has no keyboard
-    /// highlight: the draft of its thread is in `Snapshot::drafts`.
+    /// The second pane. It has no keyboard highlight. Its compose text is
+    /// empty, because the draft of its thread is in `Snapshot::drafts`. A
+    /// pane with an edit is different: it keeps the edit text.
     other: Pane,
     /// The side of the pane with the focus.
     active: SplitSide,
@@ -768,9 +774,6 @@ pub struct Snapshot {
     /// The message that the next send of its thread replies to. Another
     /// open thread does not show it or use it.
     replying: Option<ReplyTarget>,
-    /// The own message that the compose field edits. Enter saves the edit,
-    /// and Esc puts the draft of the thread back.
-    editing: Option<EditTarget>,
     /// The messages of one thread that the user selected to forward.
     selection: Option<MessageSelection>,
     /// The open forward picker: the messages it forwards and its search.
@@ -1156,7 +1159,6 @@ impl Snapshot {
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
             replying: None,
-            editing: None,
             selection: None,
             forwarding: None,
             typing: crate::typing::Typing::default(),
@@ -1242,7 +1244,7 @@ impl Snapshot {
         }
         // The edited message left the thread, for example by a delete or
         // an unlink: the draft comes back.
-        if self.editing.is_some() && self.edit_target().is_none() {
+        if self.pane.editing.is_some() && self.edit_target().is_none() {
             self.cancel_edit();
         }
     }
@@ -2444,14 +2446,21 @@ impl Snapshot {
         self.ensure_conversation_selection();
     }
 
-    /// The selection as the pane without the focus keeps it: the draft of
-    /// its thread goes to `drafts`, and the keyboard highlight goes.
+    /// The selection as the pane without the focus keeps it, for a new
+    /// split: no compose text, no edit, and no keyboard highlight.
     fn parked_pane(&self) -> Pane {
         Pane {
             compose: String::new(),
             focused_row: None,
+            editing: None,
             ..self.pane.clone()
         }
+    }
+
+    /// The draft key of the thread that the selection shows.
+    fn pane_draft_key(&self) -> Option<(ProtocolId, String, Option<MessageTopic>)> {
+        let chat = self.pane.conversation.clone()?;
+        Some((self.pane.protocol, chat, self.pane.topic))
     }
 
     /// The side of the pane with the focus. `None` is one pane.
@@ -2497,35 +2506,56 @@ impl Snapshot {
         self.split = None;
     }
 
-    /// Give the focus to the other pane. Its account, chat, topic, and
-    /// search become the selection, with the same steps as a click on that
-    /// account and that chat: the draft of each thread stays with it.
+    /// Give the focus to the other pane: the two [`Pane`] values change
+    /// places. The draft of each thread stays with it, and an edit stays
+    /// with its pane. The chat does not load again: the adapter gets only
+    /// `ViewChat` (`sync_viewed`), and `OpenChat` when the thread has no
+    /// message yet.
     pub fn focus_other_pane(&mut self) {
-        let Some(split) = self.split.take() else {
+        if self.split.is_none() {
             return;
-        };
-        let here = self.parked_pane();
-        let there = split.other;
-        match there.signal_retained {
-            Some(slot) => self.select_retained_signal(slot),
-            None => self.select_protocol(there.protocol),
         }
-        if self.pane.protocol == there.protocol
-            && let Some(id) = there.conversation
-            && self.conversation(there.protocol, &id).is_some()
-        {
-            let opened = there
-                .topic
-                .is_some_and(|topic| self.select_topic(id.clone(), topic));
-            if !opened {
-                self.select_conversation(id);
+        // The edit text never becomes a draft: it stays in `compose`.
+        if self.pane.editing.is_none() {
+            let draft = std::mem::take(&mut self.pane.compose);
+            if let Some(key) = self.pane_draft_key()
+                && !draft.is_empty()
+            {
+                self.drafts.insert(key, draft);
             }
         }
-        self.set_search(there.search);
-        self.split = Some(Split {
-            other: here,
-            active: split.active.other(),
-        });
+        self.pane.focused_row = None;
+        // A jump to a message belongs to the thread that had the focus.
+        self.reply_jump = None;
+        self.scroll_to_message = None;
+        if let Some(split) = self.split.as_mut() {
+            std::mem::swap(&mut self.pane, &mut split.other);
+            split.active = split.active.other();
+        }
+        // The chat of this pane left the list while it had no focus.
+        let gone = self
+            .pane
+            .conversation
+            .as_deref()
+            .is_some_and(|id| self.conversation(self.pane.protocol, id).is_none());
+        if gone {
+            self.pane.editing = None;
+            self.pane.compose.clear();
+            self.pane.conversation = None;
+            self.pane.topic = None;
+            // This step takes the draft of the chat that it selects.
+            self.ensure_conversation_selection();
+        } else if self.pane.editing.is_some() {
+            if self.edit_target().is_none() {
+                // The edited message left the thread: the draft comes back.
+                self.cancel_edit();
+            }
+        } else if let Some(key) = self.pane_draft_key() {
+            self.pane.compose = self.drafts.remove(&key).unwrap_or_default();
+        }
+        if self.selected_messages().is_empty() {
+            self.queue_open_chat();
+        }
     }
 
     /// Close the split when the account of its other pane is gone.
@@ -2558,7 +2588,10 @@ impl Snapshot {
             })
             .cloned()
             .unwrap_or_default();
-        self.pane.compose = draft;
+        // A pane with an edit shows the edit text, which it kept.
+        if self.pane.editing.is_none() {
+            self.pane.compose = draft;
+        }
     }
 
     /// End [`Self::enter_other_pane`]: the pane with the focus is the
@@ -2568,7 +2601,9 @@ impl Snapshot {
             return;
         };
         std::mem::swap(&mut self.pane, &mut split.other);
-        split.other.compose.clear();
+        if split.other.editing.is_none() {
+            split.other.compose.clear();
+        }
         split.other.focused_row = None;
     }
 
@@ -2784,7 +2819,7 @@ impl Snapshot {
         now: Instant,
     ) {
         if !self.is_selected_thread(protocol, chat, topic)
-            || self.editing.is_some()
+            || self.pane.editing.is_some()
             || !self.can_type(protocol)
         {
             return;
@@ -3028,7 +3063,7 @@ impl Snapshot {
     /// The own message that the compose field of the open thread edits.
     #[must_use]
     pub fn edit_target(&self) -> Option<&ChatMessage> {
-        let target = self.editing.as_ref()?;
+        let target = self.pane.editing.as_ref()?;
         if !self.is_selected_thread(target.protocol, &target.conversation_id, target.topic) {
             return None;
         }
@@ -3059,12 +3094,12 @@ impl Snapshot {
         else {
             return;
         };
-        let draft = match self.editing.take() {
+        let draft = match self.pane.editing.take() {
             Some(old) => old.draft,
             None => std::mem::take(&mut self.pane.compose),
         };
         self.replying = None;
-        self.editing = Some(EditTarget {
+        self.pane.editing = Some(EditTarget {
             protocol,
             conversation_id: conversation_id.to_owned(),
             topic: self.pane.topic,
@@ -3077,7 +3112,7 @@ impl Snapshot {
 
     /// End the edit with no change. The draft of the thread comes back.
     pub(crate) fn cancel_edit(&mut self) {
-        if let Some(target) = self.editing.take() {
+        if let Some(target) = self.pane.editing.take() {
             self.pane.compose = target.draft;
         }
     }
@@ -4796,7 +4831,7 @@ impl Snapshot {
     /// Queue the compose text. Does nothing when [`Self::can_send`] is false;
     /// the Send button is disabled in that case, so no error block shows.
     pub fn send_compose(&mut self) {
-        if self.editing.is_some() {
+        if self.pane.editing.is_some() {
             if self.can_send() {
                 self.save_edit();
             }
@@ -9922,6 +9957,58 @@ mod tests {
                 .any(|command| matches!(command, AdapterCommand::EditMessage { .. })),
             "the next send is a new message"
         );
+    }
+
+    /// A focus change of the split keeps the draft and the edit of each
+    /// pane, and it does not load a chat that has its messages.
+    #[test]
+    fn a_split_focus_change_keeps_the_edit_and_sends_no_open_chat() {
+        let opens = |snapshot: &mut Snapshot| {
+            snapshot
+                .take_commands()
+                .into_iter()
+                .filter(|command| matches!(command, AdapterCommand::OpenChat { .. }))
+                .count()
+        };
+        let mut snapshot = telegram_chat_with_rows(&[(6, true)]);
+        snapshot.pane.compose = "draft".into();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(2, "Bob", 1),
+        });
+        snapshot.open_split(ProtocolId::Telegram);
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.pane.compose = "to bob".into();
+        snapshot.take_commands();
+
+        snapshot.focus_other_pane();
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.compose, "draft");
+        assert_eq!(opens(&mut snapshot), 0, "the chat has its messages");
+
+        snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:6");
+        snapshot.pane.compose = "changed".into();
+        snapshot.focus_other_pane();
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:2"));
+        assert!(snapshot.edit_target().is_none());
+        assert_eq!(snapshot.pane.compose, "to bob");
+        assert_eq!(opens(&mut snapshot), 1, "a chat with no message loads");
+
+        snapshot.focus_other_pane();
+        assert!(snapshot.edit_target().is_some(), "the edit stays");
+        assert_eq!(snapshot.pane.compose, "changed");
+        assert_eq!(opens(&mut snapshot), 0);
+
+        // The edited message goes while its pane has no focus.
+        snapshot.focus_other_pane();
+        snapshot.apply(AdapterEvent::MessagesRemoved {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_ids: vec!["telegram:1:6".into()],
+        });
+        assert_eq!(snapshot.pane.compose, "to bob");
+        snapshot.focus_other_pane();
+        assert!(snapshot.edit_target().is_none());
+        assert_eq!(snapshot.pane.compose, "draft");
     }
 
     /// Cancel, a chat switch, the same text, and a delete each end the edit.

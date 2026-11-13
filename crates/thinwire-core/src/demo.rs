@@ -1170,6 +1170,53 @@ mod tests {
         assert_eq!(view.pane.search, "gen");
     }
 
+    /// A focus change keeps the edit of each pane, and the other pane
+    /// draws its edit.
+    #[test]
+    fn a_focus_change_keeps_the_edit_of_each_pane() {
+        let runtime = runtime();
+        let mut core = Scenario::SplitView.build(runtime.handle());
+        core.dispatch(Intent::FocusOtherPane);
+        core.dispatch(draft(ProtocolId::Telegram, ADA, "to ada"));
+        let own = core
+            .view()
+            .selected_messages()
+            .iter()
+            .find(|row| crate::state::can_edit(row))
+            .map(|row| (row.id.clone(), row.body.clone()))
+            .expect("the demo thread has an own text message");
+        core.dispatch(Intent::EditMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: ADA.into(),
+            message_id: own.0.clone(),
+        });
+        assert_eq!(core.view().pane.compose, own.1);
+
+        core.dispatch(Intent::FocusOtherPane);
+        let view = core.view();
+        assert_eq!(view.pane.protocol, ProtocolId::Slack);
+        assert!(view.edit_target().is_none());
+        assert_eq!(view.pane.compose, "");
+        // The other pane draws its edit, not the draft of its thread.
+        let seen = core.with_other_pane(|view| {
+            (
+                view.pane.compose.clone(),
+                view.edit_target().map(|row| row.id.clone()),
+            )
+        });
+        assert_eq!(seen, Some((own.1.clone(), Some(own.0.clone()))));
+
+        core.dispatch(Intent::FocusOtherPane);
+        let view = core.view();
+        assert_eq!(
+            view.edit_target().map(|row| row.id.as_str()),
+            Some(own.0.as_str())
+        );
+        assert_eq!(view.pane.compose, own.1);
+        core.dispatch(Intent::CancelEdit);
+        assert_eq!(core.view().pane.compose, "to ada");
+    }
+
     /// A draw of the other pane sees its chat and its draft, and changes
     /// nothing.
     #[test]
