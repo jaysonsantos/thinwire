@@ -44,13 +44,12 @@ impl BadgeCount {
     /// OS already has this count. Call it on the main thread: macOS needs
     /// that. On Linux it only queues the count for the D-Bus thread.
     pub fn set(&mut self, count: u32) {
-        if !changed(&mut self.last, count) {
-            return;
+        if changed(&mut self.last, count) {
+            #[cfg(target_os = "macos")]
+            dock::show(count);
+            #[cfg(target_os = "linux")]
+            self.launcher.send(count);
         }
-        #[cfg(target_os = "macos")]
-        dock::show(count);
-        #[cfg(target_os = "linux")]
-        self.launcher.send(count);
     }
 
     /// Remove the badge at shutdown, and wait at most `limit` until the
