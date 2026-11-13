@@ -206,6 +206,7 @@ shots! {
     photo_spoiler => PhotoSpoiler,
     photo_failed => PhotoFailed,
     showcase => Showcase,
+    all_chats => AllChats,
 }
 
 /// A loaded photo and a failed photo of the same size keep the same box

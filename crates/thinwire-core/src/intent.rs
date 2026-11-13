@@ -15,8 +15,13 @@ use crate::{SecretText, ThemeMode};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Intent {
-    /// Show the accounts and chats of one protocol.
+    /// Show the chat list of one account. The list of every account
+    /// closes. The choice is saved.
     SelectProtocol(ProtocolId),
+    /// Show the chats of every account in the chat list, newest first
+    /// (#507). The open chat stays open. The choice is saved. Disk I/O runs
+    /// off the caller thread.
+    SelectAll,
     /// Add an account of this protocol and open its login screen. Account 0
     /// is used while it is free: not linked and not in a login. Else the
     /// lowest free account number (ADR 0014).
@@ -35,7 +40,10 @@ pub enum Intent {
     /// Show one previous Signal account. The slot is not an account id.
     /// Sending stays off. The history stays.
     SelectRetainedSignal(u32),
-    /// Open a chat of the selected protocol and load its recent messages.
+    /// Open a chat of the chat list and load its recent messages. `id` is
+    /// the key of its row (`Snapshot::row_key`): the chat id in the list of
+    /// one account. In the list of every account, the key also names the
+    /// account, and the pane changes to that account.
     SelectConversation { id: String },
     /// Open one topic of a chat. The chat id is named so a click in the
     /// same frame cannot apply to another chat.
@@ -49,8 +57,8 @@ pub enum Intent {
     /// Move the inbox highlight by `delta` rows. Down is positive.
     /// This does not open the chat and does not focus the compose field.
     MoveInbox { delta: i32 },
-    /// Move the inbox highlight to the row that has keyboard focus.
-    /// This does not open the chat.
+    /// Move the inbox highlight to the row that has keyboard focus. `id`
+    /// is the key of that row. This does not open the chat.
     FocusInbox { id: String },
     /// Inbox search text. Matches chat title and participant only.
     /// `SecretText` keeps the typed text out of `Debug`.

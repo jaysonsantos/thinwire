@@ -129,6 +129,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             | Intent::CancelEdit
             | Intent::CancelReply) => state.message_intents.push(intent),
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
+            Intent::SelectAll => state.snapshot.select_all(),
             Intent::SelectMessage {
                 protocol,
                 conversation_id,
@@ -1298,6 +1299,97 @@ fn more_reactions_opens_the_emoji_picker_and_a_click_reacts() {
         "Esc closed the picker"
     );
     assert_eq!(harness.state().message_intents.len(), 1);
+}
+
+/// "All chats" shows the chats of every account in one list. A click on a
+/// row of another account opens that chat, and the list stays. A click on
+/// an account goes back to the list of that account.
+#[test]
+fn all_chats_lists_every_account_and_opens_a_chat_of_another_account() {
+    use egui::accesskit::Role;
+
+    let mut state = InboxUi::ready();
+    show_only(
+        &mut state.snapshot,
+        &[ProtocolId::Telegram, ProtocolId::Slack],
+    );
+    show_protocol(&mut state.snapshot, ProtocolId::Slack);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::Slack,
+        state: AccountState::Linked,
+    });
+    let mut general = telegram_chat(1, "general", 1);
+    general.protocol = ProtocolId::Slack;
+    general.id = "C1".into();
+    general.preview = "seen in general".into();
+    general.last_at += 60;
+    general.unread = 3;
+    state.snapshot.apply(AdapterEvent::ConversationUpsert {
+        conversation: general,
+    });
+    state.snapshot.take_commands();
+    let mut harness = harness(state);
+    harness.run();
+    assert!(
+        harness.query_by_label("seen in general").is_none(),
+        "the list of one account"
+    );
+    let all = harness.get_by_role_and_label(Role::Button, "All chats");
+    assert_eq!(
+        all.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    all.click();
+    harness.run();
+    assert!(harness.state().snapshot.pane.all);
+    let all = harness.get_by_role_and_label(Role::Button, "All chats");
+    assert_eq!(
+        all.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    let telegram = harness.get_by_role_and_label(Role::Button, "Telegram");
+    assert_eq!(
+        telegram.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    // The newest chat is first: the Slack chat, then the Telegram chats.
+    assert!(row_top(&harness, "general") < row_top(&harness, "Ada"));
+    harness.get_by_role_and_label(Role::Button, "Bob");
+    assert_eq!(
+        harness.state().snapshot.pane.conversation.as_deref(),
+        Some("telegram:1"),
+        "the open chat stays open"
+    );
+
+    harness.get_by_label("seen in general").click();
+    harness.run_steps(3);
+    let snapshot = &harness.state().snapshot;
+    assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+    assert_eq!(snapshot.pane.conversation.as_deref(), Some("C1"));
+    assert!(snapshot.pane.all, "the list stays");
+    let general = harness.get_by_role_and_label(Role::Button, "general");
+    assert_eq!(
+        general.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    harness.get_by_role_and_label(Role::Button, "Ada");
+
+    // The arrow keys and Enter move across accounts.
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_steps(2);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+    let snapshot = &harness.state().snapshot;
+    assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
+    assert!(snapshot.pane.conversation.is_some());
+    assert!(snapshot.pane.all);
+
+    harness.get_by_role_and_label(Role::Button, "Slack").click();
+    harness.run_steps(3);
+    let snapshot = &harness.state().snapshot;
+    assert!(!snapshot.pane.all);
+    assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+    assert!(harness.query_by_label("seen from Bob").is_none());
 }
 
 /// The chevron collapses the sidebar to the account tiles. A tile still

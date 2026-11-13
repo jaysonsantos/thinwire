@@ -928,6 +928,9 @@ fn collapsed_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>)
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = ROW_GAP;
+                    if all_chats_icon(ui, snapshot.pane.all, snapshot.unread_total()) {
+                        out.push(Intent::SelectAll);
+                    }
                     let mut clicked = None;
                     for account in snapshot.accounts.iter() {
                         if !snapshot.shows_in_switcher(account.caps.id) {
@@ -1068,7 +1071,106 @@ fn corner_badge(ui: &egui::Ui, tile: egui::Rect, right: f32, text: &str, ring: e
     ui.painter().galley(pos, galley, palette.on_badge);
 }
 
+/// The name of the entry that shows the chats of every account, and the
+/// title of that chat list.
+const ALL_CHATS: &str = "All chats";
+
+/// The tile of the "All chats" entry: a quiet square with the list icon.
+fn paint_all_chats_tile(ui: &egui::Ui, tile: egui::Rect) {
+    let palette = theme::palette(ui);
+    let corner = (tile.width() * 0.28).round().clamp(4.0, 24.0) as u8;
+    ui.painter()
+        .rect_filled(tile, egui::CornerRadius::same(corner), palette.surface);
+    icons::all_chats(
+        ui.painter(),
+        tile.center(),
+        tile.width() * 0.6,
+        palette.text,
+    );
+}
+
+/// The "All chats" entry of the sidebar, over the accounts: the tile, the
+/// name, and the unread count of every chat that is not muted. Returns
+/// true on a click.
+fn all_chats_chip(ui: &mut egui::Ui, selected: bool, unread: u32) -> bool {
+    let palette = theme::palette(ui);
+    let width = ui.available_width();
+    let badge = badge_text(unread);
+    let badge_room = badge
+        .as_deref()
+        .map_or(0.0, |text| unread_badge_width(ui, text) + space::S);
+    let text_width = (width - theme::ROW_INSET.x * 2.0 - TILE - space::M - badge_room).max(48.0);
+    let (rect, hover) = ui.allocate_exact_size(
+        egui::vec2(width, TILE + theme::ROW_INSET.y * 2.0),
+        egui::Sense::hover(),
+    );
+    let id = ui.scope_id().with("all-chats-chip");
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    row_backdrop(ui, id, rect, palette.rail, selected, hover.hovered());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(theme::row_content_rect(rect, 0.0))
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .id_salt("all-chats-chip"),
+    );
+    child.spacing_mut().item_spacing.x = space::M;
+    // A plain label lets the click go to the row.
+    child.style_mut().interaction.selectable_labels = false;
+    let (tile, _) = child.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::hover());
+    paint_all_chats_tile(&child, tile);
+    child.scope(|ui| {
+        ui.set_max_width(text_width);
+        ui.add(
+            egui::Label::new(
+                RichText::new(ALL_CHATS)
+                    .text_style(theme::row_title())
+                    .color(palette.text),
+            )
+            .truncate(),
+        );
+    });
+    if let Some(text) = &badge {
+        child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            unread_badge(ui, text, false);
+        });
+    }
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, ALL_CHATS));
+    response.clicked()
+}
+
+/// The "All chats" entry of the collapsed sidebar: the tile, with the unread
+/// count on its corner. The tooltip has the name. Returns true on a click.
+fn all_chats_icon(ui: &mut egui::Ui, selected: bool, unread: u32) -> bool {
+    let palette = theme::palette(ui);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), TILE + theme::ROW_INSET.y * 2.0),
+        egui::Sense::hover(),
+    );
+    let id = ui.scope_id().with("all-chats-icon");
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let fill = row_backdrop(ui, id, rect, palette.rail, selected, response.hovered());
+    let tile = egui::Rect::from_center_size(rect.center(), egui::vec2(TILE, TILE));
+    paint_all_chats_tile(ui, tile);
+    let badge = badge_text(unread);
+    let mut tip = ALL_CHATS.to_owned();
+    if let Some(text) = &badge {
+        corner_badge(ui, tile, rect.right(), text, fill);
+        tip.push_str(&format!(" · {text} unread"));
+    }
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, ALL_CHATS));
+    response.on_hover_text(tip).clicked()
+}
+
 fn account_rows(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    if all_chats_chip(ui, snapshot.pane.all, snapshot.unread_total()) {
+        out.push(Intent::SelectAll);
+    }
     let mut clicked: Option<ProtocolId> = None;
     for account in snapshot.accounts.iter() {
         if !snapshot.shows_in_switcher(account.caps.id) {
@@ -1123,7 +1225,8 @@ fn extra_account_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<
     });
 }
 
-/// Middle column: the selected account's chats, at the full height of the window.
+/// Middle column: the chats of the selected account, or of every account,
+/// at the full height of the window.
 fn chat_column(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     let palette = theme::palette(ui);
     // Each pane of the split view has a chat list of its own.
@@ -1158,17 +1261,25 @@ fn chat_column(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &
 
 /// Header of the chat list: the account name, its risk notice, the busy
 /// state, and the search field. Ban risk opens the same README text as Unofficial.
+/// The list of every account has its own title and no risk notice.
 fn account_info(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let protocol = snapshot.pane.protocol;
+    let all = snapshot.pane.all;
     let palette = theme::palette(ui);
     ui.horizontal(|ui| {
         ui.add_space(theme::ROW_INSET.x);
+        let title = if all {
+            ALL_CHATS.to_owned()
+        } else {
+            protocol.label()
+        };
         ui.label(
-            RichText::new(protocol.label())
+            RichText::new(title)
                 .text_style(egui::TextStyle::Heading)
                 .color(palette.text),
         );
-        if let Some(label) = notice_label(protocol)
+        if !all
+            && let Some(label) = notice_label(protocol)
             && ui
                 .add(
                     egui::Button::new(RichText::new(label).small().color(palette.text2))
@@ -1611,10 +1722,11 @@ fn inbox_scroll(
     inbox_list_id: egui::Id,
     out: &mut Vec<Intent>,
 ) {
+    // Row keys: two accounts can have a chat with the same id.
     let ids: Vec<String> = snapshot
         .visible_conversations()
         .iter()
-        .map(|row| row.id.clone())
+        .map(|row| snapshot.row_key(row))
         .collect();
     let memo_id = ui.make_persistent_id("inbox-anchor");
     let previous: Option<InboxAnchor> = ui.data(|data| data.get_temp(memo_id));
@@ -1662,6 +1774,8 @@ fn inbox(
         .iter()
         .map(|row| InboxRow {
             protocol: row.protocol,
+            key: snapshot.row_key(row),
+            account: snapshot.row_account_label(row),
             id: row.id.clone(),
             title: row.title.clone(),
             preview: row.preview.clone(),
@@ -1716,9 +1830,12 @@ fn inbox(
     let mut under_pointer = None;
     let mut first_visible = None;
     let mut menu_state_open = [false; 3];
+    let selected_key = snapshot.selected_row_key();
     for row in rows {
         let InboxRow {
             protocol,
+            key,
+            account,
             id,
             title,
             preview,
@@ -1727,11 +1844,13 @@ fn inbox(
             mute,
             avatar,
         } = row;
-        let selected = snapshot.pane.conversation.as_deref() == Some(id.as_str());
-        let focused = snapshot.pane.focused_row.as_deref() == Some(id.as_str());
+        let selected = selected_key.as_deref() == Some(key.as_str());
+        let focused = snapshot.pane.focused_row.as_deref() == Some(key.as_str());
         let response = inbox_row(
             ui,
             protocol,
+            &key,
+            account.as_deref(),
             &id,
             &title,
             &preview,
@@ -1786,27 +1905,30 @@ fn inbox(
         });
         // AccessKit `selected` is the open chat. The highlight is keyboard focus.
         response.widget_info(|| {
-            let label = if mute.is_muted() {
-                format!("{title}, muted")
-            } else {
-                title.clone()
-            };
+            let mut label = title.clone();
+            // Two accounts of one protocol can have a chat with this name.
+            if let Some(account) = &account {
+                label.push_str(&format!(", {account}"));
+            }
+            if mute.is_muted() {
+                label.push_str(", muted");
+            }
             egui::WidgetInfo::selected(egui::Role::Button, true, selected, label)
         });
         if row_scrolls(selected, focused, scroll_to_selected, scroll_to_focused) {
             response.scroll_to_me(None);
         }
         if under_pointer.is_none() && pointer.is_some_and(|pos| response.rect.contains(pos)) {
-            under_pointer = Some(id.clone());
+            under_pointer = Some(key.clone());
         }
         if first_visible.is_none() && response.rect.intersects(clip) {
-            first_visible = Some(id.clone());
+            first_visible = Some(key.clone());
         }
         if widget_focus == Some(response.id) && !focused {
-            focus_from_widget = Some(id.clone());
+            focus_from_widget = Some(key.clone());
         }
         if response.clicked() {
-            clicked = Some(id);
+            clicked = Some(key);
         }
     }
     if !hints.passive {
@@ -1839,6 +1961,11 @@ fn inbox(
 /// One inbox row, read from the view before the rows are drawn.
 struct InboxRow {
     protocol: ProtocolId,
+    /// The key of the row (`Snapshot::row_key`): the widget id, the
+    /// highlight, and the click use it.
+    key: String,
+    /// The account name, when the list has two accounts of this protocol.
+    account: Option<String>,
     id: String,
     title: String,
     preview: String,
@@ -2030,7 +2157,7 @@ fn inbox_keys(
     let row_ids: Vec<egui::Id> = snapshot
         .visible_conversations()
         .iter()
-        .map(|row| ui.scope_id().with(("inbox-row", &row.id)))
+        .map(|row| ui.scope_id().with(("inbox-row", snapshot.row_key(row))))
         .collect();
     let keys_here = ui.ctx().memory(|m| m.focused()).is_none()
         || ui.ctx().memory(|memory| {
@@ -2123,10 +2250,13 @@ fn empty_note(ui: &mut egui::Ui, text: &str) {
 }
 
 /// One inbox row. The whole rect is the click target, including the preview.
+/// `key` is the row key: two rows never have the same widget id.
 #[allow(clippy::too_many_arguments)]
 fn inbox_row(
     ui: &mut egui::Ui,
     protocol: ProtocolId,
+    key: &str,
+    account: Option<&str>,
     id: &str,
     title: &str,
     preview: &str,
@@ -2143,7 +2273,7 @@ fn inbox_row(
         egui::vec2(width, inbox_row_height(ui)),
         egui::Sense::hover(),
     );
-    let row_id = ui.scope_id().with(("inbox-row", id));
+    let row_id = ui.scope_id().with(("inbox-row", key));
     let row_fill = row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
@@ -2151,7 +2281,7 @@ fn inbox_row(
         egui::UiBuilder::new()
             .max_rect(inner)
             .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .id_salt(("inbox-row", id)),
+            .id_salt(("inbox-row", key)),
     );
     child.spacing_mut().item_spacing.x = space::M;
     // A selectable label takes the click, and it is one more click target
@@ -2170,7 +2300,9 @@ fn inbox_row(
         ui.spacing_mut().item_spacing.y = 2.0;
         // A line is as tall as its text. The row, not the line, is the target.
         ui.spacing_mut().interact_size.y = 0.0;
-        inbox_row_lines(ui, title, preview, time, unread, muted, selected, palette);
+        inbox_row_lines(
+            ui, title, account, preview, time, unread, muted, selected, palette,
+        );
     });
     ui.interact(rect, row_id, egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2180,6 +2312,7 @@ fn inbox_row(
 fn inbox_row_lines(
     ui: &mut egui::Ui,
     title: &str,
+    account: Option<&str>,
     preview: &str,
     time: &str,
     unread: u32,
@@ -2230,6 +2363,15 @@ fn inbox_row_lines(
     row_ends(
         ui,
         |ui| {
+            // The account name comes before the preview, in the quiet ink.
+            if let Some(account) = account {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                ui.label(
+                    RichText::new(format!("{account} ·"))
+                        .text_style(theme::secondary())
+                        .color(palette.text3),
+                );
+            }
             ui.add(
                 egui::Label::new(
                     RichText::new(preview)

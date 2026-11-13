@@ -140,11 +140,14 @@ pub enum Scenario {
     /// chat, and an open group with a reply, reactions, a photo, a voice
     /// message, a mention, and a link.
     Showcase,
+    /// The chats of every account in one chat list, newest first (#507),
+    /// with the accounts of the README picture.
+    AllChats,
 }
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
@@ -175,6 +178,7 @@ impl Scenario {
         Self::PhotoSpoiler,
         Self::PhotoFailed,
         Self::Showcase,
+        Self::AllChats,
     ];
 
     /// A stable snake_case name, for example for a snapshot file.
@@ -211,6 +215,7 @@ impl Scenario {
             Self::PhotoSpoiler => "photo_spoiler",
             Self::PhotoFailed => "photo_failed",
             Self::Showcase => "showcase",
+            Self::AllChats => "all_chats",
         }
     }
 
@@ -376,7 +381,7 @@ impl Scenario {
                 telegram.history.insert(ADA.into(), photo_chat(photo));
                 setup.intents.push(select(ADA));
             }
-            Self::Showcase => {
+            Self::Showcase | Self::AllChats => {
                 telegram = showcase_telegram();
                 setup.scripts.extend(showcase_others());
                 setup.visible.extend([
@@ -391,6 +396,9 @@ impl Scenario {
                     muted: true,
                 });
                 setup.intents.push(select(BOOK_CLUB));
+                if self == Self::AllChats {
+                    setup.intents.push(Intent::SelectAll);
+                }
             }
         }
         setup.scripts.insert(0, telegram);
@@ -1370,6 +1378,22 @@ mod tests {
                     ] {
                         assert!(view.shows_in_switcher(protocol), "{name}");
                     }
+                }
+                Scenario::AllChats => {
+                    assert!(view.pane.all, "{name}");
+                    assert_eq!(view.pane.conversation.as_deref(), Some(BOOK_CLUB));
+                    let rows = view.visible_conversations();
+                    for protocol in ProtocolId::ALL {
+                        assert!(
+                            rows.iter().any(|row| row.protocol == protocol),
+                            "{name}: a chat of {protocol}"
+                        );
+                    }
+                    assert!(
+                        rows.windows(2)
+                            .all(|pair| pair[0].last_at >= pair[1].last_at),
+                        "{name}: newest first"
+                    );
                 }
                 Scenario::FailedSend => {
                     let last = view.selected_messages().last().expect("rows");

@@ -325,6 +325,8 @@ impl Core {
         watch_keychain(runtime, Arc::clone(&secrets), &notifier);
         let mut state = Snapshot::new();
         state.status_text = secret_store_status_text(secrets.backend_name());
+        // The last choice of the chat list: every account, or one account.
+        state.pane.all = config.settings.inbox_all();
         let mut core = Self {
             runtime: runtime.clone(),
             commands,
@@ -953,12 +955,22 @@ impl Core {
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn dispatch(&mut self, intent: Intent) {
         match intent {
-            Intent::SelectProtocol(protocol) => self.state.select_protocol(protocol),
+            Intent::SelectProtocol(protocol) => {
+                self.state.select_protocol(protocol);
+                self.settings.set_inbox_all(self.state.pane.all);
+            }
+            Intent::SelectAll => {
+                self.state.select_all();
+                self.settings.set_inbox_all(self.state.pane.all);
+            }
             Intent::AddAccount(kind) => self.add_account(kind),
             Intent::LinkAccount(account) => self.link_account(account),
             Intent::RemoveAccount(account) => self.remove_account(account),
             Intent::UnlinkAccount(account) => self.unlink_account(account),
-            Intent::SelectRetainedSignal(slot) => self.state.select_retained_signal(slot),
+            Intent::SelectRetainedSignal(slot) => {
+                self.state.select_retained_signal(slot);
+                self.settings.set_inbox_all(self.state.pane.all);
+            }
             Intent::SelectConversation { id } => self.state.select_conversation(id),
             Intent::SelectTopic {
                 conversation_id,
@@ -1041,26 +1053,8 @@ impl Core {
                 self.state.set_window_focus(focused);
             }
             Intent::OpenFromNotification(key) => {
-                // Open the chat only in its own protocol: a late click after
-                // a session end must not open that id in another one (qa L5).
-                if self.state.has_session(key.protocol) {
-                    self.state.select_protocol(key.protocol);
-                }
-                if self.state.pane.protocol == key.protocol
-                    && self
-                        .state
-                        .conversation(key.protocol, &key.conversation_id)
-                        .is_some()
-                {
-                    let id = key.conversation_id.clone();
-                    // A topic that is not loaded yet still opens the chat.
-                    let opened = key
-                        .topic
-                        .is_some_and(|topic| self.state.select_topic(id.clone(), topic));
-                    if !opened {
-                        self.state.select_conversation(id);
-                    }
-                }
+                self.state
+                    .open_notified(key.protocol, &key.conversation_id, key.topic);
                 self.notify.dismiss(&key);
             }
             Intent::SetNotifications(on) => {
@@ -1828,6 +1822,29 @@ mod tests {
         core.dispatch(Intent::Shutdown);
         pump_until(&mut core, Core::stopped).await;
         assert!(core.state.stopped_contains(second));
+    }
+
+    /// The last choice of the chat list (every account, or one account) is
+    /// in the settings, and a restart starts with it (#507).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_all_chats_choice_is_saved_and_a_restart_keeps_it() {
+        let mut core = memory_core();
+        assert!(!core.view().pane.all);
+        core.dispatch(Intent::SelectAll);
+        assert!(core.view().pane.all);
+        assert!(core.settings.inbox_all());
+
+        let mut saved = temp_settings();
+        saved.set_inbox_all(true);
+        let restarted = Core::new(
+            &Handle::current(),
+            CoreConfig::new(saved).with_memory_secrets(),
+        );
+        assert!(restarted.view().pane.all);
+
+        core.dispatch(Intent::SelectProtocol(ProtocolId::Telegram));
+        assert!(!core.view().pane.all);
+        assert!(!core.settings.inbox_all());
     }
 
     /// A moved account keeps its place: in the view, in the settings, and

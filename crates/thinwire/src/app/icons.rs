@@ -141,6 +141,19 @@ pub(crate) fn hash(painter: &egui::Painter, center: Pos2, size: f32, color: Colo
     }
 }
 
+/// Three rows of a list, each with its dot: the chats of every account.
+pub(crate) fn all_chats(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new(1.75, color);
+    let unit = size / 16.0;
+    for y in [-4.5, 0.0, 4.5] {
+        painter.circle_filled(at(center, unit, -5.0, y), 1.1 * unit.max(1.0), color);
+        painter.line_segment(
+            [at(center, unit, -1.5, y), at(center, unit, 6.0, y)],
+            stroke,
+        );
+    }
+}
+
 /// A speech bubble with two text lines: the empty chat state.
 pub(crate) fn chat_bubble(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let stroke = Stroke::new(2.0, color);

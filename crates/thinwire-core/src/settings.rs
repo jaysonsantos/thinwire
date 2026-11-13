@@ -103,6 +103,8 @@ pub struct Settings {
     notification_preview: bool,
     /// The account sidebar shows only the account icons. Default off.
     rail_collapsed: bool,
+    /// The chat list shows the chats of every account (#507). Default off.
+    inbox_all: bool,
     /// Tell the other people of a chat when the user types (#510). Default on.
     send_typing: bool,
     /// Show the unread count on the Dock or the launcher (#513). Default on.
@@ -160,6 +162,7 @@ const ACCOUNT_ORDER_KEY: &str = "account_order";
 
 /// Settings key of the collapsed account sidebar.
 const RAIL_COLLAPSED_KEY: &str = "rail_collapsed";
+const INBOX_ALL_KEY: &str = "inbox_all";
 
 /// Settings key of the outgoing typing state.
 const SEND_TYPING_KEY: &str = "send_typing";
@@ -210,6 +213,7 @@ impl Settings {
             notifications: read_bool(&path, "notifications").unwrap_or(true),
             notification_preview: read_bool(&path, "notification_preview").unwrap_or(true),
             rail_collapsed: read_bool(&path, RAIL_COLLAPSED_KEY).unwrap_or(false),
+            inbox_all: read_bool(&path, INBOX_ALL_KEY).unwrap_or(false),
             send_typing: read_bool(&path, SEND_TYPING_KEY).unwrap_or(true),
             unread_badge: read_bool(&path, UNREAD_BADGE_KEY).unwrap_or(true),
             person_colors: read_bool(&path, PERSON_COLORS_KEY).unwrap_or(false),
@@ -239,6 +243,7 @@ impl Settings {
             notifications: true,
             notification_preview: true,
             rail_collapsed: false,
+            inbox_all: false,
             send_typing: true,
             unread_badge: true,
             person_colors: false,
@@ -466,6 +471,21 @@ impl Settings {
         }
     }
 
+    /// The chat list shows the chats of every account.
+    #[must_use]
+    pub const fn inbox_all(&self) -> bool {
+        self.inbox_all
+    }
+
+    /// Keep the last choice of the chat list: every account, or one
+    /// account. Disk persist is queued.
+    pub fn set_inbox_all(&mut self, all: bool) {
+        if self.inbox_all != all {
+            self.inbox_all = all;
+            self.persist_pending = true;
+        }
+    }
+
     /// The chats muted in thinwire.
     #[must_use]
     pub const fn chat_mutes(&self) -> &ChatMutes {
@@ -533,6 +553,9 @@ impl Settings {
         );
         if self.rail_collapsed {
             text.push_str(&format!("{RAIL_COLLAPSED_KEY} = true\n"));
+        }
+        if self.inbox_all {
+            text.push_str(&format!("{INBOX_ALL_KEY} = true\n"));
         }
         if !self.send_typing {
             text.push_str(&format!("{SEND_TYPING_KEY} = false\n"));
@@ -1071,6 +1094,22 @@ mod tests {
         assert!(!text.contains(SEND_TYPING_KEY), "the default writes no key");
         assert!(Settings::load_from(path).send_typing());
         assert!(Settings::in_memory().send_typing());
+    }
+
+    #[test]
+    fn the_all_chats_choice_persists_and_defaults_off() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(!settings.inbox_all());
+        settings.set_inbox_all(true);
+        settings.persist_now().expect("save");
+        assert!(Settings::load_from(path.clone()).inbox_all());
+        settings.set_inbox_all(false);
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains(INBOX_ALL_KEY), "the default writes no key");
+        assert!(!Settings::load_from(path).inbox_all());
+        assert!(!Settings::in_memory().inbox_all());
     }
 
     #[test]

@@ -546,6 +546,10 @@ fn without_did_not_link(detail: &str) -> String {
 /// Sending does not go out. The history stays.
 pub const SIGNAL_SENDING_OFF: &str = "Sending is off.";
 
+/// Between the account and the chat id in a row key of the list of every
+/// account. An account key does not have this character.
+const ROW_KEY_SEPARATOR: char = '\u{1f}';
+
 /// Why `sync_focused_row` runs. A search change or a key move scrolls.
 /// A chat update does not: the list stays where the user left it.
 enum FocusFollow {
@@ -594,7 +598,11 @@ impl SplitSide {
 /// text.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Pane {
+    /// The account of the open chat. With `all` off, it is also the account
+    /// of the chat list.
     pub protocol: ProtocolId,
+    /// The chat list of this pane shows the chats of every account (#507).
+    pub all: bool,
     /// The previous Signal account open in the switcher. `None` is the live
     /// Signal number, or another protocol. The number is a slot, not an
     /// account id.
@@ -605,7 +613,8 @@ pub struct Pane {
     pub topic: Option<MessageTopic>,
     pub search: String,
     pub compose: String,
-    /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
+    /// Keyboard highlight, as a row key ([`Snapshot::row_key`]). Arrows move
+    /// this. Enter and a click open the chat.
     pub focused_row: Option<String>,
     /// The own message that the compose field edits. Enter saves the edit,
     /// and Esc puts the draft of the thread back. `compose` has the edit
@@ -617,6 +626,7 @@ impl Pane {
     fn new(protocol: ProtocolId) -> Self {
         Self {
             protocol,
+            all: false,
             signal_retained: None,
             conversation: None,
             topic: None,
@@ -632,6 +642,7 @@ impl std::fmt::Debug for Pane {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pane")
             .field("protocol", &self.protocol)
+            .field("all", &self.all)
             .field("signal_retained", &self.signal_retained)
             .field("has_chat", &self.conversation.is_some())
             .finish()
@@ -2431,18 +2442,119 @@ impl Snapshot {
         self.notices.get(&protocol).map(String::as_str)
     }
 
+    /// Show the chat list of one account. The list of every account
+    /// closes.
     pub fn select_protocol(&mut self, protocol: ProtocolId) {
         if !self.account_surface_visible(protocol) {
             return;
         }
+        let was_all = std::mem::take(&mut self.pane.all);
+        if was_all && self.pane.protocol == protocol && self.pane.signal_retained.is_none() {
+            // The open chat is a chat of this account: it stays open.
+            self.pane.focused_row = None;
+            self.ensure_conversation_selection();
+            self.scroll_to_selected = true;
+            self.sync_focused_row(FocusFollow::List);
+            return;
+        }
+        self.show_account(protocol);
+    }
+
+    /// Make `protocol` the account of the pane. This does not change
+    /// [`Pane::all`]: a link, a session end, and a notification come here.
+    /// With the list of every account, the first chat of that list opens,
+    /// and `protocol` stays the account only while the list is empty.
+    fn show_account(&mut self, protocol: ProtocolId) {
+        if !self.account_surface_visible(protocol) {
+            return;
+        }
+        self.enter_account(protocol);
+        self.pane.focused_row = None;
+        self.ensure_conversation_selection();
+    }
+
+    /// Close the open chat and make `protocol` the account of the next one.
+    /// The chat list and its search stay as they are.
+    fn enter_account(&mut self, protocol: ProtocolId) {
         // Park the draft under the old protocol before the protocol changes.
         self.set_selected_conversation(None);
         self.pane.protocol = protocol;
         // The live account of that protocol. A previous Signal number has
         // its own row.
         self.pane.signal_retained = None;
+    }
+
+    /// Show the chats of every account in the chat list (#507). The open
+    /// chat stays open.
+    pub fn select_all(&mut self) {
+        if self.pane.all {
+            return;
+        }
+        self.pane.all = true;
+        // The highlight was a row key of the list of one account.
         self.pane.focused_row = None;
         self.ensure_conversation_selection();
+        self.scroll_to_selected = true;
+        self.sync_focused_row(FocusFollow::List);
+    }
+
+    /// The key of one row of the chat list. In the list of one account, it
+    /// is the chat id. In the list of every account, two accounts can have a
+    /// chat with the same id, so the key has the account before the id.
+    #[must_use]
+    pub fn row_key(&self, row: &Conversation) -> String {
+        self.row_key_of(row.protocol, &row.id)
+    }
+
+    /// [`Self::row_key`] for a chat that the caller names.
+    #[must_use]
+    pub fn row_key_of(&self, protocol: ProtocolId, id: &str) -> String {
+        if self.pane.all {
+            format!("{}{ROW_KEY_SEPARATOR}{id}", protocol.key())
+        } else {
+            id.to_owned()
+        }
+    }
+
+    /// The row key of the open chat.
+    #[must_use]
+    pub fn selected_row_key(&self) -> Option<String> {
+        let id = self.pane.conversation.as_deref()?;
+        Some(self.row_key_of(self.pane.protocol, id))
+    }
+
+    /// The account and the chat id of a row key. In the list of every
+    /// account, `None` for a key that names no chat of that list.
+    fn chat_of_row_key(&self, key: &str) -> Option<(ProtocolId, String)> {
+        if !self.pane.all {
+            return Some((self.pane.protocol, key.to_owned()));
+        }
+        let (protocol, id) = match key.split_once(ROW_KEY_SEPARATOR) {
+            Some((account, id)) => (ProtocolId::from_key(account)?, id),
+            // A key with no account is a chat of the account of the open
+            // chat: a mention in the thread names its chat this way.
+            None => (self.pane.protocol, key),
+        };
+        let listed = self
+            .all_conversations()
+            .iter()
+            .any(|row| row.protocol == protocol && row.id == id);
+        listed.then(|| (protocol, id.to_owned()))
+    }
+
+    /// The account name of a row, for the list of every account. `None`
+    /// when the protocol of the row has one account in that list: the
+    /// protocol mark on the picture is enough then.
+    #[must_use]
+    pub fn row_account_label(&self, row: &Conversation) -> Option<String> {
+        if !self.pane.all {
+            return None;
+        }
+        let accounts = self
+            .all_accounts()
+            .filter(|account| account.kind() == row.protocol.kind())
+            .count();
+        (accounts > 1).then(|| row.protocol.label())
     }
 
     /// Open a previous Signal account. Sending stays off. The history stays.
@@ -2454,6 +2566,8 @@ impl Snapshot {
         if !known || !self.account_surface_visible(ProtocolId::Signal) {
             return;
         }
+        // A previous number is not in the list of every account.
+        self.pane.all = false;
         self.set_selected_conversation(None);
         self.pane.protocol = ProtocolId::Signal;
         self.pane.signal_retained = Some(slot);
@@ -2625,7 +2739,8 @@ impl Snapshot {
     /// The open account row is selected in the switcher.
     #[must_use]
     pub fn account_row_selected(&self, account: &AccountRow) -> bool {
-        if self.pane.protocol != account.caps.id {
+        // The list of every account has its own entry in the switcher.
+        if self.pane.all || self.pane.protocol != account.caps.id {
             return false;
         }
         if !account.caps.id.is(ProtocolKind::Signal) {
@@ -2696,11 +2811,64 @@ impl Snapshot {
         }
     }
 
-    /// Open `id`. The inbox scrolls that row into view.
-    /// A click, Enter on the highlight, and a notification click all come here.
-    /// A later message does not: the list stays where the user left it.
-    pub fn select_conversation(&mut self, id: String) {
-        self.pane.focused_row = Some(id.clone());
+    /// Open the chat of the row `key` ([`Self::row_key`]). The inbox scrolls
+    /// that row into view. A click and Enter on the highlight come here. A
+    /// later message does not: the list stays where the user left it.
+    /// In the list of every account, the chat can be a chat of another
+    /// account: the draft of the open thread stays with it, and the pane
+    /// changes to that account.
+    pub fn select_conversation(&mut self, key: String) {
+        let Some((protocol, id)) = self.chat_of_row_key(&key) else {
+            return;
+        };
+        self.open_chat(protocol, id);
+    }
+
+    /// The user clicked a notification of this chat: open it. The chat
+    /// list does not change its kind. The list of one account changes to
+    /// the account of the chat. The list of every account stays.
+    pub(crate) fn open_notified(
+        &mut self,
+        protocol: ProtocolId,
+        id: &str,
+        topic: Option<MessageTopic>,
+    ) {
+        if self.pane.all {
+            let listed = self
+                .all_conversations()
+                .iter()
+                .any(|row| row.protocol == protocol && row.id == id);
+            if !listed {
+                return;
+            }
+            if protocol != self.pane.protocol || self.pane.signal_retained.is_some() {
+                self.enter_account(protocol);
+            }
+        } else {
+            // Open the chat only in its own protocol: a late click after
+            // a session end must not open that id in another one (qa L5).
+            if self.has_session(protocol) {
+                self.show_account(protocol);
+            }
+            if self.pane.protocol != protocol || self.conversation(protocol, id).is_none() {
+                return;
+            }
+        }
+        // A topic that is not loaded yet still opens the chat.
+        let opened = topic.is_some_and(|topic| self.select_topic(id.to_owned(), topic));
+        if !opened {
+            self.open_chat(protocol, id.to_owned());
+        }
+    }
+
+    /// Open a chat of `protocol`. In the list of one account, `protocol`
+    /// is the account of the pane.
+    fn open_chat(&mut self, protocol: ProtocolId, id: String) {
+        if protocol != self.pane.protocol || (self.pane.all && self.pane.signal_retained.is_some())
+        {
+            self.enter_account(protocol);
+        }
+        self.pane.focused_row = Some(self.row_key_of(protocol, &id));
         let has_topics = self
             .conversation(self.pane.protocol, &id)
             .is_some_and(|row| row.has_topics);
@@ -2728,7 +2896,7 @@ impl Snapshot {
         let closed = row.closed;
         let same_chat = self.pane.conversation.as_deref() == Some(conversation_id.as_str());
         if !same_chat {
-            self.pane.focused_row = Some(conversation_id.clone());
+            self.pane.focused_row = Some(self.row_key_of(protocol, &conversation_id));
             self.scroll_to_selected = true;
         }
         self.set_selection(Some(conversation_id), Some(topic));
@@ -2756,20 +2924,16 @@ impl Snapshot {
         if delta == 0 {
             return None;
         }
-        let ids: Vec<String> = self
-            .visible_conversations()
-            .iter()
-            .map(|row| row.id.clone())
-            .collect();
+        let ids = self.visible_ids();
         if ids.is_empty() {
             return None;
         }
         let current = self
             .pane
             .focused_row
-            .as_deref()
-            .or(self.pane.conversation.as_deref())
-            .and_then(|id| ids.iter().position(|row| row == id));
+            .clone()
+            .or_else(|| self.selected_row_key())
+            .and_then(|id| ids.iter().position(|row| *row == id));
         let next = match current {
             Some(index) => (index as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize,
             None if delta < 0 => ids.len() - 1,
@@ -2790,7 +2954,7 @@ impl Snapshot {
     /// Point the highlight at a row that already has keyboard focus.
     /// The open chat stays as it is. The row is already on screen, so this does not scroll.
     pub fn focus_inbox_row(&mut self, id: String) {
-        let visible = self.visible_conversations().iter().any(|row| row.id == id);
+        let visible = self.visible_ids().contains(&id);
         if visible {
             self.pane.focused_row = Some(id);
         }
@@ -3626,9 +3790,51 @@ impl Snapshot {
         self.account_surface_visible(protocol)
     }
 
-    /// Chats in the middle column: the selected account only. There is no
-    /// combined inbox.
+    /// The accounts whose chats are in the list of every account: each
+    /// account that the sidebar shows and that has a session, in sidebar
+    /// order. A previous Signal number is not one of them.
+    fn all_accounts(&self) -> impl Iterator<Item = ProtocolId> + '_ {
+        self.accounts
+            .iter()
+            .filter(|row| row.signal_retained.is_none())
+            .map(|row| row.caps.id)
+            .filter(|id| self.account_surface_visible(*id) && self.has_session(*id))
+    }
+
+    /// The chats of every account, newest first. Chats with the same time
+    /// keep the order of the sidebar and of their account. A placeholder
+    /// row and a chat of a previous Signal number are not in this list.
+    fn all_conversations(&self) -> Vec<&Conversation> {
+        let mut rows: Vec<&Conversation> = self
+            .all_accounts()
+            .filter_map(|account| self.conversations.get(&account))
+            .flatten()
+            .filter(|row| {
+                !row.placeholder
+                    && !(row.protocol.is(ProtocolKind::Signal)
+                        && thinwire_protocol::signal_retained_slot(&row.id).is_some())
+            })
+            .collect();
+        // A stable sort: equal times keep their order.
+        rows.sort_by_key(|row| std::cmp::Reverse(row.last_at));
+        rows
+    }
+
+    /// Chats in the middle column: the chats of the selected account, or
+    /// the chats of every account ([`Pane::all`]).
     pub fn visible_conversations(&self) -> Vec<&Conversation> {
+        if self.pane.all {
+            let query = self.pane.search.trim().to_ascii_lowercase();
+            return self
+                .all_conversations()
+                .into_iter()
+                .filter(|row| {
+                    query.is_empty()
+                        || row.title.to_ascii_lowercase().contains(&query)
+                        || row.participant.to_ascii_lowercase().contains(&query)
+                })
+                .collect();
+        }
         if !self.account_surface_visible(self.pane.protocol) {
             return Vec::new();
         }
@@ -3745,6 +3951,19 @@ impl Snapshot {
         if !self.visible_conversations().is_empty() {
             return InboxState::Rows;
         }
+        if self.pane.all {
+            if !self.all_conversations().is_empty() {
+                return InboxState::NoMatch;
+            }
+            let loading = self
+                .all_accounts()
+                .any(|account| self.chat_list_loading.contains(&account));
+            return if loading {
+                InboxState::Loading
+            } else {
+                InboxState::Empty
+            };
+        }
         let has_rows = self.has_session(self.pane.protocol)
             && self
                 .conversations
@@ -3771,6 +3990,7 @@ impl Snapshot {
     pub fn inbox_placeholder(&self) -> Option<&'static str> {
         match self.inbox_state() {
             InboxState::Loading => Some(LOADING_CHATS_STATUS),
+            InboxState::Empty if self.pane.all => self.all_accounts().next().map(|_| NO_CHATS_YET),
             InboxState::Empty if self.protocol_linked(self.pane.protocol) => Some(NO_CHATS_YET),
             InboxState::Rows | InboxState::Empty | InboxState::NoMatch => None,
         }
@@ -5227,7 +5447,8 @@ impl Snapshot {
         let keep =
             !self.pane.protocol.is(ProtocolKind::Telegram) && self.has_session(self.pane.protocol);
         if !keep {
-            self.select_protocol(account);
+            // The list of every account stays, when it is the choice.
+            self.show_account(account);
         }
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
@@ -5330,6 +5551,22 @@ impl Snapshot {
 
     fn ensure_conversation_selection(&mut self) {
         if self.pane.conversation.is_some() {
+            return;
+        }
+        if self.pane.all {
+            // The first row of the list of every account. The search does
+            // not hide it here, as in the list of one account.
+            let first = self
+                .all_conversations()
+                .first()
+                .map(|row| (row.protocol, row.id.clone()));
+            if let Some((protocol, id)) = first {
+                if protocol != self.pane.protocol || self.pane.signal_retained.is_some() {
+                    self.enter_account(protocol);
+                }
+                self.set_selected_conversation(Some(id));
+                self.queue_open_chat();
+            }
             return;
         }
         // A placeholder row is not a chat: never auto-select it (#70).
@@ -5585,7 +5822,8 @@ impl Snapshot {
                 // The first linked account, or the linked one while nothing
                 // useful is selected: show it (shell plan 2).
                 if first_link || !self.protocol_linked(self.pane.protocol) {
-                    self.select_protocol(protocol);
+                    // The list of every account stays, when it is the choice.
+                    self.show_account(protocol);
                 }
                 // A chat opened while the account was Linking did not load:
                 // load it now (#70). A duplicate in the queue is skipped. A
@@ -6307,15 +6545,20 @@ impl Snapshot {
         if self.pane.protocol == protocol && !stay_on_retained {
             self.pane.compose.clear();
             self.pane.conversation = None;
-            if let Some(next) = self
-                .accounts
-                .iter()
-                .find(|row| {
-                    self.has_session(row.caps.id) && self.account_surface_visible(row.caps.id)
-                })
-                .map(|row| row.caps.id)
+            if self.pane.all {
+                // The list of every account stays, with its next chat open.
+                self.ensure_conversation_selection();
+            }
+            if self.pane.conversation.is_none()
+                && let Some(next) = self
+                    .accounts
+                    .iter()
+                    .find(|row| {
+                        self.has_session(row.caps.id) && self.account_surface_visible(row.caps.id)
+                    })
+                    .map(|row| row.caps.id)
             {
-                self.select_protocol(next);
+                self.show_account(next);
             }
         } else if stay_on_retained
             && self
@@ -6442,10 +6685,11 @@ impl Snapshot {
         old.is_some() && new.is_some() && old != new
     }
 
+    /// The row keys of the chat list, in order.
     fn visible_ids(&self) -> Vec<String> {
         self.visible_conversations()
             .iter()
-            .map(|row| row.id.clone())
+            .map(|row| self.row_key(row))
             .collect()
     }
 
@@ -6453,10 +6697,7 @@ impl Snapshot {
     #[must_use]
     pub fn visible_focused_row(&self) -> Option<String> {
         let id = self.pane.focused_row.clone()?;
-        self.visible_conversations()
-            .iter()
-            .any(|row| row.id == id)
-            .then_some(id)
+        self.visible_ids().contains(&id).then_some(id)
     }
 
     fn message_bucket(
@@ -7699,7 +7940,7 @@ impl Snapshot {
         self.signal_screen = SignalScreen::Hidden;
         self.end_signal_pairing();
         self.status_text = "Signal is linked.".into();
-        self.select_protocol(self.signal_link_account);
+        self.show_account(self.signal_link_account);
         // Another account linked: the screens are for account 0 again.
         self.signal_link_account = ProtocolId::Signal;
     }
@@ -20526,6 +20767,434 @@ mod tests {
     }
 
     // endregion: #135
+    // region: the list of every account (#507)
+
+    fn timed(protocol: ProtocolId, id: &str, title: &str, last_at: i64) -> Conversation {
+        Conversation {
+            title: title.into(),
+            participant: title.into(),
+            last_at,
+            ..chat(protocol, id, true)
+        }
+    }
+
+    fn upsert(snapshot: &mut Snapshot, conversation: Conversation) {
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation });
+    }
+
+    /// Telegram and Slack are linked, in every feature build. Telegram has
+    /// Ada (time 100) and Bob (time 300). Slack has general (time 200).
+    /// Ada is open.
+    fn two_protocols() -> Snapshot {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        show_only(&mut snapshot, &[ProtocolId::Telegram, ProtocolId::Slack]);
+        show_protocol(&mut snapshot, ProtocolId::Slack);
+        complete_telegram(&mut snapshot, &store);
+        link(&mut snapshot, ProtocolId::Slack);
+        upsert(
+            &mut snapshot,
+            timed(ProtocolId::Telegram, "telegram:1", "Ada", 100),
+        );
+        upsert(
+            &mut snapshot,
+            timed(ProtocolId::Telegram, "telegram:2", "Bob", 300),
+        );
+        upsert(
+            &mut snapshot,
+            timed(ProtocolId::Slack, "C1", "general", 200),
+        );
+        snapshot.take_commands();
+        snapshot
+    }
+
+    fn titles(snapshot: &Snapshot) -> Vec<&str> {
+        snapshot
+            .visible_conversations()
+            .iter()
+            .map(|row| row.title.as_str())
+            .collect()
+    }
+
+    fn key_of_title(snapshot: &Snapshot, title: &str) -> String {
+        let rows = snapshot.visible_conversations();
+        let row = rows.iter().find(|row| row.title == title).expect("row");
+        snapshot.row_key(row)
+    }
+
+    #[test]
+    fn the_all_list_has_the_chats_of_every_account_newest_first() {
+        let mut snapshot = two_protocols();
+        assert_eq!(snapshot.visible_conversations().len(), 2, "one account");
+        snapshot.select_all();
+        assert!(snapshot.pane.all);
+        assert_eq!(titles(&snapshot), ["Bob", "general", "Ada"]);
+        assert_eq!(snapshot.inbox_state(), InboxState::Rows);
+        assert_eq!(
+            snapshot.pane.conversation.as_deref(),
+            Some("telegram:1"),
+            "the open chat stays open"
+        );
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
+
+        // Equal times keep the order of the sidebar: Telegram, then Slack.
+        upsert(&mut snapshot, timed(ProtocolId::Slack, "C2", "random", 100));
+        assert_eq!(titles(&snapshot), ["Bob", "general", "Ada", "random"]);
+
+        // A placeholder row is not a chat of this list.
+        let mut placeholder = timed(ProtocolId::Slack, "C3", "stand-in", 900);
+        placeholder.placeholder = true;
+        upsert(&mut snapshot, placeholder);
+        assert_eq!(titles(&snapshot), ["Bob", "general", "Ada", "random"]);
+        snapshot.select_protocol(ProtocolId::Slack);
+        assert!(titles(&snapshot).contains(&"stand-in"));
+    }
+
+    #[test]
+    fn a_new_message_moves_its_chat_to_the_top_of_the_all_list() {
+        let mut snapshot = two_protocols();
+        snapshot.select_all();
+        snapshot.take_scroll_to_selected();
+        assert_eq!(titles(&snapshot), ["Bob", "general", "Ada"]);
+
+        let mut general = timed(ProtocolId::Slack, "C1", "general", 400);
+        general.unread = 1;
+        upsert(&mut snapshot, general);
+        assert_eq!(titles(&snapshot), ["general", "Bob", "Ada"]);
+
+        upsert(
+            &mut snapshot,
+            timed(ProtocolId::Telegram, "telegram:1", "Ada", 500),
+        );
+        assert_eq!(titles(&snapshot), ["Ada", "general", "Bob"]);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
+        assert!(
+            !snapshot.wants_scroll_to_selected(),
+            "a message does not scroll the list"
+        );
+    }
+
+    #[test]
+    fn two_accounts_with_the_same_chat_id_are_two_rows_of_the_all_list() {
+        let mut snapshot = two_protocols();
+        let second = ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot");
+        assert!(snapshot.add_account_row(second));
+        snapshot.apply(AdapterEvent::FromAccount {
+            account: second,
+            event: Box::new(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::Ready,
+            }),
+        });
+        upsert(
+            &mut snapshot,
+            timed(second, "telegram:1", "Second Ada", 250),
+        );
+        snapshot.select_all();
+        assert_eq!(titles(&snapshot), ["Bob", "Second Ada", "general", "Ada"]);
+
+        let first_key = key_of_title(&snapshot, "Ada");
+        let second_key = key_of_title(&snapshot, "Second Ada");
+        assert_ne!(first_key, second_key);
+        assert_eq!(snapshot.selected_row_key(), Some(first_key.clone()));
+
+        // The account name shows only for a protocol with two accounts.
+        let rows = snapshot.visible_conversations();
+        let label = |title: &str| {
+            let row = rows.iter().find(|row| row.title == title).expect("row");
+            snapshot.row_account_label(row)
+        };
+        assert_eq!(label("Ada").as_deref(), Some("Telegram"));
+        assert_eq!(label("Second Ada").as_deref(), Some("Telegram 2"));
+        assert_eq!(label("general"), None);
+        drop(rows);
+
+        snapshot.pane.compose = "draft for Ada".into();
+        snapshot.take_commands();
+        snapshot.select_conversation(second_key.clone());
+        assert_eq!(snapshot.pane.protocol, second);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(
+            snapshot.selected_conversation_row().expect("row").title,
+            "Second Ada"
+        );
+        assert_eq!(snapshot.selected_row_key(), Some(second_key.clone()));
+        assert_eq!(snapshot.pane.focused_row, Some(second_key));
+        assert!(snapshot.pane.all, "the list stays");
+        assert!(
+            snapshot.pane.compose.is_empty(),
+            "each thread has its draft"
+        );
+        let commands = snapshot.take_commands();
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                AdapterCommand::OpenChat { protocol, conversation_id }
+                    if *protocol == second && conversation_id == "telegram:1"
+            )),
+            "the history loads from the second account: {commands:?}"
+        );
+
+        snapshot.select_conversation(first_key.clone());
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
+        assert_eq!(
+            snapshot.selected_conversation_row().expect("row").title,
+            "Ada"
+        );
+        assert_eq!(snapshot.pane.compose, "draft for Ada");
+        assert_eq!(snapshot.selected_row_key(), Some(first_key));
+
+        // A key of one account is not a key of the list of every account.
+        snapshot.select_conversation("no-such-chat".into());
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
+    }
+
+    #[test]
+    fn arrows_and_enter_move_across_accounts_in_the_all_list() {
+        let mut snapshot = two_protocols();
+        snapshot.select_all();
+        snapshot.take_scroll_to_selected();
+        // Bob, general, Ada. Ada is open and has no highlight yet.
+        assert!(snapshot.pane.focused_row.is_none());
+        snapshot.move_inbox_selection(-1);
+        let general = key_of_title(&snapshot, "general");
+        assert_eq!(snapshot.pane.focused_row, Some(general.clone()));
+        assert!(snapshot.take_scroll_to_focused());
+        assert_eq!(
+            snapshot.pane.conversation.as_deref(),
+            Some("telegram:1"),
+            "an arrow does not open the chat"
+        );
+        assert_eq!(snapshot.visible_focused_row(), Some(general.clone()));
+
+        // Enter opens the highlight: a chat of another account.
+        snapshot.select_conversation(general);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("C1"));
+
+        snapshot.move_inbox_selection(-1);
+        assert_eq!(
+            snapshot.pane.focused_row,
+            Some(key_of_title(&snapshot, "Bob"))
+        );
+        snapshot.move_inbox_selection(-1);
+        assert_eq!(
+            snapshot.pane.focused_row,
+            Some(key_of_title(&snapshot, "Bob")),
+            "the first row is the end"
+        );
+        snapshot.move_inbox_selection(2);
+        assert_eq!(
+            snapshot.pane.focused_row,
+            Some(key_of_title(&snapshot, "Ada"))
+        );
+        let ada = key_of_title(&snapshot, "Ada");
+        snapshot.focus_inbox_row("telegram:1".into());
+        assert_eq!(
+            snapshot.pane.focused_row,
+            Some(ada),
+            "a chat id alone is not a row of this list"
+        );
+    }
+
+    #[test]
+    fn the_search_filters_the_all_list_across_accounts() {
+        let mut snapshot = two_protocols();
+        snapshot.select_all();
+        snapshot.set_search("a".into());
+        assert_eq!(titles(&snapshot), ["general", "Ada"]);
+        snapshot.set_search("gen".into());
+        assert_eq!(titles(&snapshot), ["general"]);
+        snapshot.set_search("zzz".into());
+        assert!(titles(&snapshot).is_empty());
+        assert_eq!(snapshot.inbox_state(), InboxState::NoMatch);
+        assert_eq!(snapshot.inbox_placeholder(), None);
+
+        // The search stays when a click changes the account.
+        snapshot.set_search("gen".into());
+        let general = key_of_title(&snapshot, "general");
+        snapshot.select_conversation(general);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+        assert_eq!(snapshot.pane.search, "gen");
+        assert_eq!(titles(&snapshot), ["general"]);
+    }
+
+    #[test]
+    fn a_click_on_an_account_leaves_the_all_list() {
+        let mut snapshot = two_protocols();
+        snapshot.select_all();
+        let telegram_row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Telegram)
+            .expect("row")
+            .clone();
+        assert!(
+            !snapshot.account_row_selected(&telegram_row),
+            "the All entry is the selected one"
+        );
+
+        // The account of the open chat: the chat stays open.
+        snapshot.pane.compose = "draft for Ada".into();
+        snapshot.select_protocol(ProtocolId::Telegram);
+        assert!(!snapshot.pane.all);
+        assert!(snapshot.account_row_selected(&telegram_row));
+        // The list of one account has the order of its protocol.
+        assert_eq!(titles(&snapshot), ["Ada", "Bob"]);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        assert_eq!(snapshot.pane.compose, "draft for Ada");
+        assert_eq!(snapshot.selected_row_key().as_deref(), Some("telegram:1"));
+
+        // Another account: its list, and its first chat.
+        snapshot.select_all();
+        snapshot.select_protocol(ProtocolId::Slack);
+        assert!(!snapshot.pane.all);
+        assert_eq!(titles(&snapshot), ["general"]);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("C1"));
+    }
+
+    #[test]
+    fn the_all_list_opens_its_first_chat_and_stays_after_a_session_end() {
+        let mut snapshot = two_protocols();
+        // Slack has the open chat.
+        snapshot.select_all();
+        let general = key_of_title(&snapshot, "general");
+        snapshot.select_conversation(general);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert!(snapshot.pane.all, "the list stays");
+        assert_eq!(titles(&snapshot), ["Bob", "Ada"]);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
+        assert_eq!(
+            snapshot.pane.conversation.as_deref(),
+            Some("telegram:2"),
+            "the first row of the list opens"
+        );
+
+        // The open chat goes: the next first row opens.
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: "telegram:2".into(),
+        });
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+    }
+
+    /// A start with the saved choice: a link does not leave the list.
+    #[test]
+    fn a_link_keeps_the_all_list_that_the_settings_start() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        show_only(&mut snapshot, &[ProtocolId::Telegram, ProtocolId::Slack]);
+        show_protocol(&mut snapshot, ProtocolId::Slack);
+        snapshot.pane.all = true;
+        assert_eq!(snapshot.inbox_state(), InboxState::Empty);
+        assert_eq!(snapshot.inbox_placeholder(), None, "no account yet");
+        complete_telegram(&mut snapshot, &store);
+        assert!(snapshot.pane.all);
+        assert_eq!(snapshot.inbox_placeholder(), Some(LOADING_CHATS_STATUS));
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        assert_eq!(snapshot.inbox_placeholder(), Some(NO_CHATS_YET));
+        link(&mut snapshot, ProtocolId::Slack);
+        assert!(snapshot.pane.all);
+        upsert(
+            &mut snapshot,
+            timed(ProtocolId::Slack, "C1", "general", 200),
+        );
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("C1"));
+        upsert(
+            &mut snapshot,
+            timed(ProtocolId::Telegram, "telegram:1", "Ada", 300),
+        );
+        assert_eq!(titles(&snapshot), ["Ada", "general"]);
+        assert_eq!(
+            snapshot.pane.conversation.as_deref(),
+            Some("C1"),
+            "the open chat stays open"
+        );
+    }
+
+    #[test]
+    fn a_notification_click_keeps_the_kind_of_the_chat_list() {
+        let mut snapshot = two_protocols();
+        snapshot.select_all();
+        snapshot.open_notified(ProtocolId::Slack, "C1", None);
+        assert!(snapshot.pane.all);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("C1"));
+        assert_eq!(
+            snapshot.pane.focused_row,
+            Some(key_of_title(&snapshot, "general"))
+        );
+        // A chat that is gone changes nothing.
+        snapshot.open_notified(ProtocolId::Telegram, "telegram:9", None);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Slack);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("C1"));
+
+        snapshot.select_protocol(ProtocolId::Slack);
+        snapshot.open_notified(ProtocolId::Telegram, "telegram:2", None);
+        assert!(!snapshot.pane.all);
+        assert_eq!(snapshot.pane.protocol, ProtocolId::Telegram);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:2"));
+    }
+
+    #[test]
+    fn each_pane_of_the_split_view_has_its_own_kind_of_chat_list() {
+        let mut snapshot = two_protocols();
+        snapshot.select_all();
+        snapshot.open_split(ProtocolId::Slack);
+        assert!(!snapshot.pane.all, "the new pane shows the account");
+        assert_eq!(titles(&snapshot), ["general"]);
+        snapshot.focus_other_pane();
+        assert!(snapshot.pane.all, "the first pane keeps the list");
+        assert_eq!(titles(&snapshot), ["Bob", "general", "Ada"]);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        snapshot.focus_other_pane();
+        assert!(!snapshot.pane.all);
+        snapshot.select_all();
+        snapshot.focus_other_pane();
+        snapshot.focus_other_pane();
+        assert!(snapshot.pane.all, "both panes can show the list");
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("C1"));
+    }
+
+    #[test]
+    fn the_all_list_has_no_chat_of_a_previous_signal_number() {
+        use thinwire_protocol::signal_retained_chat_id;
+        let mut snapshot = two_protocols();
+        show_only(
+            &mut snapshot,
+            &[ProtocolId::Telegram, ProtocolId::Slack, ProtocolId::Signal],
+        );
+        show_protocol(&mut snapshot, ProtocolId::Slack);
+        show_protocol(&mut snapshot, ProtocolId::Signal);
+        link(&mut snapshot, ProtocolId::Signal);
+        upsert(&mut snapshot, timed(ProtocolId::Signal, "ada", "Sig", 50));
+        upsert(
+            &mut snapshot,
+            timed(
+                ProtocolId::Signal,
+                &signal_retained_chat_id(1, "old"),
+                "Old number",
+                900,
+            ),
+        );
+        snapshot.select_all();
+        assert_eq!(titles(&snapshot), ["Bob", "general", "Ada", "Sig"]);
+        // A click on the previous number leaves the list.
+        snapshot.select_retained_signal(1);
+        assert!(!snapshot.pane.all);
+        assert_eq!(titles(&snapshot), ["Old number"]);
+    }
+
+    // endregion
 }
 
 #[cfg(test)]
