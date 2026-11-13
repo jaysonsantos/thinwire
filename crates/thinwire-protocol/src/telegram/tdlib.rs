@@ -222,6 +222,8 @@ struct LiveInbox {
     ended_elsewhere: bool,
     directory: ChatDirectory,
     names: NameBook,
+    /// The status line of each chat: presence, "bot", and group size.
+    presence: super::presence::Presence,
     /// Chat `ViewChat` last named. A live message there is marked viewed.
     /// History load does not set this: the user can leave that thread.
     open_chat: Option<i64>,
@@ -295,9 +297,70 @@ impl LiveInbox {
         {
             inbox::forget_chat_topics(&mut self.topics, &mut self.topic_lists, chat_id);
         }
+        if let Some(ChatEffect::Remove(id)) = effect.as_ref()
+            && let Some(chat_id) = inbox::parse_telegram_chat_id(id)
+        {
+            self.presence.forget_chat(chat_id);
+        }
         if emit {
             emit_effect(events, effect);
         }
+    }
+
+    /// Send the status lines that changed. An account that is not linked
+    /// sends none: every line goes out when it links.
+    fn publish_status(&self, events: &EventTx, changes: Vec<super::presence::Change>) {
+        if !self.linked() {
+            return;
+        }
+        for (chat_id, status) in changes {
+            emit_chat_status(events, chat_id, status);
+        }
+    }
+}
+
+fn emit_chat_status(events: &EventTx, chat_id: i64, status: Option<crate::ChatStatus>) {
+    let _ = events.send(AdapterEvent::ChatStatus {
+        protocol: ProtocolId::Telegram,
+        conversation_id: inbox::conversation_id(chat_id),
+        status,
+    });
+}
+
+/// The status line of a user. A deleted account and the service account of
+/// Telegram have none.
+fn user_line(user: &tdlib_rs::types::User) -> Option<crate::ChatStatus> {
+    match &user.r#type {
+        tdlib_rs::enums::UserType::Bot(_) => Some(crate::ChatStatus::Bot),
+        tdlib_rs::enums::UserType::Deleted | tdlib_rs::enums::UserType::Unknown => None,
+        tdlib_rs::enums::UserType::Regular if user.is_support => None,
+        tdlib_rs::enums::UserType::Regular => Some(presence_of(&user.status)),
+    }
+}
+
+fn presence_of(status: &tdlib_rs::enums::UserStatus) -> crate::ChatStatus {
+    use tdlib_rs::enums::UserStatus;
+    match status {
+        UserStatus::Online(_) => crate::ChatStatus::Online,
+        UserStatus::Offline(offline) => crate::ChatStatus::LastSeen(i64::from(offline.was_online)),
+        UserStatus::Recently(_) => crate::ChatStatus::Recently,
+        UserStatus::LastWeek(_) => crate::ChatStatus::LastWeek,
+        UserStatus::LastMonth(_) => crate::ChatStatus::LastMonth,
+        UserStatus::Empty => crate::ChatStatus::LongAgo,
+    }
+}
+
+/// What a chat is, for its status line.
+fn status_peer(kind: &tdlib_rs::enums::ChatType) -> super::presence::Peer {
+    use super::presence::Peer;
+    match kind {
+        tdlib_rs::enums::ChatType::Private(chat) => Peer::User(chat.user_id),
+        tdlib_rs::enums::ChatType::Secret(chat) => Peer::User(chat.user_id),
+        tdlib_rs::enums::ChatType::BasicGroup(group) => Peer::BasicGroup(group.basic_group_id),
+        tdlib_rs::enums::ChatType::Supergroup(group) => Peer::Supergroup {
+            id: group.supergroup_id,
+            channel: group.is_channel,
+        },
     }
 }
 
@@ -902,6 +965,7 @@ fn spawn_tdlib_worker(
             ended_elsewhere: false,
             directory: ChatDirectory::new(),
             names: NameBook::new(),
+            presence: super::presence::Presence::default(),
             open_chat: None,
             open_topic: None,
             topics: HashMap::new(),
@@ -1474,6 +1538,8 @@ async fn apply_update(
                 &update.user.first_name,
                 &update.user.last_name,
             );
+            let changes = live.presence.user(update.user.id, user_line(&update.user));
+            live.publish_status(events, changes);
             if let tdlib_rs::enums::UserType::Bot(bot) = &update.user.r#type {
                 let effects = live
                     .directory
@@ -1750,6 +1816,9 @@ async fn apply_authorization(
             for conversation in live.directory.listed() {
                 emit_conversation(events, conversation);
             }
+            for (chat_id, status) in live.presence.current() {
+                emit_chat_status(events, chat_id, Some(status));
+            }
             if !login.open() {
                 return;
             }
@@ -1802,6 +1871,10 @@ async fn apply_chat_update(
             let chat_id = update.chat.id;
             let effect = note_chat(&mut live.directory, &update.chat);
             live.publish(events, emit, effect);
+            let changes = live
+                .presence
+                .note_chat(chat_id, status_peer(&update.chat.r#type));
+            live.publish_status(events, changes);
             let last_read = live.directory.last_read_outbox(chat_id);
             if emit && last_read > 0 {
                 emit_outbox_read(
@@ -2138,6 +2211,35 @@ async fn apply_chat_update(
         }
         tdlib_rs::enums::Update::ChatAction(update) if emit => {
             let _ = events.send(typing_event(&update, &live.names, &live.directory));
+        }
+        tdlib_rs::enums::Update::UserStatus(update) => {
+            let changes = live
+                .presence
+                .user_status(update.user_id, presence_of(&update.status));
+            live.publish_status(events, changes);
+        }
+        tdlib_rs::enums::Update::BasicGroup(update) => {
+            let group = update.basic_group;
+            let changes = live.presence.basic_group(group.id, group.member_count);
+            live.publish_status(events, changes);
+        }
+        tdlib_rs::enums::Update::Supergroup(update) => {
+            let group = update.supergroup;
+            let changes = live.presence.supergroup(group.id, group.member_count);
+            live.publish_status(events, changes);
+        }
+        tdlib_rs::enums::Update::SupergroupFullInfo(update) => {
+            let changes = live.presence.supergroup(
+                update.supergroup_id,
+                update.supergroup_full_info.member_count,
+            );
+            live.publish_status(events, changes);
+        }
+        tdlib_rs::enums::Update::Option(update) if update.name == "my_id" => {
+            if let tdlib_rs::enums::OptionValue::Integer(id) = update.value {
+                let changes = live.presence.set_me(id.value);
+                live.publish_status(events, changes);
+            }
         }
         _ => {}
     }
@@ -4492,6 +4594,7 @@ mod tests {
             ended_elsewhere: false,
             directory: ChatDirectory::new(),
             names: NameBook::new(),
+            presence: crate::telegram::presence::Presence::default(),
             open_chat: Some(42),
             open_topic: None,
             topics: HashMap::new(),

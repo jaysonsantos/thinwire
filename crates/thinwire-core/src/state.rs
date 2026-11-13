@@ -780,6 +780,9 @@ pub struct Snapshot {
     forwarding: Option<ForwardDraft>,
     /// The typing state of this account, and who types in each chat (#510).
     typing: crate::typing::Typing,
+    /// The status line of each chat, from its protocol: presence, "bot",
+    /// or the size of a group.
+    chat_status: HashMap<(ProtocolId, String), thinwire_protocol::ChatStatus>,
     /// Photos and videos attached to a thread and not sent yet, in order.
     attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
     /// Why the last attach skipped files. The tray shows it until the next
@@ -1162,6 +1165,7 @@ impl Snapshot {
             selection: None,
             forwarding: None,
             typing: crate::typing::Typing::default(),
+            chat_status: HashMap::new(),
             attachments: HashMap::new(),
             attachment_note: None,
             rejected_bodies: HashMap::new(),
@@ -1612,6 +1616,17 @@ impl Snapshot {
                 conversation_id,
                 message_id,
             } => self.mark_edited(protocol, &conversation_id, &message_id),
+            AdapterEvent::ChatStatus {
+                protocol,
+                conversation_id,
+                status,
+            } => {
+                let key = (protocol, conversation_id);
+                match status {
+                    Some(status) => self.chat_status.insert(key, status),
+                    None => self.chat_status.remove(&key),
+                };
+            }
             AdapterEvent::Typing {
                 protocol,
                 conversation_id,
@@ -2873,6 +2888,20 @@ impl Snapshot {
             && self
                 .selected_conversation_row()
                 .is_some_and(|row| row.writable)
+    }
+
+    /// What the protocol says about a chat: the presence of the other
+    /// person, "bot", or the size of a group. `None` when the protocol sent
+    /// nothing, or the session ended.
+    #[must_use]
+    pub fn chat_status(
+        &self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+    ) -> Option<thinwire_protocol::ChatStatus> {
+        self.chat_status
+            .get(&(protocol, conversation_id.to_owned()))
+            .copied()
     }
 
     /// Who types in the open thread, as one line: "Ada is typing…". `None`
@@ -6211,6 +6240,8 @@ impl Snapshot {
             .retain(|(owner, _), _| *owner != protocol);
         self.drafts.retain(|(owner, _, _), _| *owner != protocol);
         self.typing.forget(protocol);
+        // A status is true only while the session is live.
+        self.chat_status.retain(|(owner, _), _| *owner != protocol);
         // The files of an ended session do not go to a new one.
         self.attachments
             .retain(|(owner, _, _), _| *owner != protocol);
@@ -6360,6 +6391,7 @@ impl Snapshot {
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
         self.outbox_read.remove(&(protocol, id.to_owned()));
         self.topics.remove(&(protocol, id.to_owned()));
+        self.chat_status.remove(&(protocol, id.to_owned()));
         // Every removed chat loses its draft, selected or not (#43).
         self.drafts
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
@@ -10247,6 +10279,48 @@ mod tests {
         });
         snapshot.select_conversation("telegram:1".into());
         assert_eq!(snapshot.typing_line(), None);
+    }
+
+    /// A chat keeps the status that its protocol sent last. `None`, a removed
+    /// chat, and the end of the session remove it.
+    #[test]
+    fn a_chat_keeps_the_last_status_of_its_protocol() {
+        use thinwire_protocol::ChatStatus;
+        let tg = ProtocolId::Telegram;
+        let status = |chat: &str, status| AdapterEvent::ChatStatus {
+            protocol: tg,
+            conversation_id: chat.into(),
+            status,
+        };
+        let mut snapshot = telegram_chat_with_rows(&[(5, false)]);
+        assert_eq!(snapshot.chat_status(tg, "telegram:1"), None);
+        snapshot.apply(status("telegram:1", Some(ChatStatus::Online)));
+        snapshot.apply(status("telegram:2", Some(ChatStatus::Members(4))));
+        assert_eq!(
+            snapshot.chat_status(tg, "telegram:1"),
+            Some(ChatStatus::Online)
+        );
+        assert_eq!(snapshot.chat_status(ProtocolId::Slack, "telegram:1"), None);
+        snapshot.apply(status("telegram:1", Some(ChatStatus::LastSeen(90))));
+        assert_eq!(
+            snapshot.chat_status(tg, "telegram:1"),
+            Some(ChatStatus::LastSeen(90))
+        );
+        snapshot.apply(status("telegram:1", None));
+        assert_eq!(snapshot.chat_status(tg, "telegram:1"), None);
+
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: tg,
+            id: "telegram:2".into(),
+        });
+        assert_eq!(snapshot.chat_status(tg, "telegram:2"), None);
+
+        snapshot.apply(status("telegram:1", Some(ChatStatus::Online)));
+        snapshot.apply(AdapterEvent::Account {
+            protocol: tg,
+            state: AccountState::Unlinked,
+        });
+        assert_eq!(snapshot.chat_status(tg, "telegram:1"), None);
     }
 
     /// A Telegram chat "Ada" with messages 5, 6, and 7, and a second chat

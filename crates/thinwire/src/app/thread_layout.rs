@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone};
 use thinwire_protocol::ChatMessage;
+use thinwire_protocol::ChatStatus;
 
 /// Days back that the chat list shows as a weekday name.
 const WEEKDAY_WINDOW_DAYS: i64 = 6;
@@ -104,6 +105,69 @@ where
         _ if day.year() == today.year() => local.format("%-d %b").to_string(),
         _ => local.format("%-d %b %Y").to_string(),
     }
+}
+
+/// The status line under the name of a chat: "online", "last seen at
+/// 13:38", "bot", "4 members".
+#[must_use]
+pub(crate) fn status_line<Tz: TimeZone>(status: ChatStatus, now: &DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    match status {
+        ChatStatus::Online => "online".into(),
+        ChatStatus::LastSeen(at) => last_seen(at, now),
+        ChatStatus::Recently => "last seen recently".into(),
+        ChatStatus::LastWeek => "last seen in the last week".into(),
+        ChatStatus::LastMonth => "last seen in the last month".into(),
+        ChatStatus::LongAgo => "last seen a long time ago".into(),
+        ChatStatus::Bot => "bot".into(),
+        ChatStatus::Members(count) => counted(count, "member", "members"),
+        ChatStatus::Subscribers(count) => counted(count, "subscriber", "subscribers"),
+    }
+}
+
+fn last_seen<Tz: TimeZone>(at: i64, now: &DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let Some(local) = local_time(&now.timezone(), at) else {
+        return "last seen recently".into();
+    };
+    let day = local.date_naive();
+    let today = now.date_naive();
+    let time = local.format("%H:%M");
+    match (today - day).num_days() {
+        0 => {
+            let minutes = (now.timestamp() - at).max(0) / 60;
+            match minutes {
+                0 => "last seen just now".into(),
+                1 => "last seen 1 minute ago".into(),
+                2..=59 => format!("last seen {minutes} minutes ago"),
+                _ => format!("last seen at {time}"),
+            }
+        }
+        1 => format!("last seen yesterday at {time}"),
+        2..=WEEKDAY_WINDOW_DAYS => format!("last seen {} at {time}", local.format("%A")),
+        _ if day.year() == today.year() => format!("last seen {}", local.format("%-d %b")),
+        _ => format!("last seen {}", local.format("%-d %b %Y")),
+    }
+}
+
+/// "1 member", "1,204 members".
+fn counted(count: u32, one: &str, many: &str) -> String {
+    if count == 1 {
+        return format!("1 {one}");
+    }
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    format!("{grouped} {many}")
 }
 
 fn local_time<Tz: TimeZone>(zone: &Tz, at: i64) -> Option<DateTime<Tz>> {
@@ -285,5 +349,48 @@ mod tests {
         assert_eq!(list_time(NOON - 30 * DAY, &now), "24 Aug");
         assert_eq!(list_time(NOON - 400 * DAY, &now), "19 Aug 2025");
         assert_eq!(list_time(0, &now), "");
+    }
+
+    #[test]
+    fn a_status_line_says_the_presence_in_words() {
+        const MINUTE: i64 = 60;
+        let now = FixedOffset::east_opt(0)
+            .unwrap()
+            .timestamp_opt(NOON, 0)
+            .unwrap();
+        let line = |status| status_line(status, &now);
+        assert_eq!(line(ChatStatus::Online), "online");
+        assert_eq!(line(ChatStatus::LastSeen(NOON - 20)), "last seen just now");
+        assert_eq!(
+            line(ChatStatus::LastSeen(NOON - MINUTE)),
+            "last seen 1 minute ago"
+        );
+        assert_eq!(
+            line(ChatStatus::LastSeen(NOON - 42 * MINUTE)),
+            "last seen 42 minutes ago"
+        );
+        assert_eq!(
+            line(ChatStatus::LastSeen(NOON - 2 * HOUR)),
+            "last seen at 10:00"
+        );
+        assert_eq!(
+            line(ChatStatus::LastSeen(NOON - DAY)),
+            "last seen yesterday at 12:00"
+        );
+        assert!(line(ChatStatus::LastSeen(NOON - 3 * DAY)).ends_with("day at 12:00"));
+        // A time that is not valid still gives a line.
+        assert_eq!(line(ChatStatus::LastSeen(0)), "last seen recently");
+        // A clock that is behind the server does not show a negative time.
+        assert_eq!(line(ChatStatus::LastSeen(NOON + 30)), "last seen just now");
+        assert_eq!(line(ChatStatus::Recently), "last seen recently");
+        assert_eq!(line(ChatStatus::LongAgo), "last seen a long time ago");
+        assert_eq!(line(ChatStatus::Bot), "bot");
+        assert_eq!(line(ChatStatus::Members(1)), "1 member");
+        assert_eq!(line(ChatStatus::Members(999)), "999 members");
+        assert_eq!(line(ChatStatus::Members(1204)), "1,204 members");
+        assert_eq!(
+            line(ChatStatus::Subscribers(1_200_300)),
+            "1,200,300 subscribers"
+        );
     }
 }

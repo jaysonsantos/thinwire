@@ -114,6 +114,13 @@ pub(crate) fn dialog(ctx: &egui::Context, snapshot: &View<'_>, out: &mut Vec<Int
                     .text_style(theme::secondary())
                     .color(palette.text2),
             );
+            if let Some(status) = snapshot.chat_status(conversation.protocol, &conversation.id) {
+                ui.label(
+                    RichText::new(super::ui::view_status_line(status, snapshot.now()))
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                );
+            }
         });
         ui.add_space(space::M);
         ui.label(RichText::new(mute_line(mute, conversation.protocol)).color(palette.text2));

@@ -17,6 +17,8 @@ mod router;
 #[cfg(feature = "telegram-tdlib")]
 mod media_map;
 #[cfg(feature = "telegram-tdlib")]
+mod presence;
+#[cfg(feature = "telegram-tdlib")]
 mod tdlib;
 
 use std::fmt;

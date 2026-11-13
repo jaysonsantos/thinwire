@@ -1535,6 +1535,14 @@ fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>
 }
 
 /// The chat-list time of `at`, in the zone of the view's clock (#120).
+/// The status line of a chat in the zone of the view.
+pub(super) fn view_status_line(status: thinwire_protocol::ChatStatus, now: ViewNow) -> String {
+    match now {
+        ViewNow::Local(now) => super::thread_layout::status_line(status, &now),
+        ViewNow::Fixed(now) => super::thread_layout::status_line(status, &now),
+    }
+}
+
 fn view_list_time(at: i64, now: ViewNow) -> String {
     match now {
         ViewNow::Local(now) => list_time(at, &now),
@@ -3498,6 +3506,11 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
             } else {
                 conversation.protocol.label()
             };
+            // The status of the protocol takes the place of that line: the
+            // presence of the person, or the size of the group.
+            let status = snapshot.chat_status(conversation.protocol, &conversation.id);
+            let online = status == Some(thinwire_protocol::ChatStatus::Online);
+            let kind = status.map_or(kind, |status| view_status_line(status, snapshot.now()));
             // The left side pushes here: the right side holds `out`.
             let mut avatar_out = Vec::new();
             egui::Sides::new().shrink_left().truncate().show(
@@ -3606,7 +3619,7 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                         ui.label(
                             RichText::new(kind)
                                 .text_style(theme::secondary())
-                                .color(palette.text3),
+                                .color(if online { palette.link } else { palette.text3 }),
                         );
                     });
                 },

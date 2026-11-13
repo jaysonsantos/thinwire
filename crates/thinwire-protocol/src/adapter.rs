@@ -1183,6 +1183,13 @@ pub enum AdapterEvent {
         sender: String,
         typing: bool,
     },
+    /// The status line of a chat changed: the presence of the other person
+    /// of a one-to-one chat, or the size of a group. `None` removes the line.
+    ChatStatus {
+        protocol: ProtocolId,
+        conversation_id: String,
+        status: Option<ChatStatus>,
+    },
     /// A request for older messages ended. The older messages came before this
     /// event as `MessageReceived`. `more == false` means the start of the chat
     /// (or no more can load now): the UI stops asking.
@@ -1306,6 +1313,7 @@ impl AdapterEvent {
             | Self::OutboxRead { protocol, .. }
             | Self::ChatListLoaded { protocol }
             | Self::Typing { protocol, .. }
+            | Self::ChatStatus { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::Helper { protocol, .. } => {
@@ -1384,6 +1392,7 @@ impl AdapterEvent {
             | Self::OutboxRead { protocol, .. }
             | Self::ChatListLoaded { protocol }
             | Self::Typing { protocol, .. }
+            | Self::ChatStatus { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. } => Some(*protocol),
             _ => None,
@@ -1487,6 +1496,30 @@ pub struct Conversation {
     /// Inbox avatar. Telegram sets the small photo and the accent.
     /// Other protocols leave the photo empty.
     pub avatar: crate::media::ChatAvatar,
+}
+
+/// What shows under the name of an open chat. A protocol sends only what
+/// its service tells this account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatStatus {
+    /// The person is online now.
+    Online,
+    /// The person was online at this time (Unix seconds).
+    LastSeen(i64),
+    /// The service hides the exact time: some days at most.
+    Recently,
+    /// The service hides the exact time: one week at most.
+    LastWeek,
+    /// The service hides the exact time: one month at most.
+    LastMonth,
+    /// The person was not online for a long time, or never.
+    LongAgo,
+    /// The other side is a bot.
+    Bot,
+    /// The number of members of a group.
+    Members(u32),
+    /// The number of subscribers of a channel.
+    Subscribers(u32),
 }
 
 /// One topic inside a forum or a bot chat.

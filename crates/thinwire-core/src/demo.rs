@@ -930,6 +930,17 @@ fn showcase_telegram() -> DemoScript {
         .collect();
     let mut script = telegram_linked(rows);
     script.history.insert(BOOK_CLUB.into(), showcase_thread());
+    // The line under the name of a chat.
+    for (chat, status) in [
+        (BOOK_CLUB, thinwire_protocol::ChatStatus::Members(6)),
+        (ADA, thinwire_protocol::ChatStatus::Online),
+    ] {
+        script.start.push(AdapterEvent::ChatStatus {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat.into(),
+            status: Some(status),
+        });
+    }
     script
 }
 
