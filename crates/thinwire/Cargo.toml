@@ -108,7 +108,7 @@ serde_json.workspace = true
 base64 = "0.22"
 # The update check reads the nightly release on every OS. Only macOS
 # downloads and installs an update.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+ureq = { version = "3", default-features = false, features = ["tls"] }
 quick-xml = "0.38"
 tar = "0.4"
 flate2 = { version = "1.1.11", default-features = false, features = [
