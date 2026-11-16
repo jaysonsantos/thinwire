@@ -43,6 +43,11 @@ impl Presence {
         self.refresh(|peer| peer == Peer::User(user_id))
     }
 
+    /// The user id of this account, when TDLib sent it.
+    pub(super) fn me(&self) -> Option<i64> {
+        self.me
+    }
+
     /// A chat that TDLib named. Its status goes out when one is known.
     pub(super) fn note_chat(&mut self, chat_id: i64, peer: Peer) -> Vec<Change> {
         self.peers.insert(chat_id, peer);

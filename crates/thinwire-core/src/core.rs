@@ -1001,6 +1001,7 @@ impl Core {
                     self.state
                         .send_typing(protocol, &conversation_id, topic, Instant::now());
                 }
+                self.state.ask_members(protocol, &conversation_id, topic);
             }
             Intent::AddAttachments {
                 protocol,
@@ -4741,6 +4742,50 @@ mod tests {
         core.dispatch(draft("Hi"));
         core.dispatch(draft(""));
         assert_eq!(typing(), []);
+    }
+
+    /// The first "@" in the draft of an open group asks the adapter for the
+    /// people of the chat, one time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_at_sign_in_a_group_draft_asks_the_adapter_for_the_members() {
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut group = telegram_chat(1, "Book club", 10);
+        group.is_group = true;
+        core.state.apply(AdapterEvent::ConversationUpsert {
+            conversation: group,
+        });
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        let draft = |text: &str| Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: text.into(),
+            topic: None,
+        };
+        let mut asked = move || {
+            let mut chats = Vec::new();
+            while let Ok(command) = sent.try_recv() {
+                if let AdapterCommand::LoadMembers {
+                    conversation_id, ..
+                } = command
+                {
+                    chats.push(conversation_id);
+                }
+            }
+            chats
+        };
+        core.dispatch(draft("hi"));
+        assert!(asked().is_empty(), "no @");
+        core.dispatch(draft("hi @"));
+        assert_eq!(asked(), ["telegram:1".to_string()]);
+        core.dispatch(draft("hi @a"));
+        assert!(asked().is_empty(), "one request for each chat");
     }
 
     /// PR #48 review (P1): a send named for chat A after a click on chat B

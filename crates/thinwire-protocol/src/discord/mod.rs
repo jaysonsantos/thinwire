@@ -114,6 +114,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // The bot shows that it types. A member who types does not show yet: it
     // needs the gateway (#487, #526).
     typing: cfg!(feature = "discord-bot"),
+    mentions: false,
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.

@@ -80,6 +80,10 @@ pub(super) enum TdlibCommand {
         topic: Option<MessageTopic>,
         typing: bool,
     },
+    /// Ask for the people of one group, for the name completion after "@".
+    LoadMembers {
+        conversation_id: String,
+    },
     Resend {
         conversation_id: String,
         message_id: String,
@@ -171,6 +175,7 @@ impl TdlibCommand {
             Self::EditMessage { .. } => "edit_message",
             Self::ForwardMessages { .. } => "forward_messages",
             Self::SetTyping { .. } => "set_typing",
+            Self::LoadMembers { .. } => "load_members",
             Self::Resend { .. } => "resend",
             Self::LoadOlder { .. } => "load_older",
             Self::OpenTopic { .. } => "open_topic",
@@ -224,6 +229,9 @@ struct LiveInbox {
     names: NameBook,
     /// The status line of each chat: presence, "bot", and group size.
     presence: super::presence::Presence,
+    /// The people with no username of each group whose members loaded. A
+    /// send reads it, so "@" and a name becomes a text mention.
+    members: Arc<Mutex<super::members::MemberBook>>,
     /// Chat `ViewChat` last named. A live message there is marked viewed.
     /// History load does not set this: the user can leave that thread.
     open_chat: Option<i64>,
@@ -966,6 +974,7 @@ fn spawn_tdlib_worker(
             directory: ChatDirectory::new(),
             names: NameBook::new(),
             presence: super::presence::Presence::default(),
+            members: Arc::default(),
             open_chat: None,
             open_topic: None,
             topics: HashMap::new(),
@@ -1164,6 +1173,7 @@ fn spawn_tdlib_worker(
                                 &message_id,
                                 &body,
                                 live.linked(),
+                                &live.members,
                                 &events,
                             )
                             .await;
@@ -1194,6 +1204,22 @@ fn spawn_tdlib_worker(
                                     typing_target(&conversation_id, topic)
                             {
                                 tokio::spawn(send_typing(client_id, chat_id, topic, typing));
+                            }
+                        }
+                        TdlibCommand::LoadMembers { conversation_id } => {
+                            // The list is 200 local reads after one request:
+                            // it does not wait in this loop.
+                            if live.linked()
+                                && let Some(chat_id) =
+                                    inbox::parse_telegram_chat_id(&conversation_id)
+                            {
+                                tokio::spawn(load_members(
+                                    client_id,
+                                    chat_id,
+                                    live.presence.me(),
+                                    Arc::clone(&live.members),
+                                    events.clone(),
+                                ));
                             }
                         }
                         TdlibCommand::React {
@@ -2283,6 +2309,117 @@ async fn send_typing(
     }
 }
 
+/// The people of one group, for the name completion after "@":
+/// `searchChatMembers` with no query, then each user from the TDLib cache.
+/// A second request asks for the bots, so a bot of a group with more than
+/// 200 people is in the list too. This account, a deleted account, and a
+/// person who left are not in the list. A person with no username whose
+/// name another person has is not in the list (`clear_mentions`). A group
+/// that hides its members gives an empty list. No name or id goes to the
+/// log.
+async fn load_members(
+    client_id: i32,
+    chat_id: i64,
+    me: Option<i64>,
+    book: Arc<Mutex<super::members::MemberBook>>,
+    events: EventTx,
+) {
+    use tdlib_rs::enums::{ChatMemberStatus, ChatMembersFilter, MessageSender, UserType};
+    let mut found = Vec::new();
+    for filter in [None, Some(ChatMembersFilter::Bots)] {
+        match tdlib_rs::functions::search_chat_members(
+            chat_id,
+            String::new(),
+            super::members::MEMBER_LIMIT,
+            filter,
+            client_id,
+        )
+        .await
+        {
+            Ok(tdlib_rs::enums::ChatMembers::ChatMembers(page)) => found.extend(page.members),
+            Err(error) => log_tdlib_error("searchChatMembers", &error),
+        }
+    }
+    let mut people = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for member in found {
+        let MessageSender::User(sender) = member.member_id else {
+            continue;
+        };
+        if Some(sender.user_id) == me
+            || !seen.insert(sender.user_id)
+            || matches!(
+                member.status,
+                ChatMemberStatus::Left | ChatMemberStatus::Banned(_)
+            )
+        {
+            continue;
+        }
+        let Ok(tdlib_rs::enums::User::User(user)) =
+            tdlib_rs::functions::get_user(sender.user_id, client_id).await
+        else {
+            continue;
+        };
+        if matches!(user.r#type, UserType::Deleted | UserType::Unknown) {
+            continue;
+        }
+        let username = user
+            .usernames
+            .as_ref()
+            .and_then(|names| names.active_usernames.first())
+            .map(String::as_str);
+        let Some(person) = super::members::member(&user.first_name, &user.last_name, username)
+        else {
+            continue;
+        };
+        people.push((person, user.id));
+    }
+    let mut members = Vec::new();
+    let mut named = Vec::new();
+    for (person, user_id) in super::members::clear_mentions(people) {
+        if person.handle.is_none() {
+            named.push((person.mention(), user_id));
+        }
+        members.push(person);
+    }
+    book.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set(chat_id, named);
+    let _ = events.send(AdapterEvent::ChatMembers {
+        protocol: ProtocolId::Telegram,
+        conversation_id: inbox::conversation_id(chat_id),
+        members,
+    });
+}
+
+/// The text of a send, of a caption, or of an edit, with a text mention on
+/// each "@" and name of a group member who has no username.
+fn mention_text(
+    members: &Mutex<super::members::MemberBook>,
+    chat_id: i64,
+    text: &str,
+) -> tdlib_rs::types::FormattedText {
+    let mentions = members
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .mentions(chat_id, text);
+    tdlib_rs::types::FormattedText {
+        text: text.to_string(),
+        entities: mentions
+            .into_iter()
+            .map(|mention| tdlib_rs::types::TextEntity {
+                offset: mention.offset,
+                length: mention.length,
+                r#type: tdlib_rs::enums::TextEntityType::MentionName(
+                    tdlib_rs::types::TextEntityTypeMentionName {
+                        user_id: mention.user_id,
+                    },
+                ),
+            })
+            .collect(),
+    }
+}
+
 /// The `Typing` event of a TDLib chat action. Only "typing a message"
 /// counts. Another action (a voice note, a photo upload) or Cancel ends the
 /// typing state of that person.
@@ -3301,20 +3438,13 @@ async fn fetch_older_page(
 /// size itself. The caption goes on the first file of a message.
 fn media_content(
     file: &crate::media::OutgoingFile,
-    caption: Option<&str>,
+    caption: Option<tdlib_rs::types::FormattedText>,
 ) -> tdlib_rs::enums::InputMessageContent {
     use tdlib_rs::enums::{InputFile, InputMessageContent};
-    use tdlib_rs::types::{FormattedText, InputFileLocal, InputMessagePhoto, InputMessageVideo};
+    use tdlib_rs::types::{InputFileLocal, InputMessagePhoto, InputMessageVideo};
     let input = InputFile::Local(InputFileLocal {
         path: file.path.to_string_lossy().into_owned(),
     });
-    let caption = caption
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(|text| FormattedText {
-            text: text.to_owned(),
-            entities: Vec::new(),
-        });
     match file.kind {
         crate::media::MediaKind::Photo => {
             InputMessageContent::InputMessagePhoto(InputMessagePhoto {
@@ -3376,11 +3506,14 @@ async fn send_media(
         return;
     };
     let mut accepted = false;
-    for (index, batch) in files.chunks(crate::media::FILES_PER_MESSAGE).enumerate() {
+    // The caption goes on the first file, with its text mentions.
+    let mut caption = Some(caption.trim())
+        .filter(|text| !text.is_empty())
+        .map(|text| mention_text(&live.members, chat_id, text));
+    for batch in files.chunks(crate::media::FILES_PER_MESSAGE) {
         let contents: Vec<_> = batch
             .iter()
-            .enumerate()
-            .map(|(at, file)| media_content(file, (index == 0 && at == 0).then_some(caption)))
+            .map(|file| media_content(file, caption.take()))
             .collect();
         let sent: Result<Vec<tdlib_rs::types::Message>, tdlib_rs::types::Error> =
             if let [content] = contents.as_slice() {
@@ -3631,6 +3764,7 @@ async fn edit_message(
     message_id: &str,
     body: &str,
     emit: bool,
+    members: &Mutex<super::members::MemberBook>,
     events: &EventTx,
 ) {
     let Some((chat_id, id)) = inbox::parse_message_id(message_id) else {
@@ -3664,10 +3798,7 @@ async fn edit_message(
     }
     let content =
         tdlib_rs::enums::InputMessageContent::InputMessageText(tdlib_rs::types::InputMessageText {
-            text: tdlib_rs::types::FormattedText {
-                text: text.to_string(),
-                entities: Vec::new(),
-            },
+            text: mention_text(members, chat_id, text),
             link_preview_options: None,
             clear_draft: false,
         });
@@ -3765,10 +3896,7 @@ async fn send_text(
     }
     let content =
         tdlib_rs::enums::InputMessageContent::InputMessageText(tdlib_rs::types::InputMessageText {
-            text: tdlib_rs::types::FormattedText {
-                text: text.to_string(),
-                entities: Vec::new(),
-            },
+            text: mention_text(&live.members, chat_id, text),
             link_preview_options: None,
             clear_draft: true,
         });
@@ -4573,6 +4701,31 @@ mod tests {
         })
     }
 
+    /// A send names a member with no username by a text mention with the
+    /// user id. Another text has no entity: Telegram finds "@username".
+    #[test]
+    fn a_sent_name_of_a_member_with_no_username_is_a_text_mention() {
+        let members = Mutex::new(crate::telegram::members::MemberBook::default());
+        members
+            .lock()
+            .expect("book")
+            .set(42, vec![("@Nora Silva".into(), 7)]);
+        let text = mention_text(&members, 42, "hi @Nora Silva and @milo");
+        assert_eq!(text.text, "hi @Nora Silva and @milo");
+        assert_eq!(text.entities.len(), 1);
+        let entity = &text.entities[0];
+        assert_eq!((entity.offset, entity.length), (3, 11));
+        assert!(matches!(
+            &entity.r#type,
+            tdlib_rs::enums::TextEntityType::MentionName(mention) if mention.user_id == 7
+        ));
+        assert!(
+            mention_text(&members, 43, "hi @Nora Silva")
+                .entities
+                .is_empty()
+        );
+    }
+
     #[test]
     fn a_message_after_closing_starts_is_not_marked_viewed() {
         let mut runtime = TdlibRuntime::new();
@@ -4593,6 +4746,7 @@ mod tests {
             directory: ChatDirectory::new(),
             names: NameBook::new(),
             presence: crate::telegram::presence::Presence::default(),
+            members: Arc::default(),
             open_chat: Some(42),
             open_topic: None,
             topics: HashMap::new(),

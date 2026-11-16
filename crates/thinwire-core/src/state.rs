@@ -794,6 +794,11 @@ pub struct Snapshot {
     /// The status line of each chat, from its protocol: presence, "bot",
     /// or the size of a group.
     chat_status: HashMap<(ProtocolId, String), thinwire_protocol::ChatStatus>,
+    /// The people of each group chat whose protocol sent them, for the name
+    /// completion after "@" in the compose field.
+    chat_members: HashMap<(ProtocolId, String), Vec<thinwire_protocol::ChatMember>>,
+    /// The chats whose people this session already asked for.
+    members_asked: HashSet<(ProtocolId, String)>,
     /// Photos and videos attached to a thread and not sent yet, in order.
     attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
     /// Why the last attach skipped files. The tray shows it until the next
@@ -1177,6 +1182,8 @@ impl Snapshot {
             forwarding: None,
             typing: crate::typing::Typing::default(),
             chat_status: HashMap::new(),
+            chat_members: HashMap::new(),
+            members_asked: HashSet::new(),
             attachments: HashMap::new(),
             attachment_note: None,
             rejected_bodies: HashMap::new(),
@@ -1637,6 +1644,14 @@ impl Snapshot {
                     Some(status) => self.chat_status.insert(key, status),
                     None => self.chat_status.remove(&key),
                 };
+            }
+            AdapterEvent::ChatMembers {
+                protocol,
+                conversation_id,
+                members,
+            } => {
+                self.chat_members
+                    .insert((protocol, conversation_id), members);
             }
             AdapterEvent::Typing {
                 protocol,
@@ -3066,6 +3081,49 @@ impl Snapshot {
         self.chat_status
             .get(&(protocol, conversation_id.to_owned()))
             .copied()
+    }
+
+    /// The people of a group chat, for the name completion after "@" in the
+    /// compose field. Empty when the protocol sent none, or the session
+    /// ended.
+    #[must_use]
+    pub fn chat_members(
+        &self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+    ) -> &[thinwire_protocol::ChatMember] {
+        self.chat_members
+            .get(&(protocol, conversation_id.to_owned()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The draft of the open thread changed: when it has an "@", ask the
+    /// protocol for the people of the chat. One request goes out for each
+    /// chat in each session. Nothing goes out for another thread, for a
+    /// one-to-one chat, or for a protocol with no name completion.
+    pub fn ask_members(&mut self, protocol: ProtocolId, chat: &str, topic: Option<MessageTopic>) {
+        if !self.is_selected_thread(protocol, chat, topic) || !self.pane.compose.contains('@') {
+            return;
+        }
+        let key = (protocol, chat.to_owned());
+        if self.chat_members.contains_key(&key) || self.members_asked.contains(&key) {
+            return;
+        }
+        let mentions = self
+            .accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked() && row.caps.mentions);
+        let group = self
+            .selected_conversation_row()
+            .is_some_and(|row| row.is_group);
+        if !mentions || !group {
+            return;
+        }
+        self.members_asked.insert(key);
+        self.push(AdapterCommand::LoadMembers {
+            protocol,
+            conversation_id: chat.to_owned(),
+        });
     }
 
     /// Who types in the open thread, as one line: "Ada is typing…". `None`
@@ -6480,6 +6538,9 @@ impl Snapshot {
         self.typing.forget(protocol);
         // A status is true only while the session is live.
         self.chat_status.retain(|(owner, _), _| *owner != protocol);
+        // A new session asks for the people of a chat again.
+        self.chat_members.retain(|(owner, _), _| *owner != protocol);
+        self.members_asked.retain(|(owner, _)| *owner != protocol);
         // The files of an ended session do not go to a new one.
         self.attachments
             .retain(|(owner, _, _), _| *owner != protocol);
@@ -6635,6 +6696,8 @@ impl Snapshot {
         self.outbox_read.remove(&(protocol, id.to_owned()));
         self.topics.remove(&(protocol, id.to_owned()));
         self.chat_status.remove(&(protocol, id.to_owned()));
+        self.chat_members.remove(&(protocol, id.to_owned()));
+        self.members_asked.remove(&(protocol, id.to_owned()));
         // Every removed chat loses its draft, selected or not (#43).
         self.drafts
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
@@ -10562,6 +10625,84 @@ mod tests {
             state: AccountState::Unlinked,
         });
         assert_eq!(snapshot.chat_status(tg, "telegram:1"), None);
+    }
+
+    /// The first "@" in the draft of a group asks for its people, one time
+    /// for each session. A removed chat and the end of the session drop the
+    /// list.
+    #[test]
+    fn an_at_sign_in_a_group_draft_asks_for_the_members_one_time() {
+        use thinwire_protocol::ChatMember;
+        let tg = ProtocolId::Telegram;
+        let chat = "telegram:1";
+        let asked = |snapshot: &mut Snapshot| {
+            snapshot
+                .take_commands()
+                .into_iter()
+                .filter(|command| matches!(command, AdapterCommand::LoadMembers { .. }))
+                .count()
+        };
+        let type_text = |snapshot: &mut Snapshot, text: &str| {
+            snapshot.set_draft(tg, chat, None, text.into());
+            snapshot.ask_members(tg, chat, None);
+            asked(snapshot)
+        };
+        let mut snapshot = telegram_chat_with_rows(&[(5, false)]);
+        // A one-to-one chat has no list.
+        assert_eq!(type_text(&mut snapshot, "@a"), 0);
+        for row in snapshot.conversations.get_mut(&tg).expect("telegram chats") {
+            row.is_group = true;
+        }
+        assert_eq!(type_text(&mut snapshot, "hello"), 0, "no @");
+        assert_eq!(type_text(&mut snapshot, "hello @"), 1);
+        assert_eq!(type_text(&mut snapshot, "hello @a"), 0, "asked already");
+        // A topic of the chat has the list of the chat: it asks nothing more.
+        let topic = Some(MessageTopic::Forum(4));
+        snapshot.pane.topic = topic;
+        snapshot.set_draft(tg, chat, topic, "@".into());
+        snapshot.ask_members(tg, chat, topic);
+        assert_eq!(asked(&mut snapshot), 0, "one list for the chat");
+        snapshot.members_asked.clear();
+        snapshot.ask_members(tg, chat, topic);
+        assert_eq!(asked(&mut snapshot), 1, "a topic asks for the chat");
+        snapshot.pane.topic = None;
+        snapshot.set_draft(tg, chat, None, "hello @a".into());
+        // The draft of another thread asks nothing.
+        snapshot.set_draft(tg, "telegram:2", None, "@".into());
+        snapshot.ask_members(tg, "telegram:2", None);
+        assert_eq!(asked(&mut snapshot), 0);
+
+        assert!(snapshot.chat_members(tg, chat).is_empty());
+        let ada = ChatMember {
+            name: "Ada".into(),
+            handle: Some("ada".into()),
+        };
+        snapshot.apply(AdapterEvent::ChatMembers {
+            protocol: tg,
+            conversation_id: chat.into(),
+            members: vec![ada.clone()],
+        });
+        assert_eq!(snapshot.chat_members(tg, chat), [ada]);
+        assert!(snapshot.chat_members(ProtocolId::Slack, chat).is_empty());
+
+        // The end of the session drops the list, and the next "@" asks again.
+        snapshot.apply(AdapterEvent::Account {
+            protocol: tg,
+            state: AccountState::Unlinked,
+        });
+        assert!(snapshot.chat_members(tg, chat).is_empty());
+        assert!(!snapshot.members_asked.contains(&(tg, chat.to_owned())));
+
+        snapshot.apply(AdapterEvent::ChatMembers {
+            protocol: tg,
+            conversation_id: chat.into(),
+            members: Vec::new(),
+        });
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: tg,
+            id: chat.into(),
+        });
+        assert!(!snapshot.chat_members.contains_key(&(tg, chat.to_owned())));
     }
 
     /// A Telegram chat "Ada" with messages 5, 6, and 7, and a second chat

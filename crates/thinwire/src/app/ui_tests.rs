@@ -51,8 +51,26 @@ fn compose_ui_uses_enter_multiline_and_disabled_send() {
     let ui = include_str!("ui.rs");
     let compose = &ui[ui.find("fn compose(").expect("compose")..];
     let compose = &compose[..compose.find("\nfn ").expect("next")];
-    assert!(compose.contains("edited(ui, &snapshot.pane.compose"));
+    // The field shows the draft of the core, or the text with a completed
+    // mention in the frame of the completion.
+    assert!(
+        compose.contains(
+            "let compose_text = mention.text.as_deref().unwrap_or(&snapshot.pane.compose);"
+        )
+    );
+    assert!(compose.contains("edited(ui, compose_text"));
     assert!(compose.contains("TextEdit::multiline(text)"));
+    // The mention list takes Enter before the send, and only for the pane
+    // with the focus.
+    let mention = compose
+        .find("super::mention::show(ui, snapshot, compose_id, anchor)")
+        .expect("mention list");
+    let send = compose
+        .find("if enter && !other && !shift && compose_open {")
+        .expect("send");
+    assert!(mention < send, "the list reads Enter first");
+    assert!(compose.contains("if compose_open && !hints.passive {"));
+    assert!(compose.contains(".event_filter(mention.event_filter())"));
     // Plain Enter sends and is eaten, so the field does not also add a line.
     // Shift+Enter misses this branch. A closed topic or a removed Signal
     // device sets compose_open false, so Enter does not send and Send is off.

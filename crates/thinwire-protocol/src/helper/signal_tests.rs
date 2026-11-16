@@ -62,6 +62,7 @@ const fn caps(protocol: ProtocolId) -> ProtocolCapabilities {
         sends_media: true,
         message_actions: crate::MessageActions::NONE,
         typing: false,
+        mentions: false,
     }
 }
 

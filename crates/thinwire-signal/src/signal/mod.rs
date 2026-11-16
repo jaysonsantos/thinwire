@@ -67,6 +67,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_media: cfg!(feature = "signal-local"),
     message_actions: thinwire_protocol::MessageActions::NONE,
     typing: false,
+    mentions: false,
 };
 
 const NOTICE_REQUIRED: &str =

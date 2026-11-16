@@ -262,6 +262,9 @@ pub struct ProtocolCapabilities {
     pub message_actions: MessageActions,
     /// The adapter answers `SetTyping` and sends `Typing` events (#510).
     pub typing: bool,
+    /// The adapter answers `LoadMembers` with `ChatMembers`. The compose
+    /// field completes a name after "@" only for such a protocol.
+    pub mentions: bool,
 }
 
 /// What a user can do with one message, by protocol. The message menu shows
@@ -791,6 +794,12 @@ pub enum AdapterCommand {
         topic: Option<MessageTopic>,
         typing: bool,
     },
+    /// Ask for the people of one group chat, for the name completion after
+    /// "@" in the compose field. The adapter answers with `ChatMembers`.
+    LoadMembers {
+        protocol: ProtocolId,
+        conversation_id: String,
+    },
 }
 
 impl AdapterCommand {
@@ -824,6 +833,7 @@ impl AdapterCommand {
             | Self::EditMessage { protocol, .. }
             | Self::ForwardMessages { protocol, .. }
             | Self::SetTyping { protocol, .. }
+            | Self::LoadMembers { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
@@ -895,6 +905,7 @@ impl AdapterCommand {
             | Self::EditMessage { protocol, .. }
             | Self::ForwardMessages { protocol, .. }
             | Self::SetTyping { protocol, .. }
+            | Self::LoadMembers { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;
                 true
@@ -1190,6 +1201,13 @@ pub enum AdapterEvent {
         conversation_id: String,
         status: Option<ChatStatus>,
     },
+    /// The people of one group chat, as the answer to `LoadMembers`. An
+    /// empty list means that the service gave none.
+    ChatMembers {
+        protocol: ProtocolId,
+        conversation_id: String,
+        members: Vec<ChatMember>,
+    },
     /// A request for older messages ended. The older messages came before this
     /// event as `MessageReceived`. `more == false` means the start of the chat
     /// (or no more can load now): the UI stops asking.
@@ -1314,6 +1332,7 @@ impl AdapterEvent {
             | Self::ChatListLoaded { protocol }
             | Self::Typing { protocol, .. }
             | Self::ChatStatus { protocol, .. }
+            | Self::ChatMembers { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::Helper { protocol, .. } => {
@@ -1393,6 +1412,7 @@ impl AdapterEvent {
             | Self::ChatListLoaded { protocol }
             | Self::Typing { protocol, .. }
             | Self::ChatStatus { protocol, .. }
+            | Self::ChatMembers { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. } => Some(*protocol),
             _ => None,
@@ -1520,6 +1540,27 @@ pub enum ChatStatus {
     Members(u32),
     /// The number of subscribers of a channel.
     Subscribers(u32),
+}
+
+/// One person of a group chat, for the name completion after "@" in the
+/// compose field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMember {
+    /// The name to show.
+    pub name: String,
+    /// The public handle of the person, with no "@". `None` when the person
+    /// has none.
+    pub handle: Option<String>,
+}
+
+impl ChatMember {
+    /// The text that mentions this person in a message: "@" and the handle,
+    /// or "@" and the name for a person with no handle. The adapter makes a
+    /// mention with a name notify the person when it sends the message.
+    #[must_use]
+    pub fn mention(&self) -> String {
+        format!("@{}", self.handle.as_deref().unwrap_or(&self.name))
+    }
 }
 
 /// One topic inside a forum or a bot chat.

@@ -571,7 +571,30 @@ fn telegram_linked(rows: Vec<Conversation>) -> DemoScript {
     script.history.insert(BOOK_CLUB.into(), group_chat());
     script.history.insert(MILO.into(), two_person_chat(MILO, 6));
     script.history.insert(NORA.into(), two_person_chat(NORA, 3));
+    // The people of the group, for the name completion after "@".
+    script.start.push(AdapterEvent::ChatMembers {
+        protocol: ProtocolId::Telegram,
+        conversation_id: BOOK_CLUB.into(),
+        members: book_club_members(),
+    });
     script
+}
+
+/// The other people of the book club. Nora has no username.
+fn book_club_members() -> Vec<thinwire_protocol::ChatMember> {
+    [
+        ("Ada Park", Some("ada_park")),
+        ("Milo Chen", Some("milo")),
+        ("Nora Silva", None),
+        ("Noel Brandt", Some("noel_b")),
+        ("Quiz Bot", Some("book_quiz_bot")),
+    ]
+    .into_iter()
+    .map(|(name, handle)| thinwire_protocol::ChatMember {
+        name: name.to_owned(),
+        handle: handle.map(str::to_owned),
+    })
+    .collect()
 }
 
 fn telegram_unlinked() -> DemoScript {
@@ -1348,6 +1371,11 @@ mod tests {
                 }
                 Scenario::GroupChat => {
                     assert_eq!(view.selected_messages().len(), 8, "{name}");
+                    assert_eq!(
+                        view.chat_members(ProtocolId::Telegram, BOOK_CLUB).len(),
+                        5,
+                        "{name}"
+                    );
                     assert!(!view.person_colors(), "{name}");
                 }
                 Scenario::PersonColors => {

@@ -2579,6 +2579,7 @@ fn center_panel(
                 || player.take_video_escape()
                 || super::photos::take_escape(ui.ctx())
                 || super::links::take_escape(ui.ctx())
+                || super::mention::take_escape(ui.ctx())
                 || super::forward::take_escape(snapshot, out)
                 || (snapshot.edit_target().is_some() && {
                     out.push(Intent::CancelEdit);
@@ -4515,6 +4516,18 @@ fn compose(
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
+    // The list of names after "@" takes its keys first: with the list open,
+    // Enter completes the name and does not send.
+    let mention = if compose_open && !hints.passive {
+        let anchor = egui::pos2(
+            ui.max_rect().left() + THREAD_INSET,
+            ui.cursor().min.y - space::XS,
+        );
+        super::mention::show(ui, snapshot, compose_id, anchor)
+    } else {
+        super::mention::Outcome::default()
+    };
+    let compose_text = mention.text.as_deref().unwrap_or(&snapshot.pane.compose);
     if ui.memory(|memory| memory.has_focus(compose_id)) {
         let (enter, shift, other) = ui.input(|input| {
             let modifiers = input.modifiers;
@@ -4590,15 +4603,19 @@ fn compose(
                         } else {
                             "Message"
                         };
-                        if let Some(text) = edited(ui, &snapshot.pane.compose, name, |text| {
+                        let typed = edited(ui, compose_text, name, |text| {
                             egui::TextEdit::multiline(text)
                                 .id(compose_id)
                                 .frame(field)
                                 .desired_rows(1)
                                 .desired_width(width)
                                 .interactive(compose_open)
+                                .event_filter(mention.event_filter())
                                 .hint_text(RichText::new(hint.clone()).color(palette.text3))
-                        }) && compose_open
+                        });
+                        mention.after_field(ui, compose_id);
+                        if let Some(text) = typed.or_else(|| mention.text.clone())
+                            && compose_open
                             && let Some((protocol, conversation_id, topic)) = chat.clone()
                         {
                             out.push(Intent::SetDraft {

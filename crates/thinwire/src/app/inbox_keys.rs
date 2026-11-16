@@ -25,6 +25,8 @@ struct InboxUi {
     /// When set, a thread Retry control takes keyboard focus.
     focus_retry: bool,
     selects: u32,
+    /// How many times the compose field asked for a send.
+    sends: u32,
     /// Copy one-shot hints from the snapshot each frame, as the app does.
     apply_hints: bool,
     /// Protocols whose Restart the user clicked (#246).
@@ -69,6 +71,7 @@ impl InboxUi {
             hints: Hints::default(),
             focus_retry: false,
             selects: 0,
+            sends: 0,
             apply_hints: false,
             restarts: Vec::new(),
             account_intents: Vec::new(),
@@ -117,6 +120,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 state.selects += 1;
                 state.snapshot.select_conversation(id);
             }
+            Intent::SendDraft { .. } => state.sends += 1,
             Intent::RestartHelper(protocol) => state.restarts.push(protocol),
             intent @ (Intent::AddAccount(_)
             | Intent::LinkAccount(_)
@@ -2721,4 +2725,196 @@ fn ctrl_keys_select_copy_cut_and_paste_in_the_compose_field() {
     harness.event(egui::Event::Paste("three".into()));
     harness.run();
     assert_eq!(harness.state().snapshot.pane.compose, "three");
+}
+
+/// The open chat as a group with four other people. Nora has no handle.
+fn group_with_members() -> InboxUi {
+    let mut state = InboxUi::ready();
+    let mut conversation = telegram_chat(1, "Ada", 10);
+    conversation.is_group = true;
+    state
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation });
+    let member = |name: &str, handle: Option<&str>| thinwire_protocol::ChatMember {
+        name: name.to_owned(),
+        handle: handle.map(str::to_owned),
+    };
+    state.snapshot.apply(AdapterEvent::ChatMembers {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+        members: vec![
+            member("Ada Park", Some("ada_park")),
+            member("Milo Chen", Some("milo")),
+            member("Nora Silva", None),
+            member("Noel Brandt", Some("noel_b")),
+        ],
+    });
+    state.snapshot.take_commands();
+    state
+}
+
+/// Type more text at the cursor of the compose field, with no click.
+fn type_more(harness: &mut Harness<'static, InboxUi>, text: &str) {
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Message")
+        .type_text(text);
+    harness.run();
+}
+
+/// The names of the rows of the mention list, in order.
+fn mention_rows(harness: &Harness<'static, InboxUi>) -> Vec<String> {
+    harness
+        .query_all(By::new().role(egui::accesskit::Role::Button))
+        .filter_map(|node| node.accesskit_node().label())
+        .filter(|label| label.starts_with("Mention "))
+        .collect()
+}
+
+fn compose_has_focus(harness: &Harness<'static, InboxUi>) -> bool {
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Message")
+        .is_focused()
+}
+
+/// "@" in the compose field of a group lists its people, and more typed
+/// characters filter them. Tab puts the mention and one space in the text.
+/// The focus stays in the field, and the cursor is after the space.
+#[test]
+fn an_at_sign_lists_the_people_and_tab_completes_the_name() {
+    let mut harness = harness(group_with_members());
+    harness.run();
+    type_in_compose(&mut harness, "hi @");
+    assert_eq!(
+        mention_rows(&harness),
+        [
+            "Mention Ada Park",
+            "Mention Milo Chen",
+            "Mention Nora Silva",
+            "Mention Noel Brandt"
+        ]
+    );
+    type_more(&mut harness, "MI");
+    assert_eq!(mention_rows(&harness), ["Mention Milo Chen"]);
+
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    assert_eq!(harness.state().snapshot.pane.compose, "hi @milo ");
+    assert!(mention_rows(&harness).is_empty());
+    assert!(compose_has_focus(&harness), "Tab did not move the focus");
+    type_more(&mut harness, "ok");
+    assert_eq!(harness.state().snapshot.pane.compose, "hi @milo ok");
+    assert_eq!(harness.state().sends, 0);
+}
+
+/// Down moves the highlight, and Enter completes the name of that row. It
+/// does not send the message. With no list, Enter sends.
+#[test]
+fn enter_completes_the_highlighted_name_and_does_not_send() {
+    let mut harness = harness(group_with_members());
+    harness.run();
+    type_in_compose(&mut harness, "@no");
+    assert_eq!(
+        mention_rows(&harness),
+        ["Mention Nora Silva", "Mention Noel Brandt"]
+    );
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().snapshot.pane.compose, "@noel_b ");
+    assert_eq!(harness.state().sends, 0, "Enter completed the name");
+    assert!(compose_has_focus(&harness));
+
+    // Up from the first row goes to the last row.
+    type_more(&mut harness, "@no");
+    harness.key_press(egui::Key::ArrowUp);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().snapshot.pane.compose, "@noel_b @noel_b ");
+    assert_eq!(harness.state().sends, 0);
+
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().sends, 1, "with no list, Enter sends");
+}
+
+/// Esc closes the list and keeps the text and the focus. The list stays
+/// closed for that mention, and the next "@" opens it again.
+#[test]
+fn escape_closes_the_mention_list_and_keeps_the_text() {
+    let mut harness = harness(group_with_members());
+    harness.run();
+    type_in_compose(&mut harness, "@a");
+    assert!(!mention_rows(&harness).is_empty());
+
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(mention_rows(&harness).is_empty());
+    assert_eq!(harness.state().snapshot.pane.compose, "@a");
+    assert!(compose_has_focus(&harness), "Esc kept the focus");
+
+    type_more(&mut harness, "d");
+    assert!(mention_rows(&harness).is_empty(), "closed for this mention");
+    type_more(&mut harness, " @mil");
+    assert_eq!(mention_rows(&harness), ["Mention Milo Chen"]);
+}
+
+/// A click on a row completes the name, and the compose field has the
+/// focus again. A person with no handle is named.
+#[test]
+fn a_click_on_a_mention_row_completes_the_name() {
+    let mut harness = harness(group_with_members());
+    harness.run();
+    type_in_compose(&mut harness, "@");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Mention Nora Silva")
+        .click();
+    harness.run();
+    assert_eq!(harness.state().snapshot.pane.compose, "@Nora Silva ");
+    assert!(mention_rows(&harness).is_empty());
+    assert!(compose_has_focus(&harness));
+    type_more(&mut harness, "hi");
+    assert_eq!(harness.state().snapshot.pane.compose, "@Nora Silva hi");
+    assert_eq!(harness.state().sends, 0);
+}
+
+/// A chat with no member list has no mention list: "@" stays text and
+/// Enter sends.
+#[test]
+fn a_chat_with_no_members_has_no_mention_list() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    type_in_compose(&mut harness, "@a");
+    assert!(mention_rows(&harness).is_empty());
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().sends, 1);
+}
+
+/// A press of the pointer on a row takes the focus away from the compose
+/// field. The list stays for the release, the click completes the name,
+/// and the field has the focus again.
+#[test]
+fn a_pointer_click_on_a_mention_row_completes_the_name() {
+    let mut harness = harness(group_with_members());
+    harness.run();
+    type_in_compose(&mut harness, "hey @");
+    let pos = row_rect(&harness, "Mention Milo Chen").center();
+    harness.hover_at(pos);
+    harness.run();
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+    }
+    assert_eq!(harness.state().snapshot.pane.compose, "hey @milo ");
+    assert!(mention_rows(&harness).is_empty());
+    assert!(compose_has_focus(&harness));
+    type_more(&mut harness, "ok");
+    assert_eq!(harness.state().snapshot.pane.compose, "hey @milo ok");
 }

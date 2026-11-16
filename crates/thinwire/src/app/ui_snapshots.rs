@@ -470,6 +470,62 @@ mod emoji_picker {
     }
 }
 
+/// The list of names after "@", open over the compose field of a group.
+mod mention_list {
+    use super::*;
+
+    /// Same frame as [`draw`], and it applies a draft edit.
+    fn draw_typed(ui: &mut egui::Ui, state: &mut Scene) {
+        theme::install(ui.ctx());
+        if !ui.style().text_styles.contains_key(&theme::row_title()) {
+            return;
+        }
+        let mut out = Vec::new();
+        let view = state.core.view();
+        let mut player = super::super::audio::Player::new();
+        ui::draw(ui, &view, &mut state.hints, &mut player, &mut out);
+        for intent in out {
+            if matches!(intent, Intent::SetDraft { .. }) {
+                state.core.dispatch(intent);
+            }
+        }
+    }
+
+    fn shoot_open(theme: ThemeMode) {
+        let name = format!("mention_list-{}-1100x720", theme_slug(theme));
+        let (runtime, built) = scene(Scenario::GroupChat, theme);
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 720.0])
+            .wgpu()
+            .build_ui_state(draw_typed, built);
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::MultilineTextInput, "Message")
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::MultilineTextInput, "Message")
+            .type_text("Chapter 5 for Thursday? @");
+        harness.run();
+        settle_images(&mut harness);
+        harness.get_by_role_and_label(Role::Button, "Mention Ada Park");
+        harness.get_by_role_and_label(Role::Button, "Mention Quiz Bot");
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot_open(ThemeMode::Light);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot_open(ThemeMode::Dark);
+    }
+}
+
 /// The Settings button at the foot of the sidebar, clicked: the menu opens
 /// above it with Refresh, the theme choice, and the notification switches.
 mod settings_menu {

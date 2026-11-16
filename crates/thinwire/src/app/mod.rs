@@ -16,6 +16,7 @@ mod inbox_keys;
 mod links;
 #[cfg(target_os = "macos")]
 mod macos_menu;
+mod mention;
 mod menu_bar;
 mod message_menu;
 mod motion;

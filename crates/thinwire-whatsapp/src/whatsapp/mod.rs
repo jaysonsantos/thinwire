@@ -51,6 +51,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_media: cfg!(feature = "whatsapp-web"),
     message_actions: thinwire_protocol::MessageActions::NONE,
     typing: false,
+    mentions: false,
 };
 
 /// Longest wait at shutdown for the sends in flight, before the client

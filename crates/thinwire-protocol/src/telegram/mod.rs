@@ -17,6 +17,8 @@ mod router;
 #[cfg(feature = "telegram-tdlib")]
 mod media_map;
 #[cfg(feature = "telegram-tdlib")]
+mod members;
+#[cfg(feature = "telegram-tdlib")]
 mod presence;
 #[cfg(feature = "telegram-tdlib")]
 mod tdlib;
@@ -66,6 +68,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_media: true,
     message_actions: crate::MessageActions::ALL,
     typing: true,
+    mentions: true,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.
@@ -614,6 +617,10 @@ impl ProtocolAdapter for TelegramAdapter {
                     typing,
                 },
             ),
+            AdapterCommand::LoadMembers {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+            } => self.dispatch_live(events, LiveCall::LoadMembers { conversation_id }),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -722,6 +729,9 @@ enum LiveCall {
         conversation_id: String,
         topic: Option<MessageTopic>,
         typing: bool,
+    },
+    LoadMembers {
+        conversation_id: String,
     },
     Resend {
         conversation_id: String,
@@ -954,6 +964,14 @@ impl TelegramAdapter {
                             topic,
                             typing,
                         },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::LoadMembers { conversation_id } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::LoadMembers { conversation_id },
                         secrets,
                         source,
                         events,
@@ -1678,6 +1696,35 @@ mod tests {
         let body = fn_body(src, "async fn send_typing");
         assert!(body.contains("ChatAction::Typing") && body.contains("ChatAction::Cancel"));
         assert!(body.contains("functions::send_chat_action("));
+    }
+
+    /// The member list does not wait in the worker loop, and a client that
+    /// is not linked asks for none. A send, a caption, and an edit read the
+    /// people with no username, so a name becomes a text mention.
+    #[test]
+    fn members_load_off_the_worker_loop_and_a_send_reads_them() {
+        let src = include_str!("tdlib.rs");
+        let start = src
+            .find("TdlibCommand::LoadMembers { conversation_id } => {")
+            .expect("worker arm");
+        let arm = &src[start..start + 700];
+        let linked = arm.find("live.linked()").expect("linked check");
+        let spawn = arm
+            .find("tokio::spawn(load_members(")
+            .expect("spawned load");
+        assert!(linked < spawn);
+        let body = fn_body(src, "async fn load_members");
+        assert!(body.contains("functions::search_chat_members("));
+        assert!(body.contains("ChatMembersFilter::Bots"), "the bots too");
+        assert!(body.contains("members::clear_mentions(people)"));
+        assert!(body.contains("AdapterEvent::ChatMembers {"));
+        assert!(!body.contains("tracing::"), "no name or id in a log line");
+        let send = fn_body(src, "async fn send_text");
+        assert!(send.contains("mention_text(&live.members, chat_id, text)"));
+        let media = fn_body(src, "async fn send_media");
+        assert!(media.contains("mention_text(&live.members, chat_id, text)"));
+        let edit = fn_body(src, "async fn edit_message");
+        assert!(edit.contains("mention_text(members, chat_id, text)"));
     }
 
     /// Forward sends the ids in increasing order, at most 100 for each
