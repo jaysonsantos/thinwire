@@ -8,13 +8,14 @@ use thinwire_protocol::ProtocolKind;
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, AudioPath, ChatMessage, ChatTopic,
-    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, HistoryStoreCursor,
-    MAX_ATTACHMENTS, MessageAudio, MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId,
-    StoreAccessReason, TelegramApiSource, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
-    TelegramCodeVia, TelegramSecretVault, VoiceStop, catalog, ordered_topics,
-    telegram_api_available, topic_mute_id, with_outbox_read,
+    Conversation, Delivery, DiscordAdapter, FoundMessage, HelperFault, HelperState,
+    HistoryStoreCursor, MAX_ATTACHMENTS, MessageAudio, MessageTopic, OutgoingFile,
+    ProtocolCapabilities, ProtocolId, StoreAccessReason, TelegramApiSource, TelegramAuthError,
+    TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, VoiceStop, catalog,
+    ordered_topics, telegram_api_available, topic_mute_id, with_outbox_read,
 };
 
+use crate::message_search::{MessageSearch, SEARCH_MIN_CHARS, SearchTarget};
 use crate::mutes::{ChatMute, ChatMutes};
 use crate::paging::{Paging, StorePage};
 use crate::secrets::{SecretKey, SecretStore};
@@ -620,6 +621,8 @@ pub struct Pane {
     /// and Esc puts the draft of the thread back. `compose` has the edit
     /// text, also while the pane does not have the focus.
     editing: Option<EditTarget>,
+    /// The search of message text for the chat list of this pane (#514).
+    message_search: MessageSearch,
 }
 
 impl Pane {
@@ -634,6 +637,7 @@ impl Pane {
             compose: String::new(),
             focused_row: None,
             editing: None,
+            message_search: MessageSearch::default(),
         }
     }
 }
@@ -777,6 +781,9 @@ pub struct Snapshot {
     /// A clicked reply quote whose message is not loaded yet. Older pages
     /// load until the message arrives or the page budget ends.
     reply_jump: Option<ReplyJump>,
+    /// The number of the last `SearchMessages` command. Both panes count
+    /// here, so an answer names one request of one pane.
+    search_requests: u64,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
     seen_visible_ids: Vec<String>,
     /// Unsent compose text per chat and topic. `compose` holds the open
@@ -1093,12 +1100,46 @@ fn thread_key(
 /// The most older pages that one click on a reply quote loads.
 pub const REPLY_JUMP_PAGES: u8 = 5;
 
-/// A reply quote click that waits for older pages.
+/// The most older pages that one click on a found message loads (#514). A
+/// found message can be far back in its chat.
+pub const SEARCH_JUMP_PAGES: u8 = 40;
+
+/// A click on a reply quote or on a found message that waits for older
+/// pages.
 #[derive(Debug, Clone)]
 struct ReplyJump {
     thread: OlderPageKey,
     message_id: String,
     pages_left: u8,
+    /// The jump of a found message. It also waits for the first page of a
+    /// chat that the click opened, and for an anchor that must wait before
+    /// its next request. A reply jump stops in both cases.
+    patient: bool,
+}
+
+/// What the "Messages" section of the chat list shows (#514).
+pub enum MessageSearchView<'a> {
+    /// No section: the text is too short, or no account of the list
+    /// searches message text.
+    Off,
+    /// The request waits for its time or for its answer.
+    Searching,
+    /// The search ended with no message.
+    Empty,
+    /// The found messages, newest first.
+    Found(Vec<MessageHit<'a>>),
+}
+
+/// One found message and its chat.
+pub struct MessageHit<'a> {
+    /// The account of the chat.
+    pub protocol: ProtocolId,
+    pub chat: &'a Conversation,
+    /// The account name, when the list has two accounts of this protocol.
+    pub account: Option<String>,
+    pub message: &'a FoundMessage,
+    /// One line of the text around the match.
+    pub snippet: String,
 }
 
 fn older_key(
@@ -1175,6 +1216,7 @@ impl Snapshot {
             scroll_to_focused: false,
             scroll_to_message: None,
             reply_jump: None,
+            search_requests: 0,
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
             replying: None,
@@ -1586,6 +1628,8 @@ impl Snapshot {
                         initial: true,
                     });
                 }
+                // The jump to a found message waited for this page.
+                self.continue_reply_jump();
             }
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
@@ -1652,6 +1696,23 @@ impl Snapshot {
             } => {
                 self.chat_members
                     .insert((protocol, conversation_id), members);
+            }
+            AdapterEvent::MessagesFound {
+                protocol,
+                request,
+                results,
+            } => {
+                // An answer for an older text matches no open request.
+                let search = if self.pane.message_search.waits_for(protocol, request) {
+                    Some(&mut self.pane.message_search)
+                } else {
+                    self.split
+                        .as_mut()
+                        .map(|split| &mut split.other.message_search)
+                };
+                if let Some(search) = search {
+                    let _ = search.answer(protocol, request, results);
+                }
             }
             AdapterEvent::Typing {
                 protocol,
@@ -3802,6 +3863,145 @@ impl Snapshot {
         });
     }
 
+    /// The accounts whose message text the chat list of `pane` can search:
+    /// each account of the list that is linked now and whose adapter has
+    /// `message_search`. An account that connects again is not one of
+    /// them: its adapter would answer with no message. The search starts
+    /// when the account is linked. A previous Signal number has none.
+    fn visible_search_accounts(&self, pane: &Pane) -> Vec<ProtocolId> {
+        let searches = |account: &ProtocolId| {
+            self.protocol_linked(*account)
+                && self
+                    .accounts
+                    .iter()
+                    .any(|row| row.caps.id == *account && row.caps.message_search)
+        };
+        if pane.all {
+            return self.all_accounts().filter(searches).collect();
+        }
+        let account = pane.protocol;
+        if pane.signal_retained.is_none()
+            && self.account_surface_visible(account)
+            && self.has_session(account)
+            && searches(&account)
+        {
+            vec![account]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// What the message search of `pane` looks for now. `None` for a text
+    /// under [`SEARCH_MIN_CHARS`] and for a list with no account that
+    /// searches.
+    fn search_target(&self, pane: &Pane) -> Option<SearchTarget> {
+        let query = pane.search.trim();
+        if query.chars().count() < SEARCH_MIN_CHARS {
+            return None;
+        }
+        let accounts = self.visible_search_accounts(pane);
+        (!accounts.is_empty()).then(|| SearchTarget {
+            query: query.to_owned(),
+            accounts,
+        })
+    }
+
+    /// Make the message search of each pane follow its search field and
+    /// its accounts. A change drops the results and starts the wait before
+    /// the request. The core calls it after every dispatch and pump.
+    pub fn sync_message_search(&mut self, now: Instant) {
+        let target = self.search_target(&self.pane);
+        self.pane.message_search.retarget(target, now);
+        let other = self
+            .split
+            .as_ref()
+            .map(|split| self.search_target(&split.other));
+        if let (Some(target), Some(split)) = (other, self.split.as_mut()) {
+            split.other.message_search.retarget(target, now);
+        }
+    }
+
+    /// Queue the `SearchMessages` commands of each pane whose wait ended at
+    /// `now`: one for each account. `true` when a command was queued.
+    pub fn send_due_searches(&mut self, now: Instant) -> bool {
+        let mut due = Vec::new();
+        if let Some(target) = self.pane.message_search.take_due(now) {
+            due.push((false, target));
+        }
+        if let Some(split) = self.split.as_mut()
+            && let Some(target) = split.other.message_search.take_due(now)
+        {
+            due.push((true, target));
+        }
+        let sent = !due.is_empty();
+        for (other, target) in due {
+            for account in target.accounts {
+                self.search_requests += 1;
+                let request = self.search_requests;
+                let search = match self.split.as_mut() {
+                    Some(split) if other => &mut split.other.message_search,
+                    _ => &mut self.pane.message_search,
+                };
+                search.asked(account, request);
+                self.push(AdapterCommand::SearchMessages {
+                    protocol: account,
+                    conversation_id: None,
+                    query: thinwire_protocol::SearchQuery::new(target.query.clone()),
+                    request,
+                });
+            }
+        }
+        sent
+    }
+
+    /// The earliest time at which a message search sends its request.
+    pub(crate) fn next_search_deadline(&self) -> Option<Instant> {
+        let other = self
+            .split
+            .as_ref()
+            .and_then(|split| split.other.message_search.due());
+        self.pane
+            .message_search
+            .due()
+            .into_iter()
+            .chain(other)
+            .min()
+    }
+
+    /// The "Messages" section of the chat list of this pane (#514). A found
+    /// message whose chat is not a row of the core is not in it: the click
+    /// could not open that chat.
+    #[must_use]
+    pub fn message_search(&self) -> MessageSearchView<'_> {
+        let search = &self.pane.message_search;
+        let Some(query) = search.query() else {
+            return MessageSearchView::Off;
+        };
+        let hits: Vec<MessageHit<'_>> = search
+            .results()
+            .iter()
+            .filter_map(|(protocol, message)| {
+                let chat = self
+                    .conversation(*protocol, &message.conversation_id)
+                    .filter(|row| !row.placeholder)?;
+                Some(MessageHit {
+                    protocol: *protocol,
+                    chat,
+                    account: self.row_account_label(chat),
+                    message,
+                    snippet: message.snippet(query),
+                })
+            })
+            .collect();
+        if !hits.is_empty() {
+            MessageSearchView::Found(hits)
+        } else if search.busy() {
+            MessageSearchView::Searching
+        } else {
+            MessageSearchView::Empty
+        }
+    }
+
     /// New inbox search. A highlight that the query hides is cleared.
     pub fn set_search(&mut self, text: String) {
         if self.pane.search == text {
@@ -4374,7 +4574,67 @@ impl Snapshot {
             thread: older_key(self.pane.protocol, chat, self.pane.topic),
             message_id: message_id.to_owned(),
             pages_left: REPLY_JUMP_PAGES,
+            patient: false,
         });
+        self.continue_reply_jump();
+    }
+
+    /// Open the chat of a found message and scroll its thread to the
+    /// message (#514). When the message is not loaded, older pages load
+    /// until it is, at most [`SEARCH_JUMP_PAGES`]. A change of chat stops
+    /// the jump. The chat must be a chat that the list of this pane shows.
+    /// A message of a topic whose row is not loaded opens the topic list,
+    /// with no jump.
+    pub fn open_found_message(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        message_id: &str,
+    ) {
+        let same_account = protocol == self.pane.protocol && self.pane.signal_retained.is_none();
+        if !self.pane.all && !same_account {
+            return;
+        }
+        let listed = self.visible_search_accounts(&self.pane).contains(&protocol)
+            && self
+                .conversation(protocol, chat)
+                .is_some_and(|row| !row.placeholder);
+        if !listed {
+            return;
+        }
+        let open = same_account
+            && self.pane.conversation.as_deref() == Some(chat)
+            && self.pane.topic == topic;
+        if !open {
+            if !same_account {
+                self.enter_account(protocol);
+            }
+            let opened = topic.is_some_and(|topic| self.select_topic(chat.to_owned(), topic));
+            if !opened {
+                self.open_chat(protocol, chat.to_owned());
+                if topic.is_some() {
+                    return;
+                }
+            }
+        }
+        self.reply_jump = Some(ReplyJump {
+            thread: older_key(protocol, chat, topic),
+            message_id: message_id.to_owned(),
+            pages_left: SEARCH_JUMP_PAGES,
+            patient: true,
+        });
+        self.continue_reply_jump();
+    }
+
+    /// A jump waits for a page or for the time of its next request. The
+    /// core continues it in each pump.
+    pub(crate) fn jump_waits(&self) -> bool {
+        self.reply_jump.is_some()
+    }
+
+    /// Continue a jump that waited for the time of its next request.
+    pub(crate) fn resume_jump(&mut self) {
         self.continue_reply_jump();
     }
 
@@ -4403,7 +4663,28 @@ impl Snapshot {
             self.reply_jump = Some(jump);
             return;
         }
-        if jump.pages_left == 0 || self.older_anchor_at(Instant::now()).is_none() {
+        if jump.patient
+            && self
+                .history_loading
+                .contains(&(jump.thread.0, chat.to_owned()))
+        {
+            // The first page of the chat is on its way.
+            self.reply_jump = Some(jump);
+            return;
+        }
+        if jump.pages_left == 0 {
+            return;
+        }
+        if self.older_anchor_at(Instant::now()).is_none() {
+            // The anchor of a patient jump waits before its next request:
+            // a later pump asks again. Every other reason ends the jump.
+            if jump.patient
+                && self.pages_older()
+                && !self.paging.at_start(&jump.thread)
+                && !self.selected_messages().is_empty()
+            {
+                self.reply_jump = Some(jump);
+            }
             return;
         }
         jump.pages_left -= 1;
@@ -6538,6 +6819,11 @@ impl Snapshot {
         self.typing.forget(protocol);
         // A status is true only while the session is live.
         self.chat_status.retain(|(owner, _), _| *owner != protocol);
+        // A request to this session gets no answer: the search stops.
+        self.pane.message_search.forget_account(protocol);
+        if let Some(split) = self.split.as_mut() {
+            split.other.message_search.forget_account(protocol);
+        }
         // A new session asks for the people of a chat again.
         self.chat_members.retain(|(owner, _), _| *owner != protocol);
         self.members_asked.retain(|(owner, _)| *owner != protocol);
@@ -12557,6 +12843,315 @@ mod tests {
         snapshot.apply(older_loaded(1, 50, true));
         assert_eq!(snapshot.wants_scroll_to_message(), None);
         assert!(older_requests(&mut snapshot).is_empty());
+    }
+
+    /// Put `text` in the search field and let the wait of the request end.
+    /// The answer is each `SearchMessages` command: account, text, number.
+    fn search_for(snapshot: &mut Snapshot, text: &str) -> Vec<(ProtocolId, String, u64)> {
+        use crate::message_search::SEARCH_DELAY;
+        let start = Instant::now();
+        snapshot.set_search(text.into());
+        snapshot.sync_message_search(start);
+        assert!(
+            !snapshot.send_due_searches(start + SEARCH_DELAY / 2),
+            "no request while the text can still change"
+        );
+        assert!(search_requests(snapshot).is_empty());
+        snapshot.send_due_searches(start + SEARCH_DELAY);
+        search_requests(snapshot)
+    }
+
+    fn search_requests(snapshot: &mut Snapshot) -> Vec<(ProtocolId, String, u64)> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::SearchMessages {
+                    protocol,
+                    conversation_id: None,
+                    query,
+                    request,
+                } => Some((protocol, query.as_str().to_owned(), request)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn found(chat: i64, id: i64, sent_at: i64, text: &str) -> FoundMessage {
+        FoundMessage {
+            conversation_id: format!("telegram:{chat}"),
+            message_id: format!("telegram:{chat}:{id}"),
+            topic: None,
+            sender: "Ada".into(),
+            outbound: false,
+            sent_at,
+            text: text.into(),
+        }
+    }
+
+    fn messages_found(request: u64, results: Vec<FoundMessage>) -> AdapterEvent {
+        AdapterEvent::MessagesFound {
+            protocol: ProtocolId::Telegram,
+            request,
+            results,
+        }
+    }
+
+    /// The ids of the found messages that the section shows, or its state.
+    fn shown_hits(snapshot: &Snapshot) -> Result<Vec<String>, &'static str> {
+        match snapshot.message_search() {
+            MessageSearchView::Off => Err("off"),
+            MessageSearchView::Searching => Err("searching"),
+            MessageSearchView::Empty => Err("empty"),
+            MessageSearchView::Found(hits) => Ok(hits
+                .iter()
+                .map(|hit| hit.message.message_id.clone())
+                .collect()),
+        }
+    }
+
+    /// A text of two characters searches the messages of the account, one
+    /// time, after the wait. The section shows the found messages, newest
+    /// first, with one line around the match.
+    #[test]
+    fn a_search_text_asks_the_account_and_shows_the_found_messages() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        assert_eq!(shown_hits(&snapshot), Err("off"));
+        snapshot.set_search("t".into());
+        snapshot.sync_message_search(Instant::now());
+        assert_eq!(shown_hits(&snapshot), Err("off"), "one character");
+        assert!(snapshot.next_search_deadline().is_none());
+
+        let asked = search_for(&mut snapshot, " tea ");
+        let [(account, query, request)] = asked.as_slice() else {
+            panic!("one request, got {}", asked.len());
+        };
+        assert_eq!(*account, ProtocolId::Telegram);
+        assert_eq!(query, "tea", "no space at the ends");
+        assert_eq!(shown_hits(&snapshot), Err("searching"));
+        assert!(snapshot.next_search_deadline().is_none(), "it went out");
+
+        let long = format!(
+            "{} We have tea at five.",
+            "Long start of the text. ".repeat(4)
+        );
+        snapshot.apply(messages_found(
+            *request,
+            vec![
+                found(2, 9, 200, "Tea?"),
+                found(1, 7, 300, &long),
+                found(77, 1, 400, "tea in a chat that is not in the list"),
+            ],
+        ));
+        assert_eq!(
+            shown_hits(&snapshot),
+            Ok(vec!["telegram:1:7".to_owned(), "telegram:2:9".to_owned()]),
+            "newest first, and only a chat of the list"
+        );
+        let MessageSearchView::Found(hits) = snapshot.message_search() else {
+            panic!("found");
+        };
+        assert_eq!(hits[0].chat.title, "Ada");
+        assert!(hits[0].account.is_none());
+        assert!(hits[0].snippet.starts_with('…'), "the start was cut");
+        assert!(hits[0].snippet.contains("tea at five"));
+        assert_eq!(hits[1].snippet, "Tea?");
+
+        // The same text again asks nothing.
+        snapshot.sync_message_search(Instant::now());
+        assert!(snapshot.next_search_deadline().is_none());
+        // A short text drops the results.
+        snapshot.set_search("t".into());
+        snapshot.sync_message_search(Instant::now());
+        assert_eq!(shown_hits(&snapshot), Err("off"));
+    }
+
+    /// The answer for an older text does not replace the answer for the
+    /// text in the field, and a search with no message says so.
+    #[test]
+    fn the_answer_to_an_older_search_text_does_not_show() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        let first = search_for(&mut snapshot, "te")[0].2;
+        let second = search_for(&mut snapshot, "tea")[0].2;
+        assert_ne!(first, second);
+        snapshot.apply(messages_found(first, vec![found(1, 7, 300, "ten")]));
+        assert_eq!(shown_hits(&snapshot), Err("searching"));
+        snapshot.apply(messages_found(second, Vec::new()));
+        assert_eq!(shown_hits(&snapshot), Err("empty"));
+        snapshot.apply(messages_found(second, vec![found(1, 8, 300, "tea")]));
+        assert_eq!(shown_hits(&snapshot), Err("empty"), "one answer for each");
+    }
+
+    /// The search state is in the pane: the other pane of the split view
+    /// gets the answer to its own request, and `Debug` shows no text.
+    #[test]
+    fn each_pane_of_the_split_view_has_its_own_message_search() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        let left = search_for(&mut snapshot, "query-fixture-4f1")[0].2;
+        snapshot.open_split(ProtocolId::Telegram);
+        assert_eq!(snapshot.pane.search, "", "the new pane has no search");
+        snapshot.sync_message_search(Instant::now());
+        assert_eq!(shown_hits(&snapshot), Err("off"));
+        // The answer comes while the other pane has the focus.
+        snapshot.apply(messages_found(
+            left,
+            vec![found(1, 7, 300, "query-fixture-4f1 body")],
+        ));
+        assert_eq!(shown_hits(&snapshot), Err("off"));
+        let shown = format!("{:?} {:?}", snapshot.pane, snapshot.split);
+        assert!(!shown.contains("fixture"), "{shown}");
+        snapshot.focus_other_pane();
+        assert_eq!(shown_hits(&snapshot), Ok(vec!["telegram:1:7".to_owned()]));
+        let shown = format!("{:?} {:?}", snapshot.pane, snapshot.split);
+        assert!(!shown.contains("fixture"), "{shown}");
+        assert!(!shown.contains("telegram:1:7"), "{shown}");
+    }
+
+    /// A session end drops the results and the open request of its account.
+    #[test]
+    fn a_session_end_drops_the_found_messages() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        let request = search_for(&mut snapshot, "tea")[0].2;
+        snapshot.apply(messages_found(request, vec![found(1, 7, 300, "tea")]));
+        assert!(shown_hits(&snapshot).is_ok());
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Unlinked,
+        });
+        snapshot.sync_message_search(Instant::now());
+        assert_eq!(shown_hits(&snapshot), Err("off"));
+        assert!(snapshot.next_search_deadline().is_none());
+    }
+
+    /// The list of every account searches each account that can search.
+    #[test]
+    fn the_list_of_every_account_searches_its_telegram_accounts() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.select_all();
+        let asked = search_for(&mut snapshot, "tea");
+        let accounts: Vec<ProtocolId> = asked.iter().map(|(account, _, _)| *account).collect();
+        assert_eq!(accounts, [ProtocolId::Telegram]);
+        snapshot.apply(messages_found(asked[0].2, vec![found(2, 9, 200, "Tea?")]));
+        assert_eq!(shown_hits(&snapshot), Ok(vec!["telegram:2:9".to_owned()]));
+        // A click opens the chat of that account from this list.
+        snapshot.open_found_message(ProtocolId::Telegram, "telegram:2", None, "telegram:2:9");
+        assert!(snapshot.pane.all);
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:2"));
+    }
+
+    /// A click on a found message of a chat that is not open: the chat
+    /// opens, its first page loads, and older pages load until the message
+    /// is there. Then the thread scrolls to it.
+    #[test]
+    fn a_found_message_opens_its_chat_and_loads_pages_until_it_shows() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.open_found_message(ProtocolId::Telegram, "telegram:2", None, "telegram:2:30");
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:2"));
+        let commands = snapshot.take_commands();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            AdapterCommand::OpenChat { conversation_id, .. } if conversation_id == "telegram:2"
+        )));
+        assert!(snapshot.jump_waits(), "the jump waits for the first page");
+        for id in [51, 50] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: outgoing(2, id, "recent", Delivery::Sent),
+            });
+        }
+        assert!(older_requests(&mut snapshot).is_empty());
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            store_cursor: None,
+        });
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:2:50"]);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(2, 40, "older", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(2, 50, true));
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:2:40"]);
+        assert_eq!(snapshot.wants_scroll_to_message(), None);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(2, 30, "the found text", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(2, 40, true));
+        assert_eq!(snapshot.wants_scroll_to_message(), Some("telegram:2:30"));
+        assert!(older_requests(&mut snapshot).is_empty());
+        assert!(!snapshot.jump_waits());
+    }
+
+    /// A found message that is loaded in the open chat scrolls at once.
+    /// A chat that the list does not have opens nothing.
+    #[test]
+    fn a_found_message_of_the_open_chat_scrolls_at_once() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.open_found_message(ProtocolId::Telegram, "telegram:1", None, "telegram:1:50");
+        assert_eq!(snapshot.wants_scroll_to_message(), Some("telegram:1:50"));
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "the chat does not load again"
+        );
+        snapshot.take_scroll_to_message();
+        snapshot.open_found_message(ProtocolId::Telegram, "telegram:77", None, "telegram:77:1");
+        snapshot.open_found_message(ProtocolId::Slack, "telegram:2", None, "telegram:2:1");
+        assert_eq!(snapshot.pane.conversation.as_deref(), Some("telegram:1"));
+        assert!(!snapshot.jump_waits());
+    }
+
+    /// The jump of a found message loads more pages than a reply jump, and
+    /// it stops at its budget.
+    #[test]
+    fn a_search_jump_stops_after_its_larger_page_budget() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.open_found_message(ProtocolId::Telegram, "telegram:1", None, "telegram:1:1");
+        let mut pages = 0;
+        let mut oldest = 50;
+        while let [anchor] = older_requests(&mut snapshot).as_slice() {
+            assert_eq!(anchor, &format!("telegram:1:{oldest}"));
+            pages += 1;
+            let older = oldest - 1;
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: outgoing(1, older, "older", Delivery::Sent),
+            });
+            snapshot.apply(older_loaded(1, oldest, true));
+            oldest = older;
+        }
+        assert_eq!(pages, usize::from(SEARCH_JUMP_PAGES));
+        const { assert!(SEARCH_JUMP_PAGES > REPLY_JUMP_PAGES) };
+        assert_eq!(snapshot.wants_scroll_to_message(), None);
+        assert!(!snapshot.jump_waits());
+    }
+
+    /// A page that brought nothing older makes its anchor wait. The jump of
+    /// a found message stays and asks again later. A reply jump ends. A
+    /// change of chat ends the jump of a found message too.
+    #[test]
+    fn a_search_jump_waits_for_a_slow_anchor_and_ends_with_its_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.open_found_message(ProtocolId::Telegram, "telegram:1", None, "telegram:1:30");
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:50"]);
+        snapshot.apply(older_loaded(1, 50, true));
+        assert!(older_requests(&mut snapshot).is_empty(), "the anchor waits");
+        assert!(snapshot.jump_waits(), "the jump stays");
+        snapshot.resume_jump();
+        assert!(snapshot.jump_waits());
+        snapshot.select_conversation("telegram:2".into());
+        assert!(!snapshot.jump_waits(), "another chat ends it");
+
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.jump_to_message("telegram:1:30");
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:50"]);
+        snapshot.apply(older_loaded(1, 50, true));
+        assert!(!snapshot.jump_waits(), "a reply jump does not wait");
     }
 
     #[test]

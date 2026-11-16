@@ -107,6 +107,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     message_actions: crate::MessageActions::NONE,
     typing: false,
     mentions: false,
+    message_search: false,
 };
 
 /// Official Slack path. Workspace install UI is out of scope for this spike.

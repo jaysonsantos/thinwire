@@ -1322,6 +1322,54 @@ mod tests {
         assert_eq!(view.split_other_protocol(), Some(ProtocolId::Telegram));
     }
 
+    /// The demo answers a search of message text from its histories, and a
+    /// click on a found message opens its chat at that message.
+    #[test]
+    fn the_demo_finds_messages_by_their_text() {
+        let runtime = runtime();
+        let mut core = Scenario::LongChat.build(runtime.handle());
+        core.dispatch(Intent::SetSearch(crate::SecretText::new("Chapter")));
+        let found = |core: &Core| match core.view().message_search() {
+            crate::MessageSearchView::Found(hits) => hits
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.chat.id.clone(),
+                        hit.message.message_id.clone(),
+                        hit.snippet.clone(),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        while found(&core).is_empty() {
+            assert!(started.elapsed() < SETTLE_LIMIT, "no search answer");
+            std::thread::sleep(SETTLE_POLL);
+            core.pump();
+        }
+        let hits = found(&core);
+        let texts: Vec<&str> = hits.iter().map(|(_, _, text)| text.as_str()).collect();
+        assert_eq!(texts, ["Chapter 5 next.", "Who has read chapter 4?"]);
+        assert!(hits.iter().all(|(chat, _, _)| chat == BOOK_CLUB));
+        // The older message: the chat opens and the thread scrolls to it.
+        let (chat, message_id, _) = hits[1].clone();
+        assert_eq!(core.view().pane.conversation.as_deref(), Some(ADA));
+        core.dispatch(Intent::OpenFoundMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat,
+            topic: None,
+            message_id: message_id.clone(),
+        });
+        let started = std::time::Instant::now();
+        while core.view().wants_scroll_to_message() != Some(message_id.as_str()) {
+            assert!(started.elapsed() < SETTLE_LIMIT, "no jump to the message");
+            std::thread::sleep(SETTLE_POLL);
+            core.pump();
+        }
+        assert_eq!(core.view().pane.conversation.as_deref(), Some(BOOK_CLUB));
+    }
+
     /// Each scenario reaches its screen. One runtime serves all of them.
     #[test]
     fn every_scenario_reaches_its_screen() {

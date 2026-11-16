@@ -434,6 +434,45 @@ impl DemoAdapter {
         self.send(events, answer);
     }
 
+    /// The messages of the demo history that have `query` in their text,
+    /// newest first. Upper and lower case are equal.
+    fn search(&self, chat: Option<&str>, query: &str, request: u64, events: &EventTx) {
+        let needle = query.trim().to_lowercase();
+        let mut found: Vec<&ChatMessage> = self
+            .script
+            .history
+            .iter()
+            .filter(|(id, _)| chat.is_none_or(|chat| chat == id.as_str()))
+            .flat_map(|(_, rows)| rows)
+            .filter(|row| !needle.is_empty() && row.body.to_lowercase().contains(&needle))
+            .collect();
+        // The map has no order: sort on the time, then on the ids.
+        found.sort_by(|a, b| {
+            (b.sent_at, &a.conversation_id, &a.id).cmp(&(a.sent_at, &b.conversation_id, &b.id))
+        });
+        let results = found
+            .into_iter()
+            .take(crate::FOUND_MESSAGES_LIMIT)
+            .map(|row| crate::FoundMessage {
+                conversation_id: row.conversation_id.clone(),
+                message_id: row.id.clone(),
+                topic: row.topic,
+                sender: row.sender.clone(),
+                outbound: row.outbound,
+                sent_at: row.sent_at,
+                text: crate::FoundMessage::cut_text(&row.body, query),
+            })
+            .collect();
+        self.send(
+            events,
+            AdapterEvent::MessagesFound {
+                protocol: self.protocol(),
+                request,
+                results,
+            },
+        );
+    }
+
     fn login(&self, step: TelegramAuthStep, epoch: u64, events: &EventTx) {
         let Some((_, reply)) = self.script.login.iter().find(|(seen, _)| *seen == step) else {
             return;
@@ -531,6 +570,12 @@ impl DemoAdapter {
                 request,
                 ..
             } => self.resend(conversation_id, message_id, request, events),
+            AdapterCommand::SearchMessages {
+                conversation_id,
+                query,
+                request,
+                ..
+            } => self.search(conversation_id.as_deref(), query.as_str(), request, events),
             AdapterCommand::TelegramAuth { step, epoch } => self.login(step, epoch, events),
             AdapterCommand::Disconnect { protocol } | AdapterCommand::Unlink { protocol } => self
                 .send(
@@ -592,6 +637,61 @@ mod tests {
             reply_to: None,
             edited: false,
         }
+    }
+
+    /// The demo answers a search from its histories: the messages with the
+    /// text, newest first, with the number of the request. A search of one
+    /// chat gives only that chat.
+    #[test]
+    fn the_demo_answers_a_search_from_its_histories() {
+        let mut script = DemoScript::linked(crate::fake::CAPABILITIES, Vec::new(), NOW);
+        script.history.insert(
+            "a".into(),
+            (0..3).map(|index| message("a", index)).collect(),
+        );
+        script.history.insert(
+            "b".into(),
+            (0..2).map(|index| message("b", index)).collect(),
+        );
+        let adapter = DemoAdapter::new(script);
+        let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let mut search = |chat: Option<&str>, query: &str, request: u64| {
+            adapter.answer(
+                AdapterCommand::SearchMessages {
+                    protocol: adapter.protocol(),
+                    conversation_id: chat.map(str::to_owned),
+                    query: crate::SearchQuery::new(query),
+                    request,
+                },
+                &events,
+            );
+            match seen.try_recv().expect("an answer") {
+                AdapterEvent::MessagesFound {
+                    request: answered,
+                    results,
+                    ..
+                } => {
+                    assert_eq!(answered, request);
+                    results
+                }
+                other => panic!("not a search answer: {other:?}"),
+            }
+        };
+        let body = message("a", 1).body;
+        let all = search(None, &body.to_uppercase(), 1);
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|row| row.text == body));
+        assert!(
+            all.windows(2)
+                .all(|pair| pair[0].sent_at >= pair[1].sent_at)
+        );
+        let one = search(Some("b"), &body, 2);
+        assert!(one.iter().all(|row| row.conversation_id == "b"));
+        assert!(search(None, "no-such-text", 3).is_empty());
+        assert!(
+            search(None, " ", 4).is_empty(),
+            "an empty text finds nothing"
+        );
     }
 
     /// The demo adapter follows the adapter contract of the shell.

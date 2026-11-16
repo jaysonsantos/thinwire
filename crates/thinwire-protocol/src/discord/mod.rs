@@ -115,6 +115,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // needs the gateway (#487, #526).
     typing: cfg!(feature = "discord-bot"),
     mentions: false,
+    message_search: false,
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.

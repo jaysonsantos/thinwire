@@ -21,6 +21,8 @@ mod members;
 #[cfg(feature = "telegram-tdlib")]
 mod presence;
 #[cfg(feature = "telegram-tdlib")]
+mod search;
+#[cfg(feature = "telegram-tdlib")]
 mod tdlib;
 
 use std::fmt;
@@ -69,6 +71,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     message_actions: crate::MessageActions::ALL,
     typing: true,
     mentions: true,
+    message_search: true,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.
@@ -621,6 +624,19 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
             } => self.dispatch_live(events, LiveCall::LoadMembers { conversation_id }),
+            AdapterCommand::SearchMessages {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                query,
+                request,
+            } => self.dispatch_live(
+                events,
+                LiveCall::SearchMessages {
+                    conversation_id,
+                    query,
+                    request,
+                },
+            ),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -732,6 +748,11 @@ enum LiveCall {
     },
     LoadMembers {
         conversation_id: String,
+    },
+    SearchMessages {
+        conversation_id: Option<String>,
+        query: crate::SearchQuery,
+        request: u64,
     },
     Resend {
         conversation_id: String,
@@ -972,6 +993,22 @@ impl TelegramAdapter {
                 LiveCall::LoadMembers { conversation_id } => {
                     self.tdlib.enqueue_message_action(
                         tdlib::TdlibCommand::LoadMembers { conversation_id },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::SearchMessages {
+                    conversation_id,
+                    query,
+                    request,
+                } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::SearchMessages {
+                            conversation_id,
+                            query,
+                            request,
+                        },
                         secrets,
                         source,
                         events,
@@ -1725,6 +1762,38 @@ mod tests {
         assert!(media.contains("mention_text(&live.members, chat_id, text)"));
         let edit = fn_body(src, "async fn edit_message");
         assert!(edit.contains("mention_text(members, chat_id, text)"));
+    }
+
+    /// The search of message text does not wait in the worker loop. A
+    /// command with a chat asks `searchChatMessages`, and a command with no
+    /// chat asks `searchMessages` for the main chat list. Each command gets
+    /// one answer, also from a client that is not linked and after a TDLib
+    /// error. No query, text, name, or id goes to a log line.
+    #[test]
+    fn a_message_search_runs_off_the_worker_loop_and_always_answers() {
+        let src = include_str!("tdlib.rs");
+        let start = src
+            .find("TdlibCommand::SearchMessages {")
+            .expect("worker arm");
+        let arm = &src[start..start + 1500];
+        let linked = arm.find("live.linked()").expect("linked check");
+        let spawn = arm
+            .find("tokio::spawn(search_messages(")
+            .expect("spawned search");
+        assert!(linked < spawn);
+        assert!(
+            arm.contains("None => send_found(&events, request, Vec::new()),"),
+            "a search that cannot run still answers"
+        );
+        let body = fn_body(src, "async fn search_messages");
+        assert!(body.contains("functions::search_chat_messages("));
+        assert!(body.contains("functions::search_messages("));
+        assert!(body.contains("Some(tdlib_rs::enums::ChatList::Main)"));
+        assert!(body.contains("super::search::found("));
+        assert!(body.contains("send_found(&events, request, results);"));
+        assert!(!body.contains("log_tdlib_error"), "only the code is logged");
+        assert!(body.contains("tracing::warn!(request = name, code = error.code,"));
+        assert_eq!(body.matches("tracing::").count(), 1);
     }
 
     /// Forward sends the ids in increasing order, at most 100 for each

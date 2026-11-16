@@ -68,6 +68,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     message_actions: thinwire_protocol::MessageActions::NONE,
     typing: false,
     mentions: false,
+    message_search: false,
 };
 
 const NOTICE_REQUIRED: &str =

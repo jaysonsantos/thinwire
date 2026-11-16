@@ -19,6 +19,7 @@ mod macos_menu;
 mod mention;
 mod menu_bar;
 mod message_menu;
+mod message_search;
 mod motion;
 #[cfg(any(feature = "signal-local", feature = "whatsapp-web"))]
 mod pairing_qr;

@@ -526,6 +526,61 @@ mod mention_list {
     }
 }
 
+/// A search text in the chat list: the chats with the text in their name,
+/// then the section "Messages" with the messages that have it (#514).
+mod message_search {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use thinwire_core::MessageSearchView;
+
+    fn shoot(theme: ThemeMode) {
+        let name = format!("message_search-{}-1100x720", theme_slug(theme));
+        let (runtime, mut built) = scene(Scenario::GroupChat, theme);
+        built
+            .core
+            .dispatch(Intent::SetSearch(thinwire_core::SecretText::new("ch")));
+        // The request waits until the text stops, then the demo answers.
+        // Wait for the rows, not for a number of frames.
+        let started = Instant::now();
+        while !matches!(
+            built.core.view().message_search(),
+            MessageSearchView::Found(_)
+        ) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the demo did not answer the search"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            built.core.pump();
+        }
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 720.0])
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        settle_images(&mut harness);
+        harness.get_by_label("Messages");
+        harness.get_by_role_and_label(Role::Button, "Message in Book club, Nora: Chapter 5 next.");
+        harness.get_by_role_and_label(
+            Role::Button,
+            "Message in Book club, Nora: Who has read chapter 4?",
+        );
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot(ThemeMode::Light);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot(ThemeMode::Dark);
+    }
+}
+
 /// The Settings button at the foot of the sidebar, clicked: the menu opens
 /// above it with Refresh, the theme choice, and the notification switches.
 mod settings_menu {

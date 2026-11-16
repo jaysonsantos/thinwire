@@ -226,6 +226,15 @@ pub enum Intent {
         conversation_id: String,
         message_id: String,
     },
+    /// Open the chat of a message that the search of the chat list found,
+    /// and scroll its thread to the message (#514). Older pages load when
+    /// the message is not loaded yet.
+    OpenFoundMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        message_id: String,
+    },
     /// Delete one message of the open chat. `for_everyone` removes an own
     /// message for every member, where the protocol allows it.
     DeleteMessage {

@@ -18,6 +18,7 @@ mod core;
 pub mod demo;
 pub mod instance;
 mod intent;
+mod message_search;
 pub mod mutes;
 pub mod notify;
 mod paging;
@@ -43,9 +44,10 @@ pub use crate::core::{Core, CoreConfig, HelperBuilder, HelperPaths};
 pub use intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
+pub use message_search::SEARCH_MIN_CHARS;
 pub use secret_text::SecretText;
 pub use signal::{ChangeNotifier, ChangeSignal, change_channel};
-pub use state::{AuthKey, ForwardPicker, Pane, SplitSide};
+pub use state::{AuthKey, ForwardPicker, MessageHit, MessageSearchView, Pane, SplitSide};
 pub use store_key::{
     CreateStoreKeyError, LoadStoreKey, SIGNAL_STORE_KEY_ACCOUNT, SessionKey, StoreKey,
     StoreKeyAction, StoreKeyPolicy, StoreProtectFail, WHATSAPP_STORE_KEY_ACCOUNT, create_store_key,

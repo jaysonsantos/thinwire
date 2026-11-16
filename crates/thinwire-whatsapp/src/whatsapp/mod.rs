@@ -52,6 +52,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     message_actions: thinwire_protocol::MessageActions::NONE,
     typing: false,
     mentions: false,
+    message_search: false,
 };
 
 /// Longest wait at shutdown for the sends in flight, before the client

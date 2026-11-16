@@ -54,6 +54,7 @@ const CAPS: ProtocolCapabilities = ProtocolCapabilities {
     message_actions: crate::MessageActions::NONE,
     typing: false,
     mentions: false,
+    message_search: false,
 };
 
 /// Short waits, so a restart test takes milliseconds.

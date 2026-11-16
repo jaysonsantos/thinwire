@@ -145,6 +145,14 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::JumpToMessage { message_id, .. } => {
                 state.snapshot.jump_to_message(&message_id);
             }
+            Intent::OpenFoundMessage {
+                protocol,
+                conversation_id,
+                topic,
+                message_id,
+            } => state
+                .snapshot
+                .open_found_message(protocol, &conversation_id, topic, &message_id),
             Intent::OpenForward {
                 protocol,
                 conversation_id,
@@ -2934,4 +2942,119 @@ fn a_pointer_click_on_a_mention_row_completes_the_name() {
     assert!(compose_has_focus(&harness));
     type_more(&mut harness, "ok");
     assert_eq!(harness.state().snapshot.pane.compose, "hey @milo ok");
+}
+
+/// Put `text` in the search field of the core, let the wait of the request
+/// end, and give back the number of the `SearchMessages` command.
+fn search_messages(harness: &mut Harness<'static, InboxUi>, text: &str) -> u64 {
+    use std::time::{Duration, Instant};
+    let snapshot = &mut harness.state_mut().snapshot;
+    snapshot.set_search(text.into());
+    let now = Instant::now();
+    snapshot.sync_message_search(now);
+    snapshot.send_due_searches(now + Duration::from_secs(1));
+    snapshot
+        .take_commands()
+        .into_iter()
+        .find_map(|command| match command {
+            thinwire_protocol::AdapterCommand::SearchMessages { request, .. } => Some(request),
+            _ => None,
+        })
+        .expect("a search request")
+}
+
+/// #514: a search text shows the section "Messages" under the chats. It
+/// says "Searching…" until the answer, then it has one row for each found
+/// message, with a name for a screen reader. A click opens the chat and
+/// the thread scrolls to the message.
+#[test]
+fn a_search_text_lists_the_found_messages_and_a_click_opens_the_chat() {
+    use egui::accesskit::Role;
+    use thinwire_protocol::FoundMessage;
+
+    let mut state = InboxUi::ready();
+    state.apply_hints = true;
+    let mut harness = harness(state);
+    harness.run();
+    assert!(harness.query_by_label("Messages").is_none(), "no search");
+
+    let request = search_messages(&mut harness, "tea");
+    harness.run();
+    harness.get_by_label("Messages");
+    harness.get_by_label("Searching…");
+    // No chat has the text in its name. The section still shows.
+    harness.get_by_label("No chats match 'tea'.");
+
+    let found = |chat: i64, id: i64, sender: &str, outbound: bool, text: &str| FoundMessage {
+        conversation_id: format!("telegram:{chat}"),
+        message_id: format!("telegram:{chat}:{id}"),
+        topic: None,
+        sender: sender.into(),
+        outbound,
+        sent_at: 1_700_000_000,
+        text: text.into(),
+    };
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::MessagesFound {
+            protocol: ProtocolId::Telegram,
+            request,
+            results: vec![
+                found(2, 9, "Bob", false, "Tea at five?"),
+                found(1, 4, "you", true, "More\ntea"),
+            ],
+        });
+    harness.run();
+    assert!(harness.query_by_label("Searching…").is_none());
+    harness.get_by_role_and_label(Role::Button, "Message in Ada, You: More tea");
+    harness
+        .get_by_role_and_label(Role::Button, "Message in Bob, Tea at five?")
+        .click();
+    // The chat loads its first page: a spinner turns, so no `run`.
+    harness.run_steps(3);
+    assert_eq!(
+        harness.state().snapshot.pane.conversation.as_deref(),
+        Some("telegram:2"),
+        "the click opens the chat of the message"
+    );
+    assert_eq!(
+        harness.state().snapshot.pane.search,
+        "tea",
+        "the search stays"
+    );
+    // The first page of the chat has the message: the thread scrolls to it.
+    let mut message = chat_message("telegram:2:9", "Tea at five?", 1_700_000_000);
+    message.conversation_id = "telegram:2".into();
+    let snapshot = &mut harness.state_mut().snapshot;
+    snapshot.apply(AdapterEvent::MessageReceived { message });
+    snapshot.apply(AdapterEvent::HistoryLoaded {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:2".into(),
+        store_cursor: None,
+    });
+    // The bubble glows for a time, so the frames do not settle at once.
+    harness.run_steps(12);
+    assert_eq!(harness.state().scrolled_to, ["telegram:2:9".to_owned()]);
+
+    // A search with no message says so.
+    let request = search_messages(&mut harness, "zzz");
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::MessagesFound {
+            protocol: ProtocolId::Telegram,
+            request,
+            results: Vec::new(),
+        });
+    harness.run();
+    harness.get_by_label("No messages found");
+    // One character is not a search of messages.
+    harness.state_mut().snapshot.set_search("z".into());
+    harness
+        .state_mut()
+        .snapshot
+        .sync_message_search(std::time::Instant::now());
+    harness.run();
+    assert!(harness.query_by_label("Messages").is_none());
 }

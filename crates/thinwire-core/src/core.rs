@@ -179,6 +179,9 @@ pub struct Core {
     /// A wake at the earliest send deadline, so a frontend that waits on the
     /// change signal pumps then and the chat unlocks (PR #81 review).
     send_wake: Option<(Instant, tokio::task::JoinHandle<()>)>,
+    /// A wake at the time a message search sends its request (#514), so a
+    /// frontend that waits on the change signal pumps then.
+    search_wake: Option<(Instant, tokio::task::JoinHandle<()>)>,
     /// Desktop notification rules and queue (#32).
     notify: Notifications,
     /// Live forum messages whose topic row is not in state yet. The row has
@@ -345,6 +348,7 @@ impl Core {
             notifier,
             closing: false,
             send_wake: None,
+            search_wake: None,
             notify: Notifications::new(),
             held_topic_notices: Vec::new(),
         };
@@ -761,8 +765,17 @@ impl Core {
         self.state.sync_viewed();
         self.state.sync_timeout_hint();
         self.sync_notifications();
+        // A jump to a found message asks for its next page when the wait
+        // of its anchor ended.
+        if self.state.jump_waits() {
+            self.state.resume_jump();
+        }
+        // The text of a search stopped for the delay: its request goes out.
+        let now = Instant::now();
+        self.state.sync_message_search(now);
+        let searched = self.state.send_due_searches(now);
         self.flush();
-        applied || expired || released || typing
+        applied || expired || released || typing || searched
     }
 
     /// Notifications for the frontend to show or remove, oldest first
@@ -1160,6 +1173,14 @@ impl Core {
                     self.state.jump_to_message(&message_id);
                 }
             }
+            Intent::OpenFoundMessage {
+                protocol,
+                conversation_id,
+                topic,
+                message_id,
+            } => self
+                .state
+                .open_found_message(protocol, &conversation_id, topic, &message_id),
             Intent::EditMessage {
                 protocol,
                 conversation_id,
@@ -1225,6 +1246,8 @@ impl Core {
         self.state.sync_viewed();
         self.state.sync_timeout_hint();
         self.sync_notifications();
+        // A new search text starts the wait before its request.
+        self.state.sync_message_search(Instant::now());
         self.flush();
         self.notifier.notify();
     }
@@ -1502,6 +1525,29 @@ impl Core {
             self.runtime.spawn_blocking(move || job.run());
         }
         self.arm_send_wake();
+        self.arm_search_wake();
+    }
+
+    /// Keep one wake at the time the next message search sends its request.
+    /// The wake only fires the change signal: the next `pump` of the
+    /// frontend sends the request.
+    fn arm_search_wake(&mut self) {
+        let deadline = self.state.next_search_deadline();
+        if self.search_wake.as_ref().map(|(at, _)| *at) == deadline {
+            return;
+        }
+        if let Some((_, task)) = self.search_wake.take() {
+            task.abort();
+        }
+        let Some(deadline) = deadline else {
+            return;
+        };
+        let notifier = self.notifier.downgrade();
+        let task = self.runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            notifier.notify();
+        });
+        self.search_wake = Some((deadline, task));
     }
 
     /// Keep one wake at the earliest send deadline: re-arm when it moves,
@@ -4786,6 +4832,52 @@ mod tests {
         assert_eq!(asked(), ["telegram:1".to_string()]);
         core.dispatch(draft("hi @a"));
         assert!(asked().is_empty(), "one request for each chat");
+    }
+
+    /// The search field searches the text of messages (#514): no request
+    /// goes out with the key press. A wake is armed for the end of the
+    /// wait, and the pump after it sends one request with the last text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_search_text_sends_one_request_after_the_text_stops() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let mut asked = move || {
+            let mut texts = Vec::new();
+            while let Ok(command) = sent.try_recv() {
+                if let AdapterCommand::SearchMessages { query, .. } = command {
+                    texts.push(query.as_str().to_owned());
+                }
+            }
+            texts
+        };
+        core.dispatch(Intent::SetSearch("te".into()));
+        core.dispatch(Intent::SetSearch("tea".into()));
+        // No pump here: a slow machine must not reach the end of the wait.
+        assert!(asked().is_empty(), "a key press is not a request");
+        assert!(
+            core.search_wake.is_some(),
+            "a wake is armed for the request"
+        );
+        let mut texts = Vec::new();
+        pump_until(&mut core, |_| {
+            texts.extend(asked());
+            !texts.is_empty()
+        })
+        .await;
+        assert_eq!(texts, ["tea".to_string()]);
+        assert!(core.search_wake.is_none(), "no wake after the request");
+        // A cleared field asks nothing more.
+        core.dispatch(Intent::SetSearch("".into()));
+        core.pump();
+        assert!(core.search_wake.is_none());
+        assert!(matches!(
+            core.view().message_search(),
+            crate::MessageSearchView::Off
+        ));
     }
 
     /// PR #48 review (P1): a send named for chat A after a click on chat B

@@ -84,6 +84,12 @@ pub(super) enum TdlibCommand {
     LoadMembers {
         conversation_id: String,
     },
+    /// Search the text of the messages of the account, or of one chat.
+    SearchMessages {
+        conversation_id: Option<String>,
+        query: crate::SearchQuery,
+        request: u64,
+    },
     Resend {
         conversation_id: String,
         message_id: String,
@@ -176,6 +182,7 @@ impl TdlibCommand {
             Self::ForwardMessages { .. } => "forward_messages",
             Self::SetTyping { .. } => "set_typing",
             Self::LoadMembers { .. } => "load_members",
+            Self::SearchMessages { .. } => "search_messages",
             Self::Resend { .. } => "resend",
             Self::LoadOlder { .. } => "load_older",
             Self::OpenTopic { .. } => "open_topic",
@@ -1220,6 +1227,36 @@ fn spawn_tdlib_worker(
                                     Arc::clone(&live.members),
                                     events.clone(),
                                 ));
+                            }
+                        }
+                        TdlibCommand::SearchMessages {
+                            conversation_id,
+                            query,
+                            request,
+                        } => {
+                            // The request can take seconds: it does not
+                            // wait in this loop. Each command gets one
+                            // answer, so the list never waits for nothing.
+                            let scope = if live.linked() {
+                                super::search::scope(
+                                    conversation_id.as_deref(),
+                                    query.as_str(),
+                                )
+                            } else {
+                                None
+                            };
+                            match scope {
+                                Some(scope) => {
+                                    tokio::spawn(search_messages(
+                                        client_id,
+                                        scope,
+                                        query,
+                                        request,
+                                        live.directory.listed_topic_chats(),
+                                        events.clone(),
+                                    ));
+                                }
+                                None => send_found(&events, request, Vec::new()),
                             }
                         }
                         TdlibCommand::React {
@@ -2390,6 +2427,127 @@ async fn load_members(
         conversation_id: inbox::conversation_id(chat_id),
         members,
     });
+}
+
+/// The answer to one `SearchMessages` command.
+fn send_found(events: &EventTx, request: u64, results: Vec<crate::FoundMessage>) {
+    let _ = events.send(AdapterEvent::MessagesFound {
+        protocol: ProtocolId::Telegram,
+        request,
+        results,
+    });
+}
+
+/// Search the text of messages (#514, #535): `searchChatMessages` for one
+/// chat, or `searchMessages` for every chat of the main chat list. TDLib
+/// gives the newest matches first, and does not search secret chats in the
+/// second request. The sender names and the chat names come from the TDLib
+/// cache. `topic_chats` are the chats with a topic list: only a message of
+/// such a chat keeps its topic (`chat_topic`). A request that fails
+/// answers with no result. The log line has the request name and the error
+/// code only: the query, the texts, the names, and the ids are user data.
+async fn search_messages(
+    client_id: i32,
+    scope: super::search::Scope,
+    query: crate::SearchQuery,
+    request: u64,
+    topic_chats: Vec<i64>,
+    events: EventTx,
+) {
+    use super::search::{LIMIT, Scope};
+    use tdlib_rs::enums::{FoundChatMessages, FoundMessages, MessageSender};
+    let text = query.as_str().trim().to_owned();
+    let (name, page) = match scope {
+        Scope::Chat(chat_id) => (
+            "searchChatMessages",
+            tdlib_rs::functions::search_chat_messages(
+                chat_id,
+                None,
+                text.clone(),
+                None,
+                0,
+                0,
+                LIMIT,
+                None,
+                client_id,
+            )
+            .await
+            .map(|FoundChatMessages::FoundChatMessages(page)| page.messages),
+        ),
+        Scope::Account => (
+            "searchMessages",
+            tdlib_rs::functions::search_messages(
+                Some(tdlib_rs::enums::ChatList::Main),
+                text.clone(),
+                String::new(),
+                LIMIT,
+                None,
+                None,
+                0,
+                0,
+                client_id,
+            )
+            .await
+            .map(|FoundMessages::FoundMessages(page)| page.messages),
+        ),
+    };
+    let messages = match page {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!(request = name, code = error.code, "tdlib search failed");
+            Vec::new()
+        }
+    };
+    let mut names = NameBook::new();
+    let mut asked = std::collections::HashSet::new();
+    let mut titles: HashMap<i64, String> = HashMap::new();
+    let mut results = Vec::new();
+    for message in messages.iter().take(crate::FOUND_MESSAGES_LIMIT) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = titles.entry(message.chat_id)
+            && let Ok(tdlib_rs::enums::Chat::Chat(chat)) =
+                tdlib_rs::functions::get_chat(message.chat_id, client_id).await
+        {
+            slot.insert(chat.title);
+        }
+        let party = match &message.sender_id {
+            MessageSender::User(user) => {
+                if asked.insert(user.user_id)
+                    && let Ok(tdlib_rs::enums::User::User(user)) =
+                        tdlib_rs::functions::get_user(user.user_id, client_id).await
+                {
+                    names.remember_user(user.id, &user.first_name, &user.last_name);
+                }
+                MessageParty::User(user.user_id)
+            }
+            MessageSender::Chat(chat) => MessageParty::Chat(chat.chat_id),
+        };
+        let media = super::media_map::map_content(&message.content);
+        let body = if media.text.trim().is_empty() {
+            media.preview
+        } else {
+            media.text
+        };
+        let topic = topic_chats
+            .contains(&message.chat_id)
+            .then(|| message.topic_id.as_ref().and_then(app_topic))
+            .flatten();
+        results.push(super::search::found(
+            &InboxMessage {
+                chat_id: message.chat_id,
+                message_id: message.id,
+                outgoing: message.is_outgoing,
+                party,
+                body,
+                sent_at: i64::from(message.date),
+                delivery: Delivery::Sent,
+                topic,
+            },
+            &names,
+            titles.get(&message.chat_id).map(String::as_str),
+            &text,
+        ));
+    }
+    send_found(&events, request, results);
 }
 
 /// The text of a send, of a caption, or of an edit, with a text mention on

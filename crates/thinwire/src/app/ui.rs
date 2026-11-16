@@ -1666,7 +1666,7 @@ pub(super) fn view_status_line(status: thinwire_protocol::ChatStatus, now: ViewN
     }
 }
 
-fn view_list_time(at: i64, now: ViewNow) -> String {
+pub(super) fn view_list_time(at: i64, now: ViewNow) -> String {
     match now {
         ViewNow::Local(now) => list_time(at, &now),
         ViewNow::Fixed(now) => list_time(at, &now),
@@ -1812,6 +1812,8 @@ fn inbox(
         InboxState::NoMatch => {
             let query = snapshot.pane.search.trim();
             empty_note(ui, &format!("No chats match '{query}'."));
+            // No chat has the text in its name. A message can have it.
+            super::message_search::show(ui, snapshot, out);
             return DrawnInbox {
                 anchor: None,
                 stride,
@@ -1931,6 +1933,8 @@ fn inbox(
             clicked = Some(key);
         }
     }
+    // The messages that have the search text, under the chats that have it.
+    super::message_search::show(ui, snapshot, out);
     if !hints.passive {
         inbox_keys(ui, snapshot, inbox_list_id, out);
     }
@@ -2252,7 +2256,7 @@ fn empty_note(ui: &mut egui::Ui, text: &str) {
 /// One inbox row. The whole rect is the click target, including the preview.
 /// `key` is the row key: two rows never have the same widget id.
 #[allow(clippy::too_many_arguments)]
-fn inbox_row(
+pub(super) fn inbox_row(
     ui: &mut egui::Ui,
     protocol: ProtocolId,
     key: &str,

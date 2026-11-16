@@ -265,6 +265,9 @@ pub struct ProtocolCapabilities {
     /// The adapter answers `LoadMembers` with `ChatMembers`. The compose
     /// field completes a name after "@" only for such a protocol.
     pub mentions: bool,
+    /// The adapter answers `SearchMessages` with `MessagesFound` (#514). The
+    /// chat list searches the text of messages only for such a protocol.
+    pub message_search: bool,
 }
 
 /// What a user can do with one message, by protocol. The message menu shows
@@ -800,6 +803,16 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// Search the text of the messages of the account (#514), or of one
+    /// chat when `conversation_id` names it. The adapter always answers
+    /// with one `MessagesFound` that has the same `request`, also when the
+    /// search fails: the list is then empty.
+    SearchMessages {
+        protocol: ProtocolId,
+        conversation_id: Option<String>,
+        query: SearchQuery,
+        request: u64,
+    },
 }
 
 impl AdapterCommand {
@@ -834,6 +847,7 @@ impl AdapterCommand {
             | Self::ForwardMessages { protocol, .. }
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
+            | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
@@ -906,6 +920,7 @@ impl AdapterCommand {
             | Self::ForwardMessages { protocol, .. }
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
+            | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;
                 true
@@ -1208,6 +1223,13 @@ pub enum AdapterEvent {
         conversation_id: String,
         members: Vec<ChatMember>,
     },
+    /// The answer to `SearchMessages`: the messages that the service found,
+    /// newest first. `request` is the number of the command.
+    MessagesFound {
+        protocol: ProtocolId,
+        request: u64,
+        results: Vec<FoundMessage>,
+    },
     /// A request for older messages ended. The older messages came before this
     /// event as `MessageReceived`. `more == false` means the start of the chat
     /// (or no more can load now): the UI stops asking.
@@ -1333,6 +1355,7 @@ impl AdapterEvent {
             | Self::Typing { protocol, .. }
             | Self::ChatStatus { protocol, .. }
             | Self::ChatMembers { protocol, .. }
+            | Self::MessagesFound { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::Helper { protocol, .. } => {
@@ -1413,6 +1436,7 @@ impl AdapterEvent {
             | Self::Typing { protocol, .. }
             | Self::ChatStatus { protocol, .. }
             | Self::ChatMembers { protocol, .. }
+            | Self::MessagesFound { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. } => Some(*protocol),
             _ => None,
@@ -1561,6 +1585,130 @@ impl ChatMember {
     pub fn mention(&self) -> String {
         format!("@{}", self.handle.as_deref().unwrap_or(&self.name))
     }
+}
+
+/// The text of a message search. `Debug` does not show it: a log line or a
+/// panic text must not have what the user typed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SearchQuery(String);
+
+impl SearchQuery {
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The text. Do not log it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SearchQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SearchQuery(<redacted>)")
+    }
+}
+
+/// The most messages that one `MessagesFound` has.
+pub const FOUND_MESSAGES_LIMIT: usize = 50;
+
+/// The most characters of [`FoundMessage::text`]. An adapter cuts a longer
+/// text around the first match ([`FoundMessage::cut_text`]).
+pub const FOUND_TEXT_CHARS: usize = 400;
+
+/// One message that a search found. The account is the `protocol` of its
+/// `MessagesFound` event.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FoundMessage {
+    pub conversation_id: String,
+    pub message_id: String,
+    /// The forum topic or bot thread of the message, as on a `ChatMessage`.
+    pub topic: Option<MessageTopic>,
+    /// The name of the sender, as on a `ChatMessage`.
+    pub sender: String,
+    pub outbound: bool,
+    /// Unix seconds when the message was sent. Zero when unknown.
+    pub sent_at: i64,
+    /// The text or the caption of the message, or the label of its media.
+    pub text: String,
+}
+
+/// The ids, the sender, and the text are user data: `Debug` shows none.
+impl fmt::Debug for FoundMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FoundMessage")
+            .field("outbound", &self.outbound)
+            .field("has_topic", &self.topic.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FoundMessage {
+    /// At most [`FOUND_TEXT_CHARS`] characters of `text`, with the first
+    /// match of `query` in them. Upper and lower case are equal. A text
+    /// with no match keeps its start.
+    #[must_use]
+    pub fn cut_text(text: &str, query: &str) -> String {
+        let (start, _) = match_window(text, query, FOUND_TEXT_CHARS / 4);
+        text.chars().skip(start).take(FOUND_TEXT_CHARS).collect()
+    }
+
+    /// One line of the text around the first match of `query`, for a result
+    /// row: line breaks become spaces, and "…" shows that the text before
+    /// the line was cut. A short text is not cut. Upper and lower case are
+    /// equal.
+    #[must_use]
+    pub fn snippet(&self, query: &str) -> String {
+        let flat = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // A short text shows whole: a cut would only hide its start.
+        if flat.chars().count() <= SNIPPET_WHOLE_CHARS {
+            return flat;
+        }
+        let (start, cut) = match_window(&flat, query, SNIPPET_LEAD_CHARS);
+        let line: String = flat.chars().skip(start).take(SNIPPET_CHARS).collect();
+        if cut { format!("…{line}") } else { line }
+    }
+}
+
+/// The most characters of a result line before its match.
+const SNIPPET_LEAD_CHARS: usize = 10;
+
+/// A text of at most this many characters is its own result line.
+const SNIPPET_WHOLE_CHARS: usize = 32;
+
+/// The most characters of a result line.
+const SNIPPET_CHARS: usize = 160;
+
+/// Where a cut of `text` starts, in characters, so that the first match of
+/// `query` has at most `lead` characters before it. The cut starts at the
+/// start of a word when one is in those characters. `true` when the cut
+/// drops text.
+fn match_window(text: &str, query: &str, lead: usize) -> (usize, bool) {
+    let lower = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let needle: Vec<char> = query.trim().chars().map(lower).collect();
+    if needle.is_empty() {
+        return (0, false);
+    }
+    // One lower-case character for each character, so an index is the same
+    // in both lists. No byte offset of a changed copy is used.
+    let chars: Vec<char> = text.chars().collect();
+    let folded: Vec<char> = chars.iter().copied().map(lower).collect();
+    let Some(at) = folded
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+    else {
+        return (0, false);
+    };
+    if at <= lead {
+        return (0, false);
+    }
+    let mut start = at - lead;
+    if let Some(space) = chars[start..at].iter().position(|c| c.is_whitespace()) {
+        start += space + 1;
+    }
+    (start, true)
 }
 
 /// One topic inside a forum or a bot chat.
@@ -2331,5 +2479,112 @@ mod account_tests {
             .from_account();
         assert_eq!(from, None, "account 0 needs no wrapper");
         assert_eq!(inner, phase);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn found(text: &str) -> FoundMessage {
+        FoundMessage {
+            conversation_id: "chat-fixture-5c2".into(),
+            message_id: "message-fixture-88a".into(),
+            topic: None,
+            sender: "sender-fixture-d1".into(),
+            outbound: false,
+            sent_at: 1,
+            text: text.into(),
+        }
+    }
+
+    /// A search command and its answer go to and come from the account of
+    /// the search, as every command and event with a protocol field.
+    #[test]
+    fn a_search_and_its_answer_have_their_account() {
+        let account = ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot 1");
+        let search = AdapterCommand::SearchMessages {
+            protocol: ProtocolId::Telegram,
+            conversation_id: None,
+            query: SearchQuery::new("tea"),
+            request: 4,
+        }
+        .for_account(account);
+        assert!(!matches!(search, AdapterCommand::ToAccount { .. }));
+        assert_eq!(search.protocol(), account);
+        let (to, seen) = search.route();
+        assert_eq!(to, account);
+        assert_eq!(seen.protocol(), ProtocolId::Telegram);
+
+        let answer = AdapterEvent::MessagesFound {
+            protocol: ProtocolId::Telegram,
+            request: 4,
+            results: vec![found("tea")],
+        }
+        .for_account(account);
+        assert_eq!(answer.inbox_protocol(), Some(account));
+        assert!(matches!(
+            answer,
+            AdapterEvent::MessagesFound { protocol, request: 4, .. } if protocol == account
+        ));
+    }
+
+    /// `Debug` of a search command and of its answer shows no text of the
+    /// user: no query, no message text, no name, and no id.
+    #[test]
+    fn debug_of_a_search_shows_no_user_data() {
+        let command = AdapterCommand::SearchMessages {
+            protocol: ProtocolId::Telegram,
+            conversation_id: None,
+            query: SearchQuery::new("query-fixture-7e3"),
+            request: 4,
+        };
+        let event = AdapterEvent::MessagesFound {
+            protocol: ProtocolId::Telegram,
+            request: 4,
+            results: vec![found("text-fixture-0b9")],
+        };
+        let shown = format!("{command:?} {event:?}");
+        for secret in [
+            "query-fixture-7e3",
+            "text-fixture-0b9",
+            "chat-fixture-5c2",
+            "message-fixture-88a",
+            "sender-fixture-d1",
+        ] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+
+    /// The line of a result row is one line. It starts at the text, or at a
+    /// word near the match when the match is far from the start.
+    #[test]
+    fn a_snippet_is_one_line_around_the_match() {
+        assert_eq!(found("Tea at\nfive?").snippet("tea"), "Tea at five?");
+        assert_eq!(found("We have tea").snippet("TEA"), "We have tea");
+        let long = found("The shop only has the big one until next week, which is late.");
+        assert_eq!(long.snippet("which"), "…week, which is late.");
+        // A text with no match keeps its start.
+        assert_eq!(long.snippet("zzz").chars().next(), Some('T'));
+        assert_eq!(found("abc").snippet(""), "abc");
+        // Characters of more than one byte, and a character whose lower
+        // case has two characters, do not move the cut into a character.
+        let wide = found("İİİİİİİİİİİİİİİİİİİİ ÀÉÎ õü tea 🍵 ça va");
+        assert_eq!(wide.snippet("TEA"), "…ÀÉÎ õü tea 🍵 ça va");
+        let line = found(&"word ".repeat(100)).snippet("zzz");
+        assert_eq!(line.chars().count(), SNIPPET_CHARS);
+    }
+
+    /// A long text that goes to the core keeps the part with the match.
+    #[test]
+    fn a_cut_text_has_the_match() {
+        assert_eq!(FoundMessage::cut_text("short tea", "tea"), "short tea");
+        let text = format!("{}needle{}", "é".repeat(1000), "ü".repeat(1000));
+        let cut = FoundMessage::cut_text(&text, "NEEDLE");
+        assert_eq!(cut.chars().count(), FOUND_TEXT_CHARS);
+        assert!(cut.contains("needle"));
+        let none = FoundMessage::cut_text(&text, "zzz");
+        assert_eq!(none.chars().count(), FOUND_TEXT_CHARS);
+        assert!(none.starts_with('é'));
     }
 }
