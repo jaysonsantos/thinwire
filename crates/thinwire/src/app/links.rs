@@ -365,14 +365,17 @@ pub(crate) fn confirm(ui: &mut egui::Ui) {
     let screen = ui.ctx().content_rect();
     let mut dismiss = false;
     let mut open_id = None;
+    // The dim layer is under the dialog: the dialog is in the foreground
+    // order, so the layer does not take its clicks.
     egui::Area::new(egui::Id::unique("link-confirm"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .show(ui.ctx(), |ui| {
             let _ = ui.allocate_rect(screen, egui::Sense::click());
             ui.painter()
                 .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
             egui::Window::new("Open link?")
+                .order(egui::Order::Foreground)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)

@@ -2095,6 +2095,23 @@ fn an_accesskit_selection_reaches_the_bubble() {
     assert_eq!(selection.focus.character_index, 5);
 }
 
+/// The open-link dialog takes a click of the pointer: its dim layer is
+/// under it. A click on Cancel closes it.
+#[test]
+fn a_pointer_click_on_cancel_closes_the_open_link_dialog() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    super::links::remember_confirm(&harness.ctx, "https://example.org/page", "A page");
+    harness.run_steps(3);
+    let cancel = harness.get_by_label("Cancel").rect().center();
+    click_at(&mut harness, cancel);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Cancel").is_none(),
+        "the dialog is closed"
+    );
+}
+
 /// A click on a mention opens the one-to-one chat of that person. A
 /// mention with no known chat does nothing.
 #[test]
