@@ -1727,6 +1727,9 @@ mod tests {
     use crate::ThemeMode;
 
     const WAIT: Duration = Duration::from_secs(3);
+    /// The limit for a file that a worker writes with `fsync`. A full or
+    /// busy disk takes seconds for one sync, so this is longer than `WAIT`.
+    const FILE_WAIT: Duration = Duration::from_secs(30);
 
     fn temp_settings() -> Settings {
         let path = std::env::temp_dir()
@@ -4248,7 +4251,7 @@ mod tests {
         assert!(core.take_notify().is_empty(), "muted in thinwire");
 
         // The written file has the mute. The write runs on a worker.
-        let deadline = Instant::now() + WAIT;
+        let deadline = Instant::now() + FILE_WAIT;
         while !ChatMutes::load_from(path.clone()).contains(ProtocolId::Telegram, "telegram:2") {
             assert!(Instant::now() < deadline, "the mute was not written");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4334,7 +4337,7 @@ mod tests {
         path: &std::path::Path,
         check: impl Fn(&crate::mutes::ChatMutes) -> bool,
     ) {
-        let deadline = Instant::now() + WAIT;
+        let deadline = Instant::now() + FILE_WAIT;
         while !check(&crate::mutes::ChatMutes::load_from(path.to_path_buf())) {
             assert!(Instant::now() < deadline, "the mutes file did not change");
             tokio::time::sleep(Duration::from_millis(10)).await;
