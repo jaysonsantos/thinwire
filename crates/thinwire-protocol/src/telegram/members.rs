@@ -74,7 +74,7 @@ impl MemberBook {
     /// place of the old one.
     pub(super) fn set(&mut self, chat_id: i64, mut people: Vec<(String, i64)>) {
         // The longest text first, so "@Ada Lovelace" wins over "@Ada".
-        people.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        people.sort_by_key(|person| std::cmp::Reverse(person.0.len()));
         self.chats.insert(chat_id, people);
     }
 
