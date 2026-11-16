@@ -1543,7 +1543,7 @@ async fn apply_update(
             if let tdlib_rs::enums::UserType::Bot(bot) = &update.user.r#type {
                 let effects = live
                     .directory
-                    .note_topic_bot(update.user.id, bot.has_topics);
+                    .note_topic_owner(inbox::TopicOwner::Bot(update.user.id), bot.has_topics);
                 let emit = live.linked();
                 for effect in effects {
                     live.publish(events, emit, Some(effect));
@@ -2144,12 +2144,6 @@ async fn apply_chat_update(
                 );
             }
         }
-        tdlib_rs::enums::Update::ChatViewAsTopics(update) => {
-            let effect = live
-                .directory
-                .set_view_as_topics(update.chat_id, update.view_as_topics);
-            live.publish(events, emit, effect);
-        }
         tdlib_rs::enums::Update::ForumTopicInfo(update) => {
             let key = (update.info.chat_id, update.info.forum_topic_id);
             if let Some(topic) = live.topics.get_mut(&key) {
@@ -2227,6 +2221,16 @@ async fn apply_chat_update(
             let group = update.supergroup;
             let changes = live.presence.supergroup(group.id, group.member_count);
             live.publish_status(events, changes);
+            // TDLib sends this before the chat of the group, and again when
+            // the owner turns topics on or off.
+            let effects = live.directory.note_topic_owner(
+                inbox::TopicOwner::Forum(group.id),
+                group.is_forum && !group.is_channel,
+            );
+            for effect in effects {
+                live.publish(events, emit, Some(effect));
+            }
+            load_due_forum_topics(client_id, live, events).await;
         }
         tdlib_rs::enums::Update::SupergroupFullInfo(update) => {
             let changes = live.presence.supergroup(
@@ -2320,25 +2324,18 @@ fn emit_effect(events: &EventTx, effect: Option<ChatEffect>) {
     }
 }
 
-/// A forum supergroup shown as topics, or a private chat with a topic bot.
-/// Saved Messages is a private chat with `view_as_topics`, so it stays a chat.
-fn forum_or_bot(
-    directory: &ChatDirectory,
-    kind: &tdlib_rs::enums::ChatType,
-    view_as_topics: bool,
-) -> bool {
+/// The bot or the supergroup that decides the topics of a chat. A forum
+/// has topics also when Telegram shows it as one thread ("View as
+/// messages", `chat.view_as_topics` off): this app has no such view.
+/// Saved Messages is a private chat with no bot, so it stays a chat.
+fn chat_peer(kind: &tdlib_rs::enums::ChatType) -> Option<inbox::TopicOwner> {
     match kind {
-        tdlib_rs::enums::ChatType::Supergroup(group) => view_as_topics && !group.is_channel,
-        tdlib_rs::enums::ChatType::Private(chat) => directory.bot_has_topics(chat.user_id),
-        tdlib_rs::enums::ChatType::BasicGroup(_) | tdlib_rs::enums::ChatType::Secret(_) => false,
-    }
-}
-
-fn chat_peer(kind: &tdlib_rs::enums::ChatType) -> Option<i64> {
-    match kind {
-        tdlib_rs::enums::ChatType::Private(chat) => Some(chat.user_id),
-        tdlib_rs::enums::ChatType::BasicGroup(_)
-        | tdlib_rs::enums::ChatType::Supergroup(_)
+        tdlib_rs::enums::ChatType::Private(chat) => Some(inbox::TopicOwner::Bot(chat.user_id)),
+        tdlib_rs::enums::ChatType::Supergroup(group) if !group.is_channel => {
+            Some(inbox::TopicOwner::Forum(group.supergroup_id))
+        }
+        tdlib_rs::enums::ChatType::Supergroup(_)
+        | tdlib_rs::enums::ChatType::BasicGroup(_)
         | tdlib_rs::enums::ChatType::Secret(_) => None,
     }
 }
@@ -2410,6 +2407,7 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
         tdlib_rs::enums::ChatType::Supergroup(group) if group.is_channel => MuteScope::Channel,
         tdlib_rs::enums::ChatType::Supergroup(_) => MuteScope::Group,
     };
+    let peer = chat_peer(&chat.r#type);
     directory.upsert(
         chat.id,
         ChatSeed {
@@ -2422,8 +2420,8 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
             is_group,
             scope,
             mute: chat_mute(&chat.notification_settings),
-            has_topics: forum_or_bot(directory, &chat.r#type, chat.view_as_topics),
-            peer: chat_peer(&chat.r#type),
+            has_topics: peer.is_some_and(|owner| directory.owner_has_topics(owner)),
+            peer,
             photo_file_id: small_photo_id(chat.photo.as_ref()),
             accent: crate::media::ChatAvatar::accent_index(chat.accent_color_id),
             last_read_outbox: chat.last_read_outbox_message_id,

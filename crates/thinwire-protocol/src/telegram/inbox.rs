@@ -114,8 +114,9 @@ pub(super) struct ChatSeed<'a> {
     pub scope: MuteScope,
     pub mute: ChatMute,
     pub has_topics: bool,
-    /// Private-chat user id, so a later bot update can set `has_topics`.
-    pub peer: Option<i64>,
+    /// The bot or the supergroup that decides `has_topics`, so a later
+    /// update of it can set the flag.
+    pub peer: Option<TopicOwner>,
     /// TDLib file id of `chat.photo.small`. Empty when the chat has no photo.
     pub photo_file_id: Option<i32>,
     /// `accent_color_id` in palette 0–6.
@@ -136,10 +137,20 @@ struct ChatRecord {
     scope: MuteScope,
     mute: ChatMute,
     has_topics: bool,
-    peer: Option<i64>,
+    peer: Option<TopicOwner>,
     photo_file_id: Option<i32>,
     accent: u8,
     last_read_outbox: i64,
+}
+
+/// What decides that a chat has topics. User ids and supergroup ids are
+/// different number spaces, so the kind is part of the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum TopicOwner {
+    /// The bot user of a private chat (`userTypeBot.has_topics`).
+    Bot(i64),
+    /// The supergroup of a group chat (`supergroup.is_forum`).
+    Forum(i64),
 }
 
 /// Main-list chats keyed by TDLib chat id. `order == 0` is not listed.
@@ -148,8 +159,8 @@ pub(super) struct ChatDirectory {
     chats: HashMap<i64, ChatRecord>,
     /// Scopes that TDLib reports as muted (`updateScopeNotificationSettings`).
     muted_scopes: HashMap<MuteScope, bool>,
-    /// Bot users whose chats have topics.
-    topic_bots: std::collections::HashSet<i64>,
+    /// Bots and forum supergroups whose chats have topics.
+    topic_owners: std::collections::HashSet<TopicOwner>,
 }
 
 impl ChatDirectory {
@@ -258,13 +269,12 @@ impl ChatDirectory {
         true
     }
 
-    /// This bot user has topics. Private chats of that user follow.
-    pub(super) fn bot_has_topics(&self, user_id: i64) -> bool {
-        self.topic_bots.contains(&user_id)
+    /// This bot or supergroup has topics. Its chats follow.
+    pub(super) fn owner_has_topics(&self, owner: TopicOwner) -> bool {
+        self.topic_owners.contains(&owner)
     }
 
-    /// A forum supergroup in "view as topics", or a private chat with a bot
-    /// that has topics.
+    /// A forum supergroup, or a private chat with a bot that has topics.
     pub(super) fn has_topics(&self, chat_id: i64) -> bool {
         self.chats.get(&chat_id).is_some_and(|chat| chat.has_topics)
     }
@@ -283,12 +293,16 @@ impl ChatDirectory {
         ids
     }
 
-    /// A bot user gained or lost topics. Private chats of that user follow.
-    pub(super) fn note_topic_bot(&mut self, user_id: i64, has_topics: bool) -> Vec<ChatEffect> {
+    /// A bot or a supergroup gained or lost topics. Its chats follow.
+    pub(super) fn note_topic_owner(
+        &mut self,
+        owner: TopicOwner,
+        has_topics: bool,
+    ) -> Vec<ChatEffect> {
         let changed = if has_topics {
-            self.topic_bots.insert(user_id)
+            self.topic_owners.insert(owner)
         } else {
-            self.topic_bots.remove(&user_id)
+            self.topic_owners.remove(&owner)
         };
         if !changed {
             return Vec::new();
@@ -296,7 +310,7 @@ impl ChatDirectory {
         let ids: Vec<i64> = self
             .chats
             .iter()
-            .filter(|(_, chat)| chat.peer == Some(user_id))
+            .filter(|(_, chat)| chat.peer == Some(owner))
             .map(|(id, _)| *id)
             .collect();
         ids.into_iter()
@@ -308,27 +322,6 @@ impl ChatDirectory {
                 self.effect(id, previous)
             })
             .collect()
-    }
-
-    /// `updateChatViewAsTopics` for a supergroup. A private chat (Saved
-    /// Messages) and a channel stay as they are.
-    pub(super) fn set_view_as_topics(
-        &mut self,
-        chat_id: i64,
-        view_as_topics: bool,
-    ) -> Option<ChatEffect> {
-        let chat = self.chats.get(&chat_id)?;
-        if chat.scope == MuteScope::Private || chat.scope == MuteScope::Channel {
-            return None;
-        }
-        if chat.has_topics == view_as_topics {
-            return None;
-        }
-        let previous = chat.order;
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.has_topics = view_as_topics;
-        }
-        self.effect(chat_id, Some(previous))
     }
 
     pub(super) fn set_title(&mut self, chat_id: i64, title: &str) -> Option<ChatEffect> {
@@ -1094,6 +1087,34 @@ mod tests {
             accent: 0,
             last_read_outbox: 0,
         }
+    }
+
+    /// A forum has topics from its supergroup, not from the "View as
+    /// topics" switch of Telegram. A bot with the same number is another
+    /// owner.
+    #[test]
+    fn a_forum_supergroup_gives_its_chat_topics() {
+        let mut directory = ChatDirectory::new();
+        let forum = TopicOwner::Forum(7);
+        let mut group = seed("Forum", 5, 0, "");
+        group.peer = Some(forum);
+        directory.upsert(-1_000_000_000_007, group);
+        let mut bot = seed("Bot", 4, 0, "");
+        bot.peer = Some(TopicOwner::Bot(7));
+        directory.upsert(7, bot);
+
+        let effects = directory.note_topic_owner(forum, true);
+        assert_eq!(effects.len(), 1, "only the chat of the supergroup");
+        assert!(directory.has_topics(-1_000_000_000_007));
+        assert!(!directory.has_topics(7), "the bot is another owner");
+        assert!(directory.owner_has_topics(forum));
+        assert!(
+            directory.note_topic_owner(forum, true).is_empty(),
+            "no change, no effect"
+        );
+
+        directory.note_topic_owner(forum, false);
+        assert!(!directory.has_topics(-1_000_000_000_007));
     }
 
     fn muted_row(effect: Option<ChatEffect>) -> bool {
