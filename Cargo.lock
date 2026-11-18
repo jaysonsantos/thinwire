@@ -5965,6 +5965,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "presage"
+version = "0.8.0-dev"
+source = "git+https://github.com/whisperfish/presage?rev=7a5c2c723cf92b9c6abf39b169e4368e07d2165b#7a5c2c723cf92b9c6abf39b169e4368e07d2165b"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "derive_more",
+ "futures",
+ "hex",
+ "libsignal-service",
+ "mime",
+ "percent-encoding",
+ "rand 0.9.5",
+ "regex",
+ "reqwest",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
 source = "git+https://github.com/jaysonsantos/thinwire?rev=cdcc1cea3ebb6d51bd95dbcabc0ce1e7ec0872d4#cdcc1cea3ebb6d51bd95dbcabc0ce1e7ec0872d4"
@@ -5973,7 +6000,7 @@ dependencies = [
  "bytes",
  "chrono",
  "libsqlite3-sys",
- "presage",
+ "presage 0.8.0-dev (git+https://github.com/whisperfish/presage?rev=4b81740610c301cbd54d95f4dbd4cadd692af95e)",
  "prost",
  "serde_json",
  "sqlx",
@@ -8211,7 +8238,7 @@ dependencies = [
  "futures",
  "libsqlite3-sys",
  "log",
- "presage",
+ "presage 0.8.0-dev (git+https://github.com/whisperfish/presage?rev=7a5c2c723cf92b9c6abf39b169e4368e07d2165b)",
  "presage-store-sqlite",
  "rusqlite",
  "sha2 0.11.1",
