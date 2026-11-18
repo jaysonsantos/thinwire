@@ -219,6 +219,8 @@ const INBOX_EVENTS: &[EventKind] = &[
     EventKind::HistorySync,
     EventKind::Messages,
     EventKind::MuteUpdate,
+    EventKind::Receipt,
+    EventKind::MarkChatAsReadUpdate,
     EventKind::ContactUpdate,
     EventKind::ContactRemoved,
 ];
@@ -295,6 +297,27 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
             jid: update.jid.to_string(),
             mute: Mute::from_action(update.action.muted, update.action.mute_end_timestamp),
         },
+        // A read of this account on another device. The library gives it
+        // the type `ReadSelf` and the chat of the other person or the group.
+        Event::Receipt(receipt)
+            if receipt.r#type == whatsapp_rust::wacore::types::presence::ReceiptType::ReadSelf =>
+        {
+            LinkEvent::Read {
+                jid: receipt.source.chat.to_non_ad().to_string(),
+                at: receipt.timestamp.timestamp(),
+            }
+        }
+        // "Mark as read" on another device. A replay of an old action does
+        // not move the read point back.
+        Event::MarkChatAsReadUpdate(update) if update.action.read == Some(true) => {
+            LinkEvent::Read {
+                jid: update.jid.to_non_ad().to_string(),
+                at: update
+                    .action_timestamp
+                    .unwrap_or(update.timestamp)
+                    .timestamp(),
+            }
+        }
         Event::Messages(batch) => LinkEvent::Messages(
             batch
                 .iter()

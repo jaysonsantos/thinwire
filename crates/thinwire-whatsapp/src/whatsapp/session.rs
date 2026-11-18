@@ -242,6 +242,13 @@ pub(super) enum LinkEvent {
         jid: String,
         mute: Mute,
     },
+    /// Another device of this account read a chat up to `at` (Unix
+    /// seconds): a read receipt of this account, or app-state
+    /// `MarkChatAsReadAction`.
+    Read {
+        jid: String,
+        at: i64,
+    },
     /// The phone saved, changed, or removed address-book contacts
     /// (app-state `ContactAction`).
     Contacts(Vec<WaContact>),
@@ -1103,6 +1110,14 @@ impl Session {
             }
             LinkEvent::Mute { jid, mute } => {
                 let row = state.inbox.apply_mute(&jid, mute);
+                if state.announced {
+                    row.into_iter().collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            LinkEvent::Read { jid, at } => {
+                let row = state.inbox.read_elsewhere(&jid, at);
                 if state.announced {
                     row.into_iter().collect()
                 } else {

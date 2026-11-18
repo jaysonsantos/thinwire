@@ -588,6 +588,30 @@ impl ChatRecord {
         }
     }
 
+    /// Another device of this account read this chat up to `at` (Unix
+    /// seconds): a read there, or an own message from there. An inbound
+    /// message after `at` stays unread. A time that is not after the read
+    /// point changes nothing.
+    fn read_up_to(&mut self, at: i64) {
+        if self.read_at.is_some_and(|old| old >= at) {
+            return;
+        }
+        let point = self.count_from(at);
+        // The rows of the read second were seen, and the rows after it are
+        // counted: a later copy of one of them must not count again.
+        let rows: Vec<(String, i64)> = self
+            .messages
+            .iter()
+            .filter(|row| !row.from_me && row.timestamp >= point)
+            .map(|row| (row.id.clone(), row.timestamp))
+            .collect();
+        let newer = rows.iter().filter(|(_, time)| *time > point).count();
+        for (id, timestamp) in rows {
+            self.remember(&id, timestamp);
+        }
+        self.unread = self.unread.min(u32::try_from(newer).unwrap_or(u32::MAX));
+    }
+
     /// Move the read point forward to `point` and drop the handled ids older
     /// than it. Returns the read point. It never moves back.
     fn count_from(&mut self, point: i64) -> i64 {
@@ -1345,6 +1369,10 @@ impl Inbox {
             }
             if is_open {
                 record.mark_read();
+            } else if message.from_me && !known {
+                // The user wrote this on another device, so the user saw
+                // the chat there up to this message.
+                record.read_up_to(message.timestamp);
             }
             // A new chat, or a name that this message brings, goes to the
             // shell before the message, so its notification has the name.
@@ -1698,6 +1726,25 @@ impl Inbox {
         record.mute = mute;
         record.mute_live = true;
         self.upsert_event(jid)
+    }
+
+    /// Another device of this account read the chat `jid` up to `at` (Unix
+    /// seconds). The row goes out when its count changes. A chat that the
+    /// inbox does not have gets no row.
+    pub(super) fn read_elsewhere(&mut self, jid: &str, at: i64) -> Option<AdapterEvent> {
+        let key = if self.chats.contains_key(jid) {
+            jid.to_string()
+        } else {
+            let other = self.alt_jid(jid)?;
+            self.chats.contains_key(other).then(|| other.to_string())?
+        };
+        let record = self.chats.get_mut(&key)?;
+        let before = record.unread;
+        record.read_up_to(at);
+        if record.unread == before {
+            return None;
+        }
+        self.upsert_event(&key)
     }
 
     fn upsert_event(&self, jid: &str) -> Option<AdapterEvent> {
@@ -3454,6 +3501,95 @@ pub(super) mod tests {
             Vec::new(),
         );
         assert_eq!(upserts(&events)[0].unread, 1);
+    }
+
+    fn own(chat: &str, id: &str, timestamp: i64) -> WaMessage {
+        WaMessage {
+            from_me: true,
+            ..message(chat, id, "mine", timestamp)
+        }
+    }
+
+    /// A read on the phone clears the count here. A message after that read
+    /// stays unread, and a copy of a read message does not count again.
+    #[test]
+    fn a_read_on_another_device_clears_the_count() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![
+            message(chat, "a", "one", 10),
+            message(chat, "b", "two", 11),
+            message(chat, "c", "three", 20),
+        ]);
+        assert_eq!(inbox.chats[chat].unread, 3);
+
+        let row = inbox.read_elsewhere(chat, 12).expect("the count changed");
+        let AdapterEvent::ConversationUpsert { conversation } = row else {
+            panic!("a chat row");
+        };
+        assert_eq!(conversation.unread, 1, "the message after the read stays");
+
+        // An older read changes nothing, and it sends no row.
+        assert!(inbox.read_elsewhere(chat, 5).is_none());
+        assert_eq!(inbox.chats[chat].unread, 1);
+
+        assert!(inbox.read_elsewhere(chat, 30).is_some());
+        assert_eq!(inbox.chats[chat].unread, 0);
+        // A history copy of a read message does not count again.
+        let events = inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 3,
+                timestamp: 20,
+                messages: vec![message(chat, "c", "three", 20)],
+            }],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 0);
+        let events = inbox.apply_messages(vec![message(chat, "d", "four", 31)]);
+        assert_eq!(upserts(&events)[0].unread, 1, "a new message counts");
+
+        // A chat that the inbox does not have gets no row.
+        assert!(inbox.read_elsewhere("999@s.whatsapp.net", 40).is_none());
+        assert!(!inbox.chats.contains_key("999@s.whatsapp.net"));
+    }
+
+    /// An own message from another device says that the user saw the chat
+    /// there. An inbound message after it stays unread.
+    #[test]
+    fn an_own_message_from_another_device_clears_the_count() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![
+            message(chat, "a", "one", 10),
+            message(chat, "b", "two", 11),
+        ]);
+        let events = inbox.apply_messages(vec![own(chat, "mine", 12)]);
+        assert_eq!(upserts(&events).last().expect("row").unread, 0);
+
+        // An own message that is older than an inbound one keeps that one.
+        let mut inbox = Inbox::default();
+        inbox.apply_messages(vec![
+            message(chat, "a", "one", 10),
+            message(chat, "c", "three", 20),
+        ]);
+        let events = inbox.apply_messages(vec![own(chat, "late", 15)]);
+        assert_eq!(upserts(&events).last().expect("row").unread, 1);
+    }
+
+    /// A read that names the other JID of a person finds the chat.
+    #[test]
+    fn a_read_finds_the_chat_by_its_other_jid() {
+        let mut inbox = Inbox::default();
+        let phone = "111@s.whatsapp.net";
+        let lid = "777@lid";
+        inbox.apply_messages(vec![message(phone, "a", "one", 10)]);
+        assert!(inbox.learn_pair(lid, phone));
+        assert!(inbox.read_elsewhere(lid, 10).is_some());
+        assert_eq!(inbox.chats[phone].unread, 0);
+        assert!(!inbox.chats.contains_key(lid));
     }
 
     /// Codex r4131622220: after a local read, a live redelivery of an id
