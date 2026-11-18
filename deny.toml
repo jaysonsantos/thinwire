@@ -24,6 +24,11 @@ ignore = [
   { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
+  # chrono, a direct dependency of thinwire-core and of wacore, presage, and
+  # libsignal-service. The notice says that every version is affected and
+  # that no upgrade is available. Not a vulnerability. Remove this entry when
+  # the workspace and the pinned protocol libraries do not need chrono.
+  { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no upgrade. thinwire-core and the pinned protocol libraries need it" },
   # A vulnerability notice, accepted by the owner on 2026-11-12. SQLite
   # before 3.54.0 can return old memory when a database file and its `-wal`
   # file have different page sizes. The attack needs a local program that
