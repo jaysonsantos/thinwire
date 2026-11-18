@@ -3819,6 +3819,7 @@ async fn send_text(
             .group_key(&outbound.conversation_id)
             .await
             .ok_or(())?;
+        let data_message = in_group(manager, &master_key, data_message).await;
         manager
             .send_message_to_group(&master_key, data_message, timestamp)
             .await
@@ -3873,6 +3874,40 @@ async fn send_text(
     Ok(())
 }
 
+/// `data_message` as a message of the group of `master_key`, with the
+/// revision of the group that the store has.
+async fn in_group(
+    manager: &Manager<SqliteStore, Registered>,
+    master_key: &[u8; 32],
+    data_message: DataMessage,
+) -> DataMessage {
+    let revision = manager
+        .store()
+        .group(*master_key)
+        .await
+        .ok()
+        .flatten()
+        .map_or(0, |group| group.revision);
+    with_group_context(data_message, master_key, revision)
+}
+
+/// `data_message` with the context of its group. Presage sends a group
+/// message to each member and does not add the context. A message with no
+/// context is a one-to-one message for each member, and the other devices
+/// of this account show it in a chat with no person.
+fn with_group_context(
+    mut data_message: DataMessage,
+    master_key: &[u8; 32],
+    revision: u32,
+) -> DataMessage {
+    data_message.group_v2 = Some(presage::libsignal_service::content::GroupContextV2 {
+        master_key: Some(master_key.to_vec()),
+        revision: Some(revision),
+        ..Default::default()
+    });
+    data_message
+}
+
 /// Send one data message to a contact or a group, with the time of now.
 async fn send_data(
     manager: &mut Manager<SqliteStore, Registered>,
@@ -3890,6 +3925,7 @@ async fn send_data(
     data_message.timestamp = Some(timestamp);
     if super::group::is_group_id(conversation_id) {
         let master_key = session.group_key(conversation_id).await.ok_or(())?;
+        let data_message = in_group(manager, &master_key, data_message).await;
         manager
             .send_message_to_group(&master_key, data_message, timestamp)
             .await
@@ -4474,6 +4510,26 @@ mod tests {
 
     use super::super::path::RETAINED_DIR;
     use super::*;
+
+    /// A message for a group has the key and the revision of the group.
+    /// With no context, each member gets a one-to-one message.
+    #[test]
+    fn a_group_message_has_the_context_of_its_group() {
+        let message = DataMessage {
+            body: Some("hello".into()),
+            ..Default::default()
+        };
+        let sent = with_group_context(message, &[7; 32], 3);
+        assert_eq!(
+            sent.group_v2,
+            Some(GroupContextV2 {
+                master_key: Some(vec![7; 32]),
+                revision: Some(3),
+                ..Default::default()
+            })
+        );
+        assert_eq!(sent.body.as_deref(), Some("hello"));
+    }
 
     /// After a new link, the phone sends its contacts. The chat list shows
     /// them at once, not at the next start.
