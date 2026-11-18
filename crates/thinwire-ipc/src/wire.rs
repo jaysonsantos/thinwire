@@ -26,9 +26,11 @@ use crate::SecretText;
 /// [`WireMessage::reply_to`], and [`WireEvent::Reactions`]. Version 7 adds
 /// [`WireMessage::mentions`]. Version 8 adds [`WireCommand::Unlink`].
 /// Version 9 adds [`WireMessage::video`], [`WireCommand::DownloadVideo`],
-/// [`WireEvent::VideoReady`], and [`WireEvent::VideoFailed`]. An older peer
+/// [`WireEvent::VideoReady`], and [`WireEvent::VideoFailed`]. Version 10 adds
+/// [`WireMessage::file`], [`WireCommand::DownloadDocument`],
+/// [`WireEvent::FileReady`], and [`WireEvent::FileFailed`]. An older peer
 /// cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// One unreadable stretch on a history page.
 ///
@@ -193,6 +195,11 @@ pub enum WireCommand {
     DownloadVideo {
         file_id: i32,
     },
+    /// Download the document `file_id` of [`WireMessage::file`]. The helper
+    /// answers [`WireEvent::FileReady`] or [`WireEvent::FileFailed`].
+    DownloadDocument {
+        file_id: i32,
+    },
     /// The user accepted the full-screen gate of this protocol in the app.
     AcknowledgeGate,
     /// Start pairing. `phone` is the optional number for a pair code. It is
@@ -227,6 +234,7 @@ impl WireCommand {
             Self::ViewChat { .. } => "view_chat",
             Self::DownloadVoice { .. } => "download_voice",
             Self::DownloadVideo { .. } => "download_video",
+            Self::DownloadDocument { .. } => "download_document",
             Self::AcknowledgeGate => "acknowledge_gate",
             Self::BeginLink { .. } => "begin_link",
             Self::CancelLink => "cancel_link",
@@ -367,6 +375,10 @@ pub struct WireMessage {
     /// is then the first picture of the clip, when the protocol gives one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<WireVideo>,
+    /// A document of the message. The file does not cross with the
+    /// message: [`WireCommand::DownloadDocument`] asks for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<WireDocument>,
     /// The reactions on the message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<WireReaction>,
@@ -442,6 +454,29 @@ pub struct WireVideo {
     /// plays in its row.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub note: bool,
+}
+
+/// The document of a message. `file_id` is a handle of the helper, not a
+/// file of a protocol server. `Debug` shows no name.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireDocument {
+    /// The file name, with no folder. It can be empty.
+    pub name: String,
+    pub mime: String,
+    /// Bytes. Zero when the protocol does not say.
+    pub size: u64,
+    /// Positive, or zero for a file that the helper does not download.
+    pub file_id: i32,
+}
+
+impl fmt::Debug for WireDocument {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireDocument")
+            .field("size", &self.size)
+            .field("file_id", &self.file_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An image of a message, as encoded bytes (WebP, PNG, or JPEG).
@@ -608,6 +643,16 @@ pub enum WireEvent {
     VideoFailed {
         file_id: i32,
     },
+    /// The document `file_id` is a local file now. The helper keeps the
+    /// file in its own folder. The path is absolute.
+    FileReady {
+        file_id: i32,
+        path: String,
+    },
+    /// The document `file_id` did not download.
+    FileFailed {
+        file_id: i32,
+    },
     /// The small picture of the chat `conversation_id`.
     Avatar {
         conversation_id: String,
@@ -660,6 +705,8 @@ impl WireEvent {
             Self::VoiceFailed { .. } => "voice_failed",
             Self::VideoReady { .. } => "video_ready",
             Self::VideoFailed { .. } => "video_failed",
+            Self::FileReady { .. } => "file_ready",
+            Self::FileFailed { .. } => "file_failed",
             Self::Avatar { .. } => "avatar",
             Self::Reactions { .. } => "reactions",
         }
@@ -695,6 +742,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
             mentions: Vec::new(),
@@ -776,6 +824,77 @@ mod tests {
             let shown = format!("{line:?}");
             assert!(
                 !shown.contains("ana") && !shown.contains(".video"),
+                "{shown}"
+            );
+        }
+    }
+
+    /// The lines of wire version 10. A document crosses as a handle with
+    /// its name, its type, and its size. A message with no document has no
+    /// key for it. The download request and both answers read back. `Debug`
+    /// shows no name and no path.
+    #[test]
+    fn a_document_and_its_download_lines_survive_the_wire() {
+        const PATH: &str = "/home/ana/files/7-notes.pdf";
+        let mut with_file = message();
+        with_file.file = Some(WireDocument {
+            name: "notes.pdf".into(),
+            mime: "application/pdf".into(),
+            size: 2048,
+            file_id: 7,
+        });
+        let text = serde_json::to_string(&with_file).expect("encode");
+        assert!(
+            text.contains(
+                r#""file":{"name":"notes.pdf","mime":"application/pdf","size":2048,"file_id":7}"#
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WireMessage>(&text).expect("decode"),
+            with_file
+        );
+        assert!(!format!("{:?}", with_file.file).contains("notes"));
+        let plain = serde_json::to_string(&message()).expect("encode");
+        assert!(!plain.contains("\"file\""), "{plain}");
+
+        let request = AppLine::Request {
+            id: 11,
+            protocol: WireProtocol::WhatsApp,
+            command: WireCommand::DownloadDocument { file_id: 7 },
+        };
+        let encoded = encode(&request).expect("encode");
+        assert_eq!(
+            encoded.trim_end(),
+            r#"{"type":"request","id":11,"protocol":"whatsapp","command":{"name":"download_document","file_id":7}}"#
+        );
+        assert_eq!(
+            decode::<AppLine>(encoded.trim_end()).expect("decode"),
+            request
+        );
+        assert!(!WireCommand::DownloadDocument { file_id: 7 }.wakes_helper());
+        assert!(!WireCommand::DownloadDocument { file_id: 7 }.reads_session_key());
+        for event in [
+            WireEvent::FileReady {
+                file_id: 7,
+                path: PATH.into(),
+            },
+            WireEvent::FileFailed { file_id: 7 },
+        ] {
+            let kind = event.kind();
+            let line = HelperLine::Event {
+                protocol: WireProtocol::WhatsApp,
+                event,
+            };
+            let encoded = encode(&line).expect("encode");
+            assert!(encoded.contains(kind), "{encoded}");
+            assert_eq!(
+                decode::<HelperLine>(encoded.trim_end()).expect("decode"),
+                line
+            );
+            let shown = format!("{line:?}");
+            assert!(
+                !shown.contains("ana") && !shown.contains("notes"),
                 "{shown}"
             );
         }

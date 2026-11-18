@@ -22,7 +22,7 @@ use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
 use super::inbox::TargetRef;
 use super::inbox::{
-    HistoryChat, ME, MEDIA_MAX_BYTES, MediaClass, MediaRef, Mute, PHOTO_LABEL,
+    Document, HistoryChat, ME, MEDIA_MAX_BYTES, MediaClass, MediaRef, Mute, PHOTO_LABEL,
     STICKER_DOWNLOAD_MAX, Sticker, THUMBNAIL_MAX_BYTES, Video, Voice, WaContact, WaMessage,
     WaReaction,
 };
@@ -32,8 +32,8 @@ use super::path::{
     whatsapp_device_store_path,
 };
 use super::session::{
-    ActionFuture, DownloadFuture, HistoryAsk, LinkEvent, NamesFuture, PhoneFuture, SendFailure,
-    SendFuture, SubjectFuture, VideoFuture, WhatsAppSender,
+    ActionFuture, DownloadFuture, HistoryAsk, LinkEvent, MediaSendFuture, NamesFuture, PhoneFuture,
+    SendFailure, SendFuture, SentMedia, SubjectFuture, VideoFuture, WhatsAppSender,
 };
 use thinwire_protocol::RedactedPairingSecret;
 
@@ -157,6 +157,7 @@ impl LinkBackend for LiveBackend {
             if let Some(dir) = path.parent() {
                 thinwire_protocol::voice_files::clear(&super::path::voice_dir_of(dir));
                 thinwire_protocol::voice_files::clear(&super::path::video_dir_of(dir));
+                thinwire_protocol::voice_files::clear(&super::path::files_dir_of(dir));
             }
             remove_device_store(&path)
         })
@@ -339,6 +340,7 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                         sticker: picture_of(&inbound.message),
                         voice: voice_of(&inbound.message),
                         video: video_of(&inbound.message),
+                        document: document_of(&inbound.message),
                         reactions: Vec::new(),
                         reply_to: reply_of(&inbound.message),
                         mentions: mentions_of(&inbound.message),
@@ -467,6 +469,7 @@ fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMe
         sticker: info.message.as_option().and_then(picture_of),
         voice: info.message.as_option().and_then(voice_of),
         video: info.message.as_option().and_then(video_of),
+        document: info.message.as_option().and_then(document_of),
         reactions: history_reactions(chat_jid, info),
         reply_to: info.message.as_option().and_then(reply_of),
         mentions: info
@@ -674,6 +677,30 @@ fn video_of(message: &wa::Message) -> Option<Video> {
     })
 }
 
+/// The file of a document message. A file that is larger than the helper
+/// keeps, and a view-once file, have no download reference: the row shows
+/// the name and the size only.
+fn document_of(message: &wa::Message) -> Option<Document> {
+    let document = message.get_base_message().document_message.as_option()?;
+    let media = (!message.is_view_once()
+        && fits(
+            document.file_length,
+            thinwire_protocol::voice_files::DOCUMENT_MAX_BYTES as u64,
+        ))
+    .then(|| media_ref(MediaClass::Document, document))
+    .flatten();
+    Some(Document {
+        name: document
+            .file_name
+            .clone()
+            .or_else(|| document.title.clone())
+            .unwrap_or_default(),
+        mime: document.mimetype.clone().unwrap_or_default(),
+        size: document.file_length.unwrap_or(0),
+        media,
+    })
+}
+
 /// Plain text, a media caption, or a short media label. Protocol-only
 /// messages (reactions, key distribution, receipts) return `None`.
 fn body_of(message: &wa::Message) -> Option<String> {
@@ -701,8 +728,9 @@ fn body_of(message: &wa::Message) -> Option<String> {
         "[voice message]"
     } else if base.audio_message.is_set() {
         "[audio]"
-    } else if base.document_message.is_set() {
-        "[document]"
+    } else if let Some(document) = document_of(message) {
+        // The file name, for the chat list. The row shows the file.
+        return Some(document.label().to_string());
     } else if base.sticker_message.is_set() || base.lottie_sticker_message.is_set() {
         "[sticker]"
     } else if base.contact_message.is_set() {
@@ -1014,7 +1042,7 @@ impl WhatsAppSender for LiveSender {
         chat_jid: &'a str,
         file: &'a thinwire_protocol::OutgoingFile,
         caption: &'a str,
-    ) -> SendFuture<'a> {
+    ) -> MediaSendFuture<'a> {
         Box::pin(async move {
             use whatsapp_rust::download::MediaType;
             use whatsapp_rust::waproto::buffa::MessageField;
@@ -1040,6 +1068,42 @@ impl WhatsAppSender for LiveSender {
                 .await
                 .map_err(|_| SendFailure::Network)?;
             let caption = (!caption.is_empty()).then(|| caption.to_string());
+            // The row of this send downloads the file as a row of another
+            // device does.
+            let reference = |class| MediaRef {
+                class,
+                direct_path: upload.direct_path.clone(),
+                media_key: upload.media_key.to_vec(),
+                file_sha256: upload.file_sha256.to_vec(),
+                file_enc_sha256: upload.file_enc_sha256.to_vec(),
+                file_length: upload.file_length,
+            };
+            let (sticker, video) = match file.kind {
+                thinwire_protocol::MediaKind::Photo => (
+                    fits(
+                        Some(upload.file_length),
+                        thinwire_protocol::photo_resize::PHOTO_DOWNLOAD_MAX as u64,
+                    )
+                    .then(|| Sticker {
+                        width: 0,
+                        height: 0,
+                        media: reference(MediaClass::Image),
+                        photo: true,
+                    }),
+                    None,
+                ),
+                thinwire_protocol::MediaKind::Video => (
+                    None,
+                    Some(Video {
+                        seconds: 0,
+                        width: 0,
+                        height: 0,
+                        media: reference(MediaClass::Video),
+                        note: false,
+                        thumbnail: None,
+                    }),
+                ),
+            };
             let mut message = wa::Message::default();
             // The proto structs are non-exhaustive: set the fields one by one.
             match file.kind {
@@ -1074,7 +1138,11 @@ impl WhatsAppSender for LiveSender {
             self.client
                 .send_message(jid, message)
                 .await
-                .map(|sent| sent.message_id.to_string())
+                .map(|sent| SentMedia {
+                    id: sent.message_id.to_string(),
+                    sticker,
+                    video,
+                })
                 .map_err(|error| classify_send_error(&error))
         })
     }
@@ -1086,8 +1154,9 @@ impl WhatsAppSender for LiveSender {
                 MediaClass::Sticker => STICKER_DOWNLOAD_MAX,
                 MediaClass::Image => thinwire_protocol::photo_resize::PHOTO_DOWNLOAD_MAX as u64,
                 MediaClass::Audio => thinwire_protocol::voice_files::VOICE_MAX_BYTES as u64,
-                // A video goes to a file: `download_video`.
-                MediaClass::Video => return Err(()),
+                // A video and a document go to a file: `download_video`
+                // and `download_document`.
+                MediaClass::Video | MediaClass::Document => return Err(()),
             };
             let params = download_params(media)?;
             let bytes = self
@@ -1117,7 +1186,7 @@ impl WhatsAppSender for LiveSender {
                 .find_map(|size| size.bytes)
                 .map(|bytes| bytes.as_slice().to_vec())
                 .ok_or(()),
-                MediaClass::Audio | MediaClass::Video => Ok(bytes),
+                MediaClass::Audio | MediaClass::Video | MediaClass::Document => Ok(bytes),
             }
         })
     }
@@ -1129,29 +1198,67 @@ impl WhatsAppSender for LiveSender {
         file_id: i32,
     ) -> VideoFuture<'a> {
         Box::pin(async move {
-            use thinwire_protocol::voice_files::{VIDEO_MAX_BYTES, VideoPart};
+            use thinwire_protocol::voice_files::VideoPart;
             if media.class != MediaClass::Video {
                 return Err(());
             }
-            let params = download_params(media)?;
             let folder = dir.to_path_buf();
-            let (file, part) =
-                tokio::task::spawn_blocking(move || VideoPart::begin(&folder, file_id))
-                    .await
-                    .map_err(|_| ())?
-                    .map_err(|_| ())?;
-            // The client decrypts into the file and checks both hashes. A
-            // failed download drops `part`, and the part file goes.
-            let file = self
-                .client
-                .download_to_writer(&params, file, download_limits(VIDEO_MAX_BYTES as u64))
+            self.download_to_file(media, move || VideoPart::begin(&folder, file_id))
                 .await
-                .map_err(|_| ())?;
-            tokio::task::spawn_blocking(move || part.finish(file))
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())
         })
+    }
+
+    fn download_document<'a>(
+        &'a self,
+        media: &'a MediaRef,
+        dir: &'a std::path::Path,
+        file_id: i32,
+        name: &'a str,
+    ) -> VideoFuture<'a> {
+        Box::pin(async move {
+            use thinwire_protocol::voice_files::VideoPart;
+            if media.class != MediaClass::Document {
+                return Err(());
+            }
+            let (folder, name) = (dir.to_path_buf(), name.to_string());
+            self.download_to_file(media, move || {
+                VideoPart::begin_document(&folder, file_id, &name)
+            })
+            .await
+        })
+    }
+}
+
+impl LiveSender {
+    /// Download and decrypt `media` into the file that `begin` starts. The
+    /// file never is in memory as a whole.
+    async fn download_to_file(
+        &self,
+        media: &MediaRef,
+        begin: impl FnOnce() -> Result<
+            (std::fs::File, thinwire_protocol::voice_files::VideoPart),
+            thinwire_protocol::voice_files::StoreError,
+        > + Send
+        + 'static,
+    ) -> Result<thinwire_protocol::AudioPath, ()> {
+        // A video and a document have the same limit.
+        const MAX: u64 = thinwire_protocol::voice_files::VIDEO_MAX_BYTES as u64;
+        let params = download_params(media)?;
+        let (file, part) = tokio::task::spawn_blocking(begin)
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        // The client decrypts into the file and checks both hashes. A
+        // failed download drops `part`, and the part file goes.
+        let file = self
+            .client
+            .download_to_writer(&params, file, download_limits(MAX))
+            .await
+            .map_err(|_| ())?;
+        tokio::task::spawn_blocking(move || part.finish(file))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())
     }
 }
 
@@ -1172,6 +1279,7 @@ fn download_params(media: &MediaRef) -> Result<DownloadParams, ()> {
         MediaClass::Image => MediaType::Image,
         MediaClass::Audio => MediaType::Audio,
         MediaClass::Video => MediaType::Video,
+        MediaClass::Document => MediaType::Document,
     };
     DownloadParams::encrypted(
         media.direct_path.as_str(),
@@ -1363,6 +1471,49 @@ mod tests {
         assert_eq!(video.seconds, 12);
     }
 
+    /// A document has its name, its type, its size, and a download
+    /// reference, also inside the wrapper of a document with a caption.
+    /// With no caption, the body is the file name. A document that is too
+    /// large has no reference.
+    #[test]
+    fn a_document_has_its_file_and_its_name_as_the_body() {
+        let mut document = wa::message::DocumentMessage::default();
+        downloadable!(document);
+        document.file_name = Some("notes.pdf".into());
+        document.mimetype = Some("application/pdf".into());
+        let mut plain = wa::Message::default();
+        plain.document_message =
+            whatsapp_rust::waproto::buffa::MessageField::some(document.clone());
+        let file = document_of(&plain).expect("document");
+        assert_eq!(file.name, "notes.pdf");
+        assert_eq!(file.mime, "application/pdf");
+        assert_eq!(file.size, document.file_length.unwrap_or(0));
+        let media = file.media.expect("reference");
+        assert_eq!(media.class, MediaClass::Document);
+        assert!(download_params(&media).is_ok());
+        assert_eq!(body_of(&plain).as_deref(), Some("notes.pdf"));
+
+        let mut with_caption = document.clone();
+        with_caption.caption = Some("read this".into());
+        let mut inner = wa::Message::default();
+        inner.document_message = whatsapp_rust::waproto::buffa::MessageField::some(with_caption);
+        let mut outer = wa::Message::default();
+        outer.document_with_caption_message =
+            whatsapp_rust::waproto::buffa::MessageField::some(wrapped(inner));
+        assert!(document_of(&outer).and_then(|file| file.media).is_some());
+        assert_eq!(body_of(&outer).as_deref(), Some("read this"));
+
+        let mut large = document.clone();
+        large.file_length = Some(thinwire_protocol::voice_files::DOCUMENT_MAX_BYTES as u64 + 1);
+        large.file_name = None;
+        let mut big = wa::Message::default();
+        big.document_message = whatsapp_rust::waproto::buffa::MessageField::some(large);
+        let file = document_of(&big).expect("document");
+        assert!(file.media.is_none());
+        assert_eq!(body_of(&big).as_deref(), Some("[document]"));
+        assert!(document_of(&wa::Message::text("hi")).is_none());
+    }
+
     /// A video that is too large, or that has no key, keeps its label only.
     #[test]
     fn a_video_that_cannot_download_keeps_its_label() {
@@ -1448,6 +1599,7 @@ mod tests {
             (MediaClass::Image, MediaType::Image),
             (MediaClass::Audio, MediaType::Audio),
             (MediaClass::Video, MediaType::Video),
+            (MediaClass::Document, MediaType::Document),
         ] {
             let reference = MediaRef {
                 class,

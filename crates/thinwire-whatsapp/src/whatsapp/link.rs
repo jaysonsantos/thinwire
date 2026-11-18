@@ -1045,6 +1045,7 @@ pub(super) mod tests {
                         sticker: None,
                         voice: None,
                         video: None,
+                        document: None,
                     }],
                 },
             )],

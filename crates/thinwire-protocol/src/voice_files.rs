@@ -1,10 +1,12 @@
-//! The audio and video files that an adapter keeps for the player.
+//! The audio and video files that an adapter keeps for the player, and
+//! the documents that the user downloads.
 //!
 //! Each adapter and account has one folder for audio and one for video. The
 //! files are plain media, as the files of TDLib are: the folder is private
 //! to the user (0700), and each file is 0600. An adapter empties its folders
 //! at start and when its account unlinks. A file name is the handle of the
-//! media, so it holds no chat, no sender, and no text.
+//! media, so it holds no chat, no sender, and no text. A document also has
+//! its clean name, so the OS knows its program ([`document_file_name`]).
 //!
 //! An in-app adapter keeps its video clips in the folder of its audio files,
 //! with the same rules ([`store_video`]).
@@ -129,6 +131,101 @@ impl VideoPart {
     }
 }
 
+/// The largest document an adapter keeps.
+pub const DOCUMENT_MAX_BYTES: usize = VIDEO_MAX_BYTES;
+
+/// The file name of the document `file_id` in its folder: the handle, "-",
+/// and the clean name of the document. The program of the OS for a file
+/// comes from the extension, so the name keeps it.
+///
+/// `name` comes from another person. The clean name has no folder and no
+/// leading dot, and it has only letters, digits, spaces, and `-_.()`. It
+/// has 120 bytes at most.
+#[must_use]
+pub fn document_file_name(file_id: i32, name: &str) -> String {
+    const STEM_MAX: usize = 100;
+    const EXTENSION_MAX: usize = 10;
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean: String = base
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | '(' | ')') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean = clean.trim_matches(|ch| ch == '.' || ch == ' ');
+    let (stem, extension) = match clean.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && (1..=EXTENSION_MAX).contains(&extension.len())
+                && extension.chars().all(|ch| ch.is_ascii_alphanumeric()) =>
+        {
+            (stem, Some(extension))
+        }
+        _ => (clean, None),
+    };
+    let mut end = stem.len().min(STEM_MAX);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let stem = stem[..end].trim_end_matches(['.', ' ']);
+    let stem = if stem.is_empty() { "file" } else { stem };
+    match extension {
+        Some(extension) => format!("{file_id}-{stem}.{extension}"),
+        None => format!("{file_id}-{stem}"),
+    }
+}
+
+/// The document `file_id` with the name `name` in `dir`, when an earlier
+/// download of this run wrote it. The path is absolute.
+#[must_use]
+pub fn stored_document(dir: &Path, file_id: i32, name: &str) -> Option<AudioPath> {
+    if file_id <= 0 {
+        return None;
+    }
+    let path = dir.join(document_file_name(file_id, name));
+    let size = std::fs::metadata(&path)
+        .ok()
+        .filter(|meta| meta.is_file())?;
+    if size.len() == 0 {
+        return None;
+    }
+    absolute(&path).ok()
+}
+
+impl VideoPart {
+    /// Start the document `file_id` with the name `name` in `dir`. It has
+    /// the rules of [`VideoPart::begin`], and [`VideoPart::finish`] gives
+    /// the file the name of [`document_file_name`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] as [`VideoPart::begin`] gives it.
+    pub fn begin_document(
+        dir: &Path,
+        file_id: i32,
+        name: &str,
+    ) -> Result<(std::fs::File, Self), StoreError> {
+        if file_id <= 0 {
+            return Err(StoreError);
+        }
+        prepare(dir).map_err(|_| StoreError)?;
+        let part = dir.join(format!("{file_id}.{PART_SUFFIX}"));
+        let file = open_private(&part).map_err(|_| StoreError)?;
+        Ok((
+            file,
+            Self {
+                part,
+                path: dir.join(document_file_name(file_id, name)),
+                done: false,
+            },
+        ))
+    }
+}
+
 impl Drop for VideoPart {
     fn drop(&mut self) {
         if !self.done {
@@ -226,6 +323,60 @@ mod tests {
             .join(format!("{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The name of a document comes from another person. The file name
+    /// has the handle first, no folder, no leading dot, and its extension.
+    #[test]
+    fn a_document_name_is_clean_and_keeps_its_extension() {
+        assert_eq!(document_file_name(7, "notes.pdf"), "7-notes.pdf");
+        assert_eq!(
+            document_file_name(7, "../../.ssh/authorized_keys"),
+            "7-authorized_keys"
+        );
+        assert_eq!(
+            document_file_name(7, "C:\\dir\\a b (1).TXT"),
+            "7-a b (1).TXT"
+        );
+        assert_eq!(document_file_name(7, ".bashrc"), "7-bashrc");
+        assert_eq!(document_file_name(7, "a\u{0}b:c*.pdf"), "7-a_b_c_.pdf");
+        assert_eq!(document_file_name(7, ""), "7-file");
+        assert_eq!(document_file_name(7, "..."), "7-file");
+        assert_eq!(document_file_name(7, "relatório.pdf"), "7-relatório.pdf");
+        let long = format!("{}.pdf", "é".repeat(300));
+        let name = document_file_name(7, &long);
+        assert!(name.len() <= 120, "{}", name.len());
+        assert!(name.ends_with(".pdf"));
+    }
+
+    /// A document part gets its name at the end, and a later request of
+    /// this run finds the file.
+    #[test]
+    fn a_document_part_gets_its_name_at_the_end() {
+        let dir = folder("document");
+        assert!(stored_document(&dir, 7, "notes.pdf").is_none());
+        let (mut file, part) = VideoPart::begin_document(&dir, 7, "notes.pdf").expect("part");
+        file.write_all(b"%PDF-1.7").expect("write");
+        let path = part.finish(file).expect("stored");
+        assert_eq!(
+            path.as_path().file_name().and_then(|name| name.to_str()),
+            Some("7-notes.pdf")
+        );
+        assert_eq!(stored_document(&dir, 7, "notes.pdf"), Some(path.clone()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file = std::fs::metadata(path.as_path()).expect("file");
+            assert_eq!(file.permissions().mode() & 0o777, 0o600);
+        }
+        // A part that does not finish leaves no file.
+        let (file, part) = VideoPart::begin_document(&dir, 8, "b.pdf").expect("part");
+        drop(part);
+        drop(file);
+        assert!(stored_document(&dir, 8, "b.pdf").is_none());
+        assert!(VideoPart::begin_document(&dir, 0, "b.pdf").is_err());
+        clear(&dir);
+        assert!(stored_document(&dir, 7, "notes.pdf").is_none());
     }
 
     /// The file has the bytes, an absolute path, and private modes. The

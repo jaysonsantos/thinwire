@@ -10,7 +10,7 @@ use std::fmt;
 
 use thinwire_protocol::{
     AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ImageBytes, MessageAudio,
-    MessagePhoto, MessageVideo, PhotoSize, ProtocolId, mention_links,
+    MessageFile, MessagePhoto, MessageVideo, PhotoSize, ProtocolId, mention_links,
 };
 
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
@@ -51,6 +51,9 @@ pub(super) const MEDIA_MAX_BYTES: usize = 512 * 1024;
 /// The body of a photo message with no caption.
 pub(super) const PHOTO_LABEL: &str = "[photo]";
 
+/// The body of a document message with no caption and no file name.
+pub(super) const DOCUMENT_LABEL: &str = "[document]";
+
 /// The longest side of a sticker in the thread, in points. The image keeps
 /// its own pixels, so it stays sharp on a high-density screen.
 const STICKER_SIDE: u32 = 160;
@@ -77,6 +80,7 @@ pub(super) enum MediaClass {
     Image,
     Audio,
     Video,
+    Document,
 }
 
 /// The download reference of one media file: where the encrypted file is,
@@ -269,8 +273,56 @@ impl Video {
     }
 }
 
-/// The handle of the audio of one message for `DownloadVoice`, and of its
-/// video for `DownloadVideo`. The same message has the same handle in every
+/// A document on a message. It downloads when the user asks. `Debug` shows
+/// no name.
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(super) struct Document {
+    /// The file name from the message. It can be empty.
+    pub name: String,
+    pub mime: String,
+    /// Bytes. Zero when the message does not say.
+    pub size: u64,
+    /// `None` for a file that the helper does not download: it is too
+    /// large, or the message has no complete reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaRef>,
+}
+
+impl fmt::Debug for Document {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Document")
+            .field("size", &self.size)
+            .field("media", &self.media)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Document {
+    /// The body of a document row with no caption: the file name, or
+    /// [`DOCUMENT_LABEL`] for a document with no name.
+    pub(super) fn label(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() {
+            DOCUMENT_LABEL
+        } else {
+            name
+        }
+    }
+
+    fn file(&self, file_id: i32) -> MessageFile {
+        MessageFile::new(
+            self.name.clone(),
+            self.mime.clone(),
+            self.size,
+            if self.media.is_some() { file_id } else { 0 },
+            None,
+            None,
+        )
+    }
+}
+
+/// The handle of the audio of one message for `DownloadVoice`, of its
+/// video for `DownloadVideo`, and of its document for `DownloadDocument`. The same message has the same handle in every
 /// run, so a row from before a helper restart still downloads. Always
 /// positive.
 pub(super) fn voice_file_id(jid: &str, id: &str) -> i32 {
@@ -340,6 +392,8 @@ pub(super) struct WaMessage {
     pub voice: Option<Voice>,
     /// The video of a video message, of a round video message, or of a GIF.
     pub video: Option<Video>,
+    /// The file of a document message.
+    pub document: Option<Document>,
     /// The id of the message that this one replies to.
     pub reply_to: Option<String>,
     /// The reactions: who reacted ([`ME`] or a JID) and the emoji. Sorted by
@@ -712,6 +766,8 @@ pub(super) struct SavedMessage {
     pub voice: Option<Voice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<Video>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<Document>,
 }
 
 /// One saved chat: the row and its messages.
@@ -829,6 +885,7 @@ fn saved_message(message: &WaMessage) -> SavedMessage {
         sticker: message.sticker.clone(),
         voice: message.voice.clone(),
         video: message.video.clone(),
+        document: message.document.clone(),
     }
 }
 
@@ -955,6 +1012,7 @@ impl Inbox {
                         sticker: message.sticker,
                         voice: message.voice,
                         video: message.video,
+                        document: message.document,
                         reply_to: message.reply_to,
                         reactions: message.reactions,
                         mentions: message.mentions,
@@ -1058,6 +1116,21 @@ impl Inbox {
                 })
                 .and_then(|message| message.video.as_ref())
                 .map(|video| video.media.clone())
+        })
+    }
+
+    /// The document of the message with the handle `file_id`, while the
+    /// message is in the cache: its download reference and its name.
+    pub(super) fn document_media(&self, file_id: i32) -> Option<(MediaRef, String)> {
+        self.chats.iter().find_map(|(jid, record)| {
+            record
+                .messages
+                .iter()
+                .filter(|message| voice_file_id(jid, &message.id) == file_id)
+                .find_map(|message| {
+                    let document = message.document.as_ref()?;
+                    Some((document.media.clone()?, document.name.clone()))
+                })
         })
     }
 
@@ -1541,6 +1614,7 @@ impl Inbox {
             sticker: None,
             voice: None,
             video: None,
+            document: None,
             reactions: Vec::new(),
             reply_to: None,
             mentions: Vec::new(),
@@ -1557,6 +1631,26 @@ impl Inbox {
             },
             self.upsert_event(jid),
         )
+    }
+
+    /// The download reference of the first file of a media send, for its
+    /// pending row. The row then shows its photo, or plays its video, and
+    /// the chat cache keeps the reference.
+    pub(super) fn set_sent_media(
+        &mut self,
+        jid: &str,
+        pending: &str,
+        sticker: Option<Sticker>,
+        video: Option<Video>,
+    ) {
+        if let Some(row) = self
+            .chats
+            .get_mut(jid)
+            .and_then(|record| record.messages.iter_mut().find(|row| row.id == pending))
+        {
+            row.sticker = sticker;
+            row.video = video;
+        }
     }
 
     /// The pending row `pending` is a send of photos or videos.
@@ -2134,7 +2228,13 @@ impl Inbox {
             .sticker
             .as_ref()
             .is_some_and(|sticker| sticker.photo && message.body != PHOTO_LABEL);
-        let body = if picture.is_some() && !caption {
+        // A document with no caption has its name as the body, for the chat
+        // list. The row shows the file, so the body is empty there.
+        let named = message
+            .document
+            .as_ref()
+            .is_some_and(|document| message.body == document.label());
+        let body = if (picture.is_some() && !caption) || named {
             String::new()
         } else {
             message.body.clone()
@@ -2174,7 +2274,10 @@ impl Inbox {
                 )
             }),
             video,
-            file: None,
+            file: message
+                .document
+                .as_ref()
+                .map(|document| document.file(voice_file_id(&message.chat_jid, &message.id))),
             reactions: reaction_counts(&message.reactions),
             reply_to: message.reply_to.clone(),
             edited: false,
@@ -2551,6 +2654,7 @@ pub(super) mod tests {
             sticker: None,
             voice: None,
             video: None,
+            document: None,
             reactions: Vec::new(),
             reply_to: None,
             mentions: Vec::new(),
@@ -2728,6 +2832,116 @@ pub(super) mod tests {
         );
         let debug = format!("{:?}", video_message(chat, "v1", false).video);
         assert!(!debug.contains("/fake/"), "{debug}");
+    }
+
+    pub(in crate::whatsapp) fn document_message(chat: &str, id: &str, body: &str) -> WaMessage {
+        WaMessage {
+            document: Some(Document {
+                name: "notes.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 2048,
+                media: Some(MediaRef::fake(MediaClass::Document, id)),
+            }),
+            ..message(chat, id, body, 5)
+        }
+    }
+
+    /// A document row has the file: its name, its type, its size, and a
+    /// handle. With no caption, the name is the preview of the chat list
+    /// and the row has no body. A caption stays the body. A document with
+    /// no reference has no handle. The reference survives the disk cache.
+    #[test]
+    fn a_document_row_has_its_file() {
+        let chat = "15550113@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let mut large = document_message(chat, "d3", "notes.pdf");
+        if let Some(document) = large.document.as_mut() {
+            document.media = None;
+        }
+        let events = inbox.apply_messages(vec![
+            document_message(chat, "d1", "notes.pdf"),
+            document_message(chat, "d2", "read this"),
+            large,
+        ]);
+        let row = received_id(&events, "d1").expect("row");
+        assert_eq!(row.body, "");
+        let file = row.file.expect("file");
+        assert_eq!(file.name(), "notes.pdf");
+        assert_eq!(file.mime(), "application/pdf");
+        assert_eq!(file.size(), 2048);
+        assert_eq!(file.file_id(), voice_file_id(chat, "d1"));
+        assert!(file.file().is_none());
+        assert_eq!(received_id(&events, "d2").expect("row").body, "read this");
+        let no_handle = received_id(&events, "d3").and_then(|row| row.file);
+        assert_eq!(no_handle.expect("file").file_id(), 0);
+        assert!(inbox.media_requests(&events, true).is_empty());
+        let (media, name) = inbox.document_media(file.file_id()).expect("reference");
+        assert_eq!(media.class, MediaClass::Document);
+        assert_eq!(name, "notes.pdf");
+        assert!(inbox.document_media(voice_file_id(chat, "d3")).is_none());
+        assert!(inbox.video_media(file.file_id()).is_none());
+        let debug = format!("{:?}", document_message(chat, "d1", "x").document);
+        assert!(!debug.contains("notes"), "{debug}");
+
+        let changes = inbox.changes(&SavedHashes::default());
+        let (_, _, saved) = &changes.chats[0];
+        let json = serde_json::to_string(saved).expect("json");
+        let loaded: SavedChat = serde_json::from_str(&json).expect("reads back");
+        let mut restored = Inbox::default();
+        let _ = restored.restore(SavedInbox {
+            chats: vec![(chat.to_string(), loaded)],
+            ..SavedInbox::default()
+        });
+        let opened = restored.open_chat(chat).expect("open");
+        assert!(received_id(&opened, "d1").expect("row").file.is_some());
+        assert!(restored.document_media(file.file_id()).is_some());
+    }
+
+    /// An own photo that comes from another device is a live row, and it
+    /// asks for its image as the photo of another person does.
+    #[test]
+    fn an_own_photo_of_another_device_asks_for_its_image() {
+        let chat = "15550115@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let mut own = photo_message(chat, "own-1", PHOTO_LABEL);
+        own.from_me = true;
+        let events = inbox.apply_messages(vec![own]);
+        let requests = inbox.media_requests(&events, false);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "own-1");
+    }
+
+    /// The row of a photo send gets the download reference of its file. It
+    /// then asks for its image as a photo of another device does, and the
+    /// row shows the photo with no label.
+    #[test]
+    fn a_sent_photo_row_gets_its_photo() {
+        let chat = "15550114@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let (pending, _, _) = inbox.begin_send(chat, PHOTO_LABEL, 9);
+        inbox.set_sent_media(
+            chat,
+            &pending,
+            photo_message(chat, "x", PHOTO_LABEL).sticker,
+            None,
+        );
+        let events = inbox.confirm_send(chat, &pending, "SRV1".into());
+        let requests = inbox.media_requests(&events, true);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "SRV1");
+        let event = inbox
+            .finish_media(chat, "SRV1", Some(PIXEL_PNG.to_vec()))
+            .expect("the row again");
+        let AdapterEvent::MessageReceived { message } = event else {
+            panic!("not a message row: {event:?}");
+        };
+        assert!(message.outbound);
+        assert_eq!(message.body, "");
+        assert!(message.photo.is_some());
+        // The chat cache keeps the reference.
+        let changes = inbox.changes(&SavedHashes::default());
+        let (_, _, saved) = &changes.chats[0];
+        assert!(saved.messages.iter().any(|row| row.sticker.is_some()));
     }
 
     /// The chat cache keeps the media references. After a restart, a

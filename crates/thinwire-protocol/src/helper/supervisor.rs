@@ -751,6 +751,12 @@ impl Supervisor {
                     file_id: *file_id,
                 });
             }
+            WireCommand::DownloadDocument { file_id } => {
+                let _ = self.events.send(AdapterEvent::FileFailed {
+                    protocol,
+                    file_id: *file_id,
+                });
+            }
             // A start that failed: `launch` reported it.
             WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. } => {}
             // The helper is not running. Do not start it: a start would

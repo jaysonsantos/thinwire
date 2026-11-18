@@ -46,6 +46,19 @@ const OLDER_HISTORY_FAILED: &str = "Could not load older WhatsApp messages.";
 pub(super) type SendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, SendFailure>> + Send + 'a>>;
 
+/// One photo or video that the server accepted: the server message id and
+/// the download reference of the uploaded file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SentMedia {
+    pub id: String,
+    pub sticker: Option<super::inbox::Sticker>,
+    pub video: Option<super::inbox::Video>,
+}
+
+/// Boxed media send future.
+pub(super) type MediaSendFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SentMedia, SendFailure>> + Send + 'a>>;
+
 /// Send failure class without server text, JIDs, or bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
@@ -74,14 +87,14 @@ pub(super) trait WhatsAppSender: Send + Sync {
     fn send_text<'a>(&'a self, chat_jid: &'a str, body: &'a str) -> SendFuture<'a>;
 
     /// Upload one photo or video and send it, with `caption` when it is not
-    /// empty. Resolves to the server message id. A sender with no client
-    /// refuses.
+    /// empty. Resolves to the server message id and the download reference
+    /// of the file. A sender with no client refuses.
     fn send_media<'a>(
         &'a self,
         _chat_jid: &'a str,
         _file: &'a thinwire_protocol::OutgoingFile,
         _caption: &'a str,
-    ) -> SendFuture<'a> {
+    ) -> MediaSendFuture<'a> {
         Box::pin(async { Err(SendFailure::Rejected) })
     }
 
@@ -100,6 +113,21 @@ pub(super) trait WhatsAppSender: Send + Sync {
         _media: &'a MediaRef,
         _dir: &'a std::path::Path,
         _file_id: i32,
+    ) -> VideoFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
+
+    /// Download and decrypt the document `media` into the file of the
+    /// handle `file_id` and the name `name` in `dir`
+    /// (`voice_files::document_file_name`). The file never is in memory as
+    /// a whole. Resolves to the absolute path. A sender with no client has
+    /// nothing to download.
+    fn download_document<'a>(
+        &'a self,
+        _media: &'a MediaRef,
+        _dir: &'a std::path::Path,
+        _file_id: i32,
+        _name: &'a str,
     ) -> VideoFuture<'a> {
         Box::pin(async { Err(()) })
     }
@@ -288,6 +316,8 @@ struct State {
     /// The video handles with a download that runs. A second Play of the
     /// same clip waits for the answer of the first.
     video_downloads: HashSet<i32>,
+    /// The document handles with a download that runs.
+    document_downloads: HashSet<i32>,
     /// This link fetched its chat pictures. A reconnect does not again.
     avatars_asked: bool,
     subjects_listed: bool,
@@ -649,6 +679,87 @@ impl Session {
                 return;
             }
             clip.answer(&events, stored);
+        });
+    }
+
+    /// Download the document `file_id` into the files folder. The answer
+    /// is `FileReady`, or `FileFailed` when the link is down, the message
+    /// left the cache, or the download or the write failed. A file of an
+    /// earlier download of this run answers at once. A second request for
+    /// a download that runs gets the answer of the first.
+    pub(super) fn download_document(&self, file_id: i32, events: &EventTx) {
+        let failed = move |events: &EventTx| {
+            let _ = events.send(AdapterEvent::FileFailed {
+                protocol: ProtocolId::WhatsApp,
+                file_id,
+            });
+        };
+        let mut state = self.lock();
+        if state.document_downloads.contains(&file_id) {
+            return;
+        }
+        let Some((media, name)) = state.inbox.document_media(file_id) else {
+            drop(state);
+            failed(events);
+            return;
+        };
+        let (Ok(runtime), Ok(dir)) = (
+            tokio::runtime::Handle::try_current(),
+            super::path::files_dir(),
+        ) else {
+            drop(state);
+            failed(events);
+            return;
+        };
+        let sender = (!state.closed && state.connected)
+            .then(|| state.sender.clone())
+            .flatten();
+        let gate = state
+            .media_gate
+            .get_or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)))
+            .clone();
+        state.document_downloads.insert(file_id);
+        drop(state);
+        let session = self.clone();
+        let events = events.clone();
+        runtime.spawn(async move {
+            let (lookup, known_name) = (dir.clone(), name.clone());
+            let known = tokio::task::spawn_blocking(move || {
+                thinwire_protocol::voice_files::stored_document(&lookup, file_id, &known_name)
+            })
+            .await
+            .ok()
+            .flatten();
+            let stored = match (known, sender) {
+                (Some(path), _) => Ok(path),
+                (None, Some(sender)) => {
+                    let _permit = gate.acquire_owned().await.ok();
+                    sender.download_document(&media, &dir, file_id, &name).await
+                }
+                (None, None) => Err(()),
+            };
+            let closed = {
+                let mut state = session.lock();
+                state.document_downloads.remove(&file_id);
+                state.closed
+            };
+            // No event follows `Stopped`.
+            if closed {
+                return;
+            }
+            match stored {
+                Ok(path) => {
+                    let _ = events.send(AdapterEvent::FileReady {
+                        protocol: ProtocolId::WhatsApp,
+                        file_id,
+                        path,
+                    });
+                }
+                Err(()) => {
+                    tracing::debug!("a whatsapp document did not download");
+                    failed(&events);
+                }
+            }
         });
     }
 
@@ -1237,6 +1348,40 @@ impl Session {
         answer: &SendRequest,
         events: &EventTx,
     ) -> bool {
+        self.finish_any_send(generation, jid, pending, result, None, answer, events)
+    }
+
+    /// [`Self::finish_send`] for a send of photos or videos. The row gets
+    /// the download reference of its first file, and a photo downloads as
+    /// the photo of another device does. So the row shows the photo, also
+    /// after a restart.
+    pub(super) fn finish_media_send(
+        &self,
+        generation: u64,
+        jid: &str,
+        pending: &str,
+        result: Result<SentMedia, SendFailure>,
+        answer: &SendRequest,
+        events: &EventTx,
+    ) -> bool {
+        let (result, media) = match result {
+            Ok(sent) => (Ok(sent.id), Some((sent.sticker, sent.video))),
+            Err(failure) => (Err(failure), None),
+        };
+        self.finish_any_send(generation, jid, pending, result, media, answer, events)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_any_send(
+        &self,
+        generation: u64,
+        jid: &str,
+        pending: &str,
+        result: Result<String, SendFailure>,
+        media: Option<(Option<super::inbox::Sticker>, Option<super::inbox::Video>)>,
+        answer: &SendRequest,
+        events: &EventTx,
+    ) -> bool {
         let mut state = self.lock();
         if state.closed {
             // `Stopped` is out: the core is past this adapter. Its exit log
@@ -1256,6 +1401,9 @@ impl Session {
         let revoked = result == Err(SendFailure::Unlinked);
         let out = match result {
             Ok(server_id) => {
+                if let Some((sticker, video)) = media {
+                    state.inbox.set_sent_media(jid, pending, sticker, video);
+                }
                 let mut out = vec![answer.accepted()];
                 out.extend(state.inbox.confirm_send(jid, pending, server_id));
                 out
@@ -1275,9 +1423,11 @@ impl Session {
                 out
             }
         };
-        for event in out {
-            let _ = events.send(event);
+        for event in &out {
+            let _ = events.send(event.clone());
         }
+        // The photo of a media send downloads now. A text send has none.
+        self.spawn_media(&mut state, &out, true, events);
         revoked
     }
 }
@@ -1402,6 +1552,25 @@ pub(super) mod fake {
                 *self.downloads.lock().expect("fake lock") += 1;
                 let bytes = self.media.clone().ok_or(())?;
                 thinwire_protocol::voice_files::store_video(dir, file_id, &bytes).map_err(|_| ())
+            })
+        }
+
+        fn download_document<'a>(
+            &'a self,
+            _media: &'a MediaRef,
+            dir: &'a std::path::Path,
+            file_id: i32,
+            name: &'a str,
+        ) -> VideoFuture<'a> {
+            Box::pin(async move {
+                use std::io::Write as _;
+                use thinwire_protocol::voice_files::VideoPart;
+                *self.downloads.lock().expect("fake lock") += 1;
+                let bytes = self.media.clone().ok_or(())?;
+                let (mut file, part) =
+                    VideoPart::begin_document(dir, file_id, name).map_err(|_| ())?;
+                file.write_all(&bytes).map_err(|_| ())?;
+                part.finish(file).map_err(|_| ())
             })
         }
 
@@ -1735,6 +1904,123 @@ mod tests {
             assert_eq!(video_answer(&mut rx, file_id).await, Some(Err(())));
             assert_eq!(*broken.downloads.lock().expect("lock"), tries);
         }
+    }
+
+    /// A document row has a handle. Download writes the file into the
+    /// files folder, with its name, one time. A handle with no message, and
+    /// a download that fails, answer `FileFailed`.
+    #[tokio::test]
+    async fn a_document_downloads_into_the_files_folder() {
+        const FILE_CHAT: &str = "15550143@s.whatsapp.net";
+        async fn answer(
+            rx: &mut UnboundedReceiver<AdapterEvent>,
+            file_id: i32,
+        ) -> Option<Result<thinwire_protocol::AudioPath, ()>> {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await {
+                        Some(AdapterEvent::FileReady {
+                            file_id: id, path, ..
+                        }) if id == file_id => return Some(Ok(path)),
+                        Some(AdapterEvent::FileFailed { file_id: id, .. }) if id == file_id => {
+                            return Some(Err(()));
+                        }
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        let (session, tx, mut rx) = linked();
+        let sender = Arc::new(fake::FakeSender {
+            media: Some(b"%PDF-1.7".to_vec()),
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        let row = crate::whatsapp::inbox::tests::document_message(FILE_CHAT, "doc-1", "notes.pdf");
+        session.apply(LinkEvent::Messages(vec![row]), 1, &tx);
+        let file_id = crate::whatsapp::inbox::voice_file_id(FILE_CHAT, "doc-1");
+        assert_eq!(*sender.downloads.lock().expect("lock"), 0, "not before");
+        session.download_document(file_id, &tx);
+        let ready = answer(&mut rx, file_id)
+            .await
+            .expect("an answer")
+            .expect("ready");
+        assert!(ready.as_path().is_absolute());
+        assert_eq!(std::fs::read(ready.as_path()).expect("file"), b"%PDF-1.7");
+        let name = ready.as_path().file_name().and_then(|name| name.to_str());
+        assert_eq!(name, Some(format!("{file_id}-notes.pdf").as_str()));
+        session.download_document(file_id, &tx);
+        let again = answer(&mut rx, file_id).await.expect("an answer");
+        assert_eq!(again, Ok(ready.clone()));
+        assert_eq!(*sender.downloads.lock().expect("lock"), 1, "one download");
+        let unknown = file_id.wrapping_add(1).max(1);
+        session.download_document(unknown, &tx);
+        assert_eq!(answer(&mut rx, unknown).await, Some(Err(())));
+        let _ = std::fs::remove_file(ready.as_path());
+
+        let (session, tx, mut rx) = linked();
+        let broken = Arc::new(fake::FakeSender::default());
+        assert!(session.attach_sender(1, broken.clone()));
+        let row = crate::whatsapp::inbox::tests::document_message(FILE_CHAT, "doc-2", "notes.pdf");
+        session.apply(LinkEvent::Messages(vec![row]), 1, &tx);
+        let file_id = crate::whatsapp::inbox::voice_file_id(FILE_CHAT, "doc-2");
+        for tries in 1..=2 {
+            session.download_document(file_id, &tx);
+            assert_eq!(answer(&mut rx, file_id).await, Some(Err(())));
+            assert_eq!(*broken.downloads.lock().expect("lock"), tries);
+        }
+    }
+
+    /// A photo send that the server accepted shows its photo: the row
+    /// comes with the server id, and then again with the image.
+    #[tokio::test]
+    async fn a_sent_photo_row_comes_again_with_its_image() {
+        let (session, tx, mut rx) = linked();
+        let sender = Arc::new(fake::FakeSender {
+            media: Some(crate::whatsapp::inbox::tests::PIXEL_PNG.to_vec()),
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        let pending = session.with_inbox(|inbox| inbox.begin_send(CHAT, "[photo]", 9).0);
+        let sent = SentMedia {
+            id: "SRV-PHOTO".into(),
+            sticker: Some(crate::whatsapp::inbox::Sticker {
+                width: 0,
+                height: 0,
+                media: MediaRef::fake(crate::whatsapp::inbox::MediaClass::Image, "up"),
+                photo: true,
+            }),
+            video: None,
+        };
+        let answer = SendRequest {
+            conversation_id: format!("whatsapp:{CHAT}"),
+            request: 4,
+            retry: false,
+        };
+        assert!(!session.finish_media_send(1, CHAT, &pending, Ok(sent), &answer, &tx));
+        let mut photo = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while photo.is_none() && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(AdapterEvent::MessageReceived { message }))
+                    if message.id == "SRV-PHOTO" =>
+                {
+                    photo = message
+                        .photo
+                        .map(|photo| (photo, message.body, message.outbound));
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        let (_, body, outbound) = photo.expect("the row with its photo");
+        assert_eq!(body, "");
+        assert!(outbound);
+        assert_eq!(*sender.downloads.lock().expect("lock"), 1);
     }
 
     /// A connection asks for the group subjects and the chat pictures. A

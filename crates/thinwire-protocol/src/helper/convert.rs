@@ -6,13 +6,14 @@
 
 use thinwire_ipc::{
     SecretText, WireAccountState, WireArrival, WireAudio, WireCommand, WireConversation,
-    WireDelivery, WireEvent, WireFile, WireHistoryCursor, WireHistorySkip, WireMediaKind,
-    WireMention, WireMessage, WirePhoto, WireProtocol, WireStatus, WireStoreAccess, WireVideo,
+    WireDelivery, WireDocument, WireEvent, WireFile, WireHistoryCursor, WireHistorySkip,
+    WireMediaKind, WireMention, WireMessage, WirePhoto, WireProtocol, WireStatus, WireStoreAccess,
+    WireVideo,
 };
 
 use crate::media::{
-    AudioPath, ImageBytes, MediaKind, MessageAudio, MessageLink, MessagePhoto, MessageVideo,
-    OutgoingFile, PhotoSize,
+    AudioPath, ImageBytes, MediaKind, MessageAudio, MessageFile, MessageLink, MessagePhoto,
+    MessageVideo, OutgoingFile, PhotoSize,
 };
 
 use crate::ProtocolKind;
@@ -155,6 +156,9 @@ pub(crate) fn command_to_wire(
         AdapterCommand::DownloadVideo { file_id, .. } => WireCommand::DownloadVideo {
             file_id: *file_id,
         },
+        AdapterCommand::DownloadDocument { file_id, .. } => WireCommand::DownloadDocument {
+            file_id: *file_id,
+        },
         // The app answers these itself. They never cross the pipe.
         // Topic commands are Telegram-only. A helper never sees them.
         AdapterCommand::Shutdown { .. }
@@ -171,7 +175,6 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::ToAccount { .. }
         | AdapterCommand::ViewTopic { .. }
         | AdapterCommand::DownloadFile { .. }
-        | AdapterCommand::DownloadDocument { .. }
         // A helper has no edit yet (#519, #520).
         | AdapterCommand::EditMessage { .. }
         // A helper has no forward yet (#533, #534).
@@ -303,6 +306,9 @@ pub(crate) fn command_from_wire(
         }
         WireCommand::DownloadVideo { file_id } => {
             AdapterCommand::DownloadVideo { protocol, file_id }
+        }
+        WireCommand::DownloadDocument { file_id } => {
+            AdapterCommand::DownloadDocument { protocol, file_id }
         }
     };
     Some((command, None))
@@ -450,6 +456,18 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
             protocol: seen,
             file_id,
         } if own(seen) => WireEvent::VideoFailed { file_id },
+        AdapterEvent::FileReady {
+            protocol: seen,
+            file_id,
+            path,
+        } if own(seen) => WireEvent::FileReady {
+            file_id,
+            path: path.as_path().to_string_lossy().into_owned(),
+        },
+        AdapterEvent::FileFailed {
+            protocol: seen,
+            file_id,
+        } if own(seen) => WireEvent::FileFailed { file_id },
         // A picture that does not fit one line does not cross.
         AdapterEvent::ChatAvatar {
             protocol: seen,
@@ -682,6 +700,18 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
             }
         }
         WireEvent::VideoFailed { file_id } => AdapterEvent::VideoFailed { protocol, file_id },
+        // The same rule: only an absolute path opens.
+        WireEvent::FileReady { file_id, path } => {
+            match AudioPath::new(path).filter(|path| path.as_path().is_absolute()) {
+                Some(path) => AdapterEvent::FileReady {
+                    protocol,
+                    file_id,
+                    path,
+                },
+                None => AdapterEvent::FileFailed { protocol, file_id },
+            }
+        }
+        WireEvent::FileFailed { file_id } => AdapterEvent::FileFailed { protocol, file_id },
         WireEvent::Avatar {
             conversation_id,
             photo,
@@ -901,6 +931,7 @@ fn message_to_wire(message: ChatMessage) -> Box<WireMessage> {
         photo: message.photo.as_ref().and_then(photo_to_wire),
         audio: message.audio.as_ref().and_then(audio_to_wire),
         video: message.video.as_ref().and_then(video_to_wire),
+        file: message.file.as_ref().map(file_to_wire),
         reactions: reactions_to_wire(&message.reactions),
         reply_to: message.reply_to.clone(),
         mentions: mentions_to_wire(&message.links),
@@ -965,6 +996,30 @@ fn video_to_wire(video: &MessageVideo) -> Option<WireVideo> {
         file_id: video.file_id(),
         note: video.is_note(),
     })
+}
+
+/// A document. The local path does not cross: it is a path of the helper,
+/// and `FileReady` sends it. The preview does not cross.
+fn file_to_wire(file: &MessageFile) -> WireDocument {
+    WireDocument {
+        name: file.name().to_string(),
+        mime: file.mime().to_string(),
+        size: file.size(),
+        file_id: file.file_id().max(0),
+    }
+}
+
+/// The document of a wire message. A handle that is not positive gives a
+/// document with no download.
+fn file_from_wire(file: WireDocument) -> MessageFile {
+    MessageFile::new(
+        file.name,
+        file.mime,
+        file.size,
+        file.file_id.max(0),
+        None,
+        None,
+    )
 }
 
 /// The video of a wire message. `None` when the handle is not positive.
@@ -1038,7 +1093,7 @@ fn message_from_wire(protocol: ProtocolId, message: Box<WireMessage>) -> ChatMes
             .audio
             .and_then(|audio| MessageAudio::new(audio.duration_secs, audio.file_id, None)),
         video: message.video.and_then(video_from_wire),
-        file: None,
+        file: message.file.map(file_from_wire),
         reactions: reactions_from_wire(message.reactions),
         reply_to: message.reply_to,
         edited: false,
@@ -1224,6 +1279,87 @@ mod tests {
         ));
     }
 
+    /// A document crosses as a handle with its name, its type, and its
+    /// size. A local path of the helper does not cross with the message.
+    /// The download request and both answers cross, and a relative path
+    /// is a failure.
+    #[test]
+    fn a_document_and_its_download_cross_the_pipe() {
+        let mut row = message(ProtocolId::WhatsApp);
+        row.body = "the notes".into();
+        let local = std::env::temp_dir().join("9-notes.pdf");
+        row.file = Some(MessageFile::new(
+            "notes.pdf",
+            "application/pdf",
+            2048,
+            9,
+            AudioPath::new(local.to_string_lossy()),
+            None,
+        ));
+        let wire = message_to_wire(row.clone());
+        assert_eq!(
+            wire.file,
+            Some(WireDocument {
+                name: "notes.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 2048,
+                file_id: 9,
+            })
+        );
+        let back = message_from_wire(ProtocolId::WhatsApp, wire);
+        let file = back.file.expect("document");
+        assert_eq!(file.name(), "notes.pdf");
+        assert_eq!(file.mime(), "application/pdf");
+        assert_eq!(file.size(), 2048);
+        assert_eq!(file.file_id(), 9);
+        assert!(file.file().is_none(), "the path of the helper stays there");
+        // A name with a folder shows only the file name.
+        let mut bad = message_to_wire(row);
+        bad.file = Some(WireDocument {
+            name: "../../secret/notes.pdf".into(),
+            mime: String::new(),
+            size: 0,
+            file_id: -4,
+        });
+        let file = message_from_wire(ProtocolId::WhatsApp, bad)
+            .file
+            .expect("document");
+        assert_eq!(file.name(), "notes.pdf");
+        assert_eq!(file.file_id(), 0, "no download");
+
+        for protocol in [ProtocolId::WhatsApp, ProtocolId::Signal] {
+            let command = AdapterCommand::DownloadDocument {
+                protocol,
+                file_id: 9,
+            };
+            let wire = command_to_wire(protocol, &command, || None).expect("crosses");
+            assert_eq!(wire, WireCommand::DownloadDocument { file_id: 9 });
+            let (back, phone) = command_from_wire(protocol, wire).expect("back");
+            assert_eq!(back, command);
+            assert!(phone.is_none());
+
+            let ready = AdapterEvent::FileReady {
+                protocol,
+                file_id: 9,
+                path: AudioPath::new(local.to_string_lossy()).expect("path"),
+            };
+            let wire = event_to_wire(protocol, ready.clone()).expect("crosses");
+            assert_eq!(event_from_wire(protocol, wire), Some(ready));
+            let failed = AdapterEvent::FileFailed {
+                protocol,
+                file_id: 9,
+            };
+            let wire = event_to_wire(protocol, failed.clone()).expect("crosses");
+            assert_eq!(wire, WireEvent::FileFailed { file_id: 9 });
+            assert_eq!(event_from_wire(protocol, wire), Some(failed.clone()));
+            let relative = WireEvent::FileReady {
+                file_id: 9,
+                path: "files/9-notes.pdf".into(),
+            };
+            assert_eq!(event_from_wire(protocol, relative), Some(failed));
+        }
+    }
+
     /// A video crosses as a handle with its length, its size, and its
     /// thumbnail. The download command and both answers cross. A path that
     /// is not absolute is a failed download.
@@ -1320,6 +1456,16 @@ mod tests {
             assert_eq!(event_from_wire(protocol, relative), Some(failed));
         }
         // An event of another protocol does not cross.
+        assert!(
+            event_to_wire(
+                ProtocolId::Signal,
+                AdapterEvent::FileFailed {
+                    protocol: ProtocolId::WhatsApp,
+                    file_id: 9,
+                },
+            )
+            .is_none()
+        );
         assert!(
             event_to_wire(
                 ProtocolId::Signal,

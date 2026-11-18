@@ -114,13 +114,36 @@ pub(crate) fn video_dir() -> Result<PathBuf, ()> {
     store.parent().map(video_dir_of).ok_or(())
 }
 
-/// Delete the audio and the video files of an earlier run. Call it after
+/// The folder of the documents that the user downloads, in the session
+/// folder `dir`.
+#[must_use]
+pub(crate) fn files_dir_of(dir: &Path) -> PathBuf {
+    dir.join("files")
+}
+
+/// The folder of the documents of this account.
+pub(crate) fn files_dir() -> Result<PathBuf, ()> {
+    // A unit test never writes in the app-data folder of the user.
+    #[cfg(test)]
+    if SESSION_DIR.get().is_none() {
+        return Ok(std::env::temp_dir()
+            .join("thinwire-whatsapp-files-tests")
+            .join(std::process::id().to_string()));
+    }
+    let store = whatsapp_device_store_path()?;
+    store.parent().map(files_dir_of).ok_or(())
+}
+
+/// Delete the audio files, the video files, and the documents of an earlier run. Call it after
 /// [`lock_session`]: no other helper of this account writes there then.
 pub fn clear_voice_files() {
     if let Ok(dir) = voice_dir() {
         thinwire_protocol::voice_files::clear(&dir);
     }
     if let Ok(dir) = video_dir() {
+        thinwire_protocol::voice_files::clear(&dir);
+    }
+    if let Ok(dir) = files_dir() {
         thinwire_protocol::voice_files::clear(&dir);
     }
 }

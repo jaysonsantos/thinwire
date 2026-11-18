@@ -633,7 +633,8 @@ impl WhatsAppAdapter {
         let caption = caption.trim().to_string();
         tokio::spawn(async move {
             let result = send_files(sender.as_ref(), &jid, &files, &caption).await;
-            let revoked = session.finish_send(generation, &jid, &pending, result, &answer, &events);
+            let revoked =
+                session.finish_media_send(generation, &jid, &pending, result, &answer, &events);
             running.finish();
             if revoked && let Some(owner) = owner {
                 owner.send(session::LinkEvent::LoggedOut);
@@ -831,19 +832,20 @@ fn media_label(files: &[thinwire_protocol::OutgoingFile], caption: &str) -> Stri
 }
 
 /// Send each file as its own message. The send is the first message: its
-/// failure fails the send. A later file that fails is logged.
+/// failure fails the send, and its download reference is the media of the
+/// row. A later file that fails is logged.
 async fn send_files(
     sender: &dyn session::WhatsAppSender,
     jid: &str,
     files: &[thinwire_protocol::OutgoingFile],
     caption: &str,
-) -> Result<String, session::SendFailure> {
+) -> Result<session::SentMedia, session::SendFailure> {
     let mut first = None;
     for (index, file) in files.iter().enumerate() {
         let caption = if index == 0 { caption } else { "" };
         match sender.send_media(jid, file, caption).await {
-            Ok(id) => {
-                first.get_or_insert(id);
+            Ok(sent) => {
+                first.get_or_insert(sent);
             }
             Err(failure) if first.is_none() => return Err(failure),
             Err(_) => {
@@ -1055,6 +1057,13 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 file_id,
             } => {
                 self.session.download_video(file_id, events);
+                Ok(())
+            }
+            AdapterCommand::DownloadDocument {
+                protocol: ProtocolId::WhatsApp,
+                file_id,
+            } => {
+                self.session.download_document(file_id, events);
                 Ok(())
             }
             AdapterCommand::Disconnect {
