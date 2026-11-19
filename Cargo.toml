@@ -56,7 +56,7 @@ eframe = { version = "0.37", default-features = false, features = [
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 # The font list of the OS, for the color emoji font (`theme::system_emoji`).
 # `egui_system_font_provider` links it with the same features.
-fontique = { version = "0.11.1", default-features = false, features = [
+fontique = { version = "0.13.0", default-features = false, features = [
   "fontconfig-dlopen",
   "system",
 ] }
