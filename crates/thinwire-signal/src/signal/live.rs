@@ -216,6 +216,9 @@ pub(super) struct Session {
     reactions: std::sync::Mutex<(String, super::react::ReactionBook)>,
     /// The live senders with no name that this run looked up one time.
     lookups: std::sync::Mutex<super::names::SenderLookups>,
+    /// The photos of a live message download also when its chat is not
+    /// open. The app sends the choice (`SetAutoDownload`).
+    auto_download: AtomicBool,
     /// Tests pause the pre-link publish here. Production builds have no pause.
     #[cfg(test)]
     prelink_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -239,6 +242,7 @@ impl Session {
             downloads: Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)),
             reactions: std::sync::Mutex::default(),
             lookups: std::sync::Mutex::default(),
+            auto_download: AtomicBool::new(false),
             #[cfg(test)]
             prelink_hold: std::sync::Mutex::new(None),
         }
@@ -454,6 +458,16 @@ impl Session {
     /// The job stores that id for the worker.
     pub(super) fn request_viewed(&self, conversation_id: Option<String>) -> bool {
         self.enqueue(WorkerJob::Viewed(conversation_id))
+    }
+
+    /// Photos of a chat that is not open download by themselves, or wait
+    /// until the chat opens.
+    pub(super) fn set_auto_download(&self, on: bool) {
+        self.auto_download.store(on, Ordering::SeqCst);
+    }
+
+    fn auto_download(&self) -> bool {
+        self.auto_download.load(Ordering::SeqCst)
     }
 
     /// Queue a clear of the unread count of one chat.
@@ -1782,7 +1796,13 @@ async fn run_linked(
                                         &names,
                                     );
                                     // A photo of the open chat downloads now.
-                                    if let Some(viewed) = viewed.as_deref() {
+                                    // With the automatic download on, the
+                                    // photos of every chat do.
+                                    if session.auto_download() {
+                                        for chat in session.media().waiting_chats() {
+                                            start_photo_downloads(&manager, &session, token, &events, &chat);
+                                        }
+                                    } else if let Some(viewed) = viewed.as_deref() {
                                         start_photo_downloads(&manager, &session, token, &events, viewed);
                                     }
                                 }
@@ -9854,6 +9874,25 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         }
         assert_eq!(counts, vec![4, 4]);
         assert_eq!(rows.get(&id).expect("row").unread, 4);
+    }
+
+    /// The photos of a chat that is not open wait, until the app turns the
+    /// automatic download on.
+    #[test]
+    fn the_auto_download_choice_starts_off_and_follows_the_app() {
+        let session = Session::new();
+        assert!(!session.auto_download());
+        session.set_auto_download(true);
+        assert!(session.auto_download());
+        session.set_auto_download(false);
+        assert!(!session.auto_download());
+        let src = include_str!("live.rs");
+        let receive = &src[src
+            .find("// A photo of the open chat downloads now.")
+            .expect("hook")..];
+        let receive = &receive[..600];
+        assert!(receive.contains("session.auto_download()"));
+        assert!(receive.contains("session.media().waiting_chats()"));
     }
 
     /// "Mark as read" queues its own job: it clears the count of that

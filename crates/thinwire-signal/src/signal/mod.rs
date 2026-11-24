@@ -809,6 +809,18 @@ impl ProtocolAdapter for SignalAdapter {
                 request,
                 ..
             } => self.send_media(&conversation_id, &caption, files, request, events),
+            AdapterCommand::SetAutoDownload {
+                protocol: ProtocolId::Signal,
+                on,
+            } => {
+                #[cfg(feature = "signal-local")]
+                if let Engine::Live(session) = &self.engine {
+                    session.set_auto_download(on);
+                }
+                #[cfg(not(feature = "signal-local"))]
+                let _ = on;
+                Ok(())
+            }
             AdapterCommand::MarkRead {
                 protocol: ProtocolId::Signal,
                 conversation_id,

@@ -29,8 +29,9 @@ use crate::SecretText;
 /// [`WireEvent::VideoReady`], and [`WireEvent::VideoFailed`]. Version 10 adds
 /// [`WireMessage::file`], [`WireCommand::DownloadDocument`],
 /// [`WireEvent::FileReady`], and [`WireEvent::FileFailed`]. Version 11 adds
-/// [`WireCommand::MarkRead`]. An older peer cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// [`WireCommand::MarkRead`]. Version 12 adds
+/// [`WireCommand::SetAutoDownload`]. An older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// One unreadable stretch on a history page.
 ///
@@ -190,6 +191,12 @@ pub enum WireCommand {
     MarkRead {
         conversation_id: String,
     },
+    /// Photos download by themselves also for a chat that is not open
+    /// (`on`), or only for the open chat. The app sends it again after a
+    /// restart of the helper.
+    SetAutoDownload {
+        on: bool,
+    },
     /// Download the audio `file_id` of [`WireMessage::audio`]. The helper
     /// answers [`WireEvent::VoiceReady`] or [`WireEvent::VoiceFailed`].
     DownloadVoice {
@@ -238,6 +245,7 @@ impl WireCommand {
             Self::SendMedia { .. } => "send_media",
             Self::ViewChat { .. } => "view_chat",
             Self::MarkRead { .. } => "mark_read",
+            Self::SetAutoDownload { .. } => "set_auto_download",
             Self::DownloadVoice { .. } => "download_voice",
             Self::DownloadVideo { .. } => "download_video",
             Self::DownloadDocument { .. } => "download_document",

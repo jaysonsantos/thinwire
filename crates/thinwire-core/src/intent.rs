@@ -160,6 +160,12 @@ pub enum Intent {
         conversation_id: String,
         muted: bool,
     },
+    /// When photos and videos download with no click (Settings > Chats).
+    /// Disk I/O runs off the caller thread.
+    SetMediaDownload(crate::MediaDownload),
+    /// The OS says the network has this cost now. A frontend sends it when
+    /// the value changes.
+    SetNetworkCost(crate::NetworkCost),
     /// Mark every message of one chat read, from the menu of its row. It
     /// acts only when [`crate::Snapshot::can_mark_read`] allows it.
     MarkChatRead {

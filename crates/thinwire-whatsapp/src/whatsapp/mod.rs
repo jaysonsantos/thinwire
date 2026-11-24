@@ -1067,6 +1067,12 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 self.session.download_document(file_id, events);
                 Ok(())
             }
+            // The helper already fetches the photos of every live message:
+            // they are small (512 KiB at most). Videos wait for the app.
+            AdapterCommand::SetAutoDownload {
+                protocol: ProtocolId::WhatsApp,
+                ..
+            } => Ok(()),
             AdapterCommand::MarkRead {
                 protocol: ProtocolId::WhatsApp,
                 conversation_id,

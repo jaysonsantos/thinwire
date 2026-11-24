@@ -18,6 +18,7 @@ mod core;
 pub mod demo;
 pub mod instance;
 mod intent;
+pub mod media_auto;
 mod message_search;
 pub mod mutes;
 pub mod notify;
@@ -44,6 +45,7 @@ pub use crate::core::{Core, CoreConfig, HelperBuilder, HelperPaths};
 pub use intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
+pub use media_auto::{MediaDownload, NetworkCost};
 pub use message_search::SEARCH_MIN_CHARS;
 pub use secret_text::SecretText;
 pub use signal::{ChangeNotifier, ChangeSignal, change_channel};

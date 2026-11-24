@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use thinwire_core::notify::NotifyKey;
 use thinwire_core::{Core, CoreConfig, Intent};
-use thinwire_notify::{BadgeCount, Notifier};
+use thinwire_notify::{BadgeCount, NetworkWatch, Notifier};
 
 pub use theme::install as install_theme;
 pub use theme::install_system_emoji;
@@ -417,6 +417,8 @@ pub struct ThinwireApp {
     notifier: Notifier,
     /// The unread count on the Dock icon or the launcher entry (#513).
     badge: BadgeCount,
+    /// The cost of the network, for the automatic media download.
+    network: NetworkWatch,
     updates: thinwire::update::Updates,
     /// The native menu bar. macOS only.
     #[cfg(target_os = "macos")]
@@ -446,6 +448,8 @@ impl ThinwireApp {
             wake.request_repaint();
         });
         let updates = thinwire::update::Updates::start(ctx.clone());
+        let wake = ctx.clone();
+        let network = NetworkWatch::start(move || wake.request_repaint());
         #[cfg(target_os = "macos")]
         let native_menu = {
             macos_menu::wake_on_event(ctx);
@@ -462,6 +466,7 @@ impl ThinwireApp {
             watchdog: false,
             notifier,
             badge: BadgeCount::new(),
+            network,
             updates,
             #[cfg(target_os = "macos")]
             native_menu,
@@ -749,6 +754,9 @@ impl eframe::App for ThinwireApp {
         self.run_menu_commands(ctx);
         self.handle_close(ctx, frame);
         self.update_badge();
+        if let Some(cost) = self.network.changed() {
+            self.core.dispatch(Intent::SetNetworkCost(cost));
+        }
         self.raise_for_show(ctx, frame);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
             ctx.request_repaint();

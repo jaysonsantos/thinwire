@@ -314,6 +314,10 @@ struct Replay {
     acknowledged: bool,
     /// The pairing that the user started.
     link: Option<u64>,
+    /// The last automatic photo download choice of the app. A new helper
+    /// starts with it off, so a restart sends it again. An unlink does not
+    /// change it: it is a choice of the app, not of the account.
+    auto_download: Option<bool>,
 }
 
 impl Replay {
@@ -325,8 +329,12 @@ impl Replay {
         match command {
             WireCommand::AcknowledgeGate => self.acknowledged = true,
             WireCommand::BeginLink { generation, .. } => self.link = Some(*generation),
+            WireCommand::SetAutoDownload { on } => self.auto_download = Some(*on),
             WireCommand::CancelLink | WireCommand::Disconnect | WireCommand::Unlink => {
-                *self = Self::default();
+                *self = Self {
+                    auto_download: self.auto_download,
+                    ..Self::default()
+                };
             }
             _ => {}
         }
@@ -542,6 +550,11 @@ impl Supervisor {
             self.request(wire);
             return;
         }
+        // A helper that does not run keeps the choice for its start.
+        if matches!(wire, WireCommand::SetAutoDownload { .. }) {
+            self.replay.note(&wire);
+            return;
+        }
         // The gate and a pairing start wake the helper.
         match wire {
             // `launch` sends the gate from the replay.
@@ -722,7 +735,9 @@ impl Supervisor {
             WireCommand::Unlink => {
                 emit_command_failed(events, protocol, None, self.unlink_needs_helper());
             }
-            WireCommand::ViewChat { .. } | WireCommand::MarkRead { .. } => {}
+            WireCommand::ViewChat { .. }
+            | WireCommand::MarkRead { .. }
+            | WireCommand::SetAutoDownload { .. } => {}
             WireCommand::DeleteMessage {
                 conversation_id, ..
             }
@@ -877,6 +892,9 @@ impl Supervisor {
         let mut commands = Vec::new();
         if self.replay.acknowledged {
             commands.push(WireCommand::AcknowledgeGate);
+        }
+        if let Some(on) = self.replay.auto_download {
+            commands.push(WireCommand::SetAutoDownload { on });
         }
         if let Some(generation) = self.replay.link {
             // No phone: it crossed the pipe with the first start.
@@ -1254,3 +1272,25 @@ async fn log_stderr(stderr: HelperOutput, protocol: ProtocolId) {
 }
 
 // endregion: tasks
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    /// A new helper starts with no automatic photo download, so the replay
+    /// keeps the last choice of the app. An unlink keeps it: it is a choice
+    /// of the app, not of the account.
+    #[test]
+    fn the_replay_keeps_the_auto_download_choice() {
+        let mut replay = Replay::default();
+        replay.note(&WireCommand::AcknowledgeGate);
+        replay.note(&WireCommand::SetAutoDownload { on: true });
+        assert_eq!(replay.auto_download, Some(true));
+        replay.note(&WireCommand::Unlink);
+        assert!(!replay.acknowledged);
+        assert_eq!(replay.auto_download, Some(true));
+        assert!(replay.is_empty(), "the choice alone starts no helper");
+        replay.note(&WireCommand::SetAutoDownload { on: false });
+        assert_eq!(replay.auto_download, Some(false));
+    }
+}

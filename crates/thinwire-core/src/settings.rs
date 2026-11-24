@@ -112,6 +112,9 @@ pub struct Settings {
     /// Each other person of a chat has a bubble color (#581). Default off:
     /// one color for the user and one for the other people.
     person_colors: bool,
+    /// When photos and videos download with no click. Default: on an
+    /// unmetered network.
+    media_download: crate::MediaDownload,
     path: PathBuf,
     persist_pending: bool,
     persist_epoch: u64,
@@ -173,6 +176,9 @@ const UNREAD_BADGE_KEY: &str = "unread_badge";
 /// Settings key of the bubble color for each person.
 const PERSON_COLORS_KEY: &str = "person_colors";
 
+/// Settings key of the automatic download of photos and videos.
+const MEDIA_DOWNLOAD_KEY: &str = "media_download";
+
 /// Settings key of the WhatsApp helper path.
 const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
 /// Settings key of the Signal helper path.
@@ -217,6 +223,9 @@ impl Settings {
             send_typing: read_bool(&path, SEND_TYPING_KEY).unwrap_or(true),
             unread_badge: read_bool(&path, UNREAD_BADGE_KEY).unwrap_or(true),
             person_colors: read_bool(&path, PERSON_COLORS_KEY).unwrap_or(false),
+            media_download: read_word(&path, MEDIA_DOWNLOAD_KEY)
+                .and_then(|word| crate::MediaDownload::parse(&word))
+                .unwrap_or_default(),
             path,
             persist_pending: false,
             persist_epoch: 0,
@@ -247,6 +256,7 @@ impl Settings {
             send_typing: true,
             unread_badge: true,
             person_colors: false,
+            media_download: crate::MediaDownload::default(),
             path: PathBuf::new(),
             persist_pending: false,
             persist_epoch: 0,
@@ -448,6 +458,21 @@ impl Settings {
         self.person_colors
     }
 
+    /// When photos and videos download with no click.
+    #[must_use]
+    pub const fn media_download(&self) -> crate::MediaDownload {
+        self.media_download
+    }
+
+    /// Change when photos and videos download by themselves. Disk persist is
+    /// queued.
+    pub fn set_media_download(&mut self, value: crate::MediaDownload) {
+        if self.media_download != value {
+            self.media_download = value;
+            self.persist_pending = true;
+        }
+    }
+
     /// One bubble color for each person, or one for all other people. Disk
     /// persist is queued.
     pub fn set_person_colors(&mut self, on: bool) {
@@ -565,6 +590,12 @@ impl Settings {
         }
         if self.person_colors {
             text.push_str(&format!("{PERSON_COLORS_KEY} = true\n"));
+        }
+        if self.media_download != crate::MediaDownload::default() {
+            text.push_str(&format!(
+                "{MEDIA_DOWNLOAD_KEY} = \"{}\"\n",
+                self.media_download.as_str()
+            ));
         }
         if self.signal_notice_version != 0 {
             text.push_str(&format!(
@@ -703,6 +734,15 @@ fn read_recent_emoji(path: &std::path::Path) -> Vec<String> {
 }
 
 /// A `key = true|false` line. Anything else is `None`.
+/// The raw value of a `key = value` line, with its quotes.
+fn read_word(path: &std::path::Path, wanted: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        (key.trim() == wanted).then(|| value.trim().to_string())
+    })
+}
+
 fn read_bool(path: &std::path::Path, wanted: &str) -> Option<bool> {
     let contents = fs::read_to_string(path).ok()?;
     contents.lines().find_map(|line| {
@@ -1059,6 +1099,31 @@ mod tests {
         );
         assert!(!Settings::load_from(path).person_colors());
         assert!(!Settings::in_memory().person_colors());
+    }
+
+    #[test]
+    fn the_media_download_choice_persists_and_defaults_to_unmetered() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.media_download(), crate::MediaDownload::Unmetered);
+        settings.set_media_download(crate::MediaDownload::Always);
+        settings.persist_now().expect("save");
+        assert_eq!(
+            Settings::load_from(path.clone()).media_download(),
+            crate::MediaDownload::Always
+        );
+        settings.set_media_download(crate::MediaDownload::Unmetered);
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains(MEDIA_DOWNLOAD_KEY),
+            "the default writes no key"
+        );
+        std::fs::write(&path, "media_download = \"never\"\n").expect("write");
+        assert_eq!(
+            Settings::load_from(path).media_download(),
+            crate::MediaDownload::Never
+        );
     }
 
     #[test]

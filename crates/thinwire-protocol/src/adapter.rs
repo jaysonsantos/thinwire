@@ -814,6 +814,14 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// Photos download by themselves also for a chat that is not open
+    /// (`on`), or only for the open chat. The core sends it to a helper
+    /// account when the value changes and when the account links. The app
+    /// decides videos and the photos of the other protocols itself.
+    SetAutoDownload {
+        protocol: ProtocolId,
+        on: bool,
+    },
     /// Search the text of the messages of the account (#514), or of one
     /// chat when `conversation_id` names it. The adapter always answers
     /// with one `MessagesFound` that has the same `request`, also when the
@@ -859,6 +867,7 @@ impl AdapterCommand {
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
             | Self::MarkRead { protocol, .. }
+            | Self::SetAutoDownload { protocol, .. }
             | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
@@ -933,6 +942,7 @@ impl AdapterCommand {
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
             | Self::MarkRead { protocol, .. }
+            | Self::SetAutoDownload { protocol, .. }
             | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;

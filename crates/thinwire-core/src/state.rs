@@ -833,6 +833,17 @@ pub struct Snapshot {
     /// Telegram photo downloads in flight, keyed by protocol and file id.
     photo_downloads: HashSet<(ProtocolId, i32)>,
     file_downloads: HashSet<(ProtocolId, i32)>,
+    /// Video downloads in flight, keyed by protocol and file id: a Play and
+    /// an automatic download ask one time.
+    video_downloads: HashSet<(ProtocolId, i32)>,
+    /// Photo and video downloads that the app started by itself
+    /// (`media_auto`). A failure of one leaves no mark on its row: the user
+    /// did not ask for it. A click on the row makes it a request of the user.
+    background_media: HashSet<(ProtocolId, i32)>,
+    /// Photos and videos download by themselves now (`media_auto::allows`).
+    auto_media: bool,
+    /// What the OS says about the cost of the network.
+    network_cost: crate::NetworkCost,
     pending: Vec<AdapterCommand>,
     /// The Telegram account that the login screens are for (ADR 0014).
     /// Login steps go to it, and only its login events change the screens.
@@ -1242,6 +1253,10 @@ impl Snapshot {
             signal_link_account: ProtocolId::Signal,
             photo_downloads: HashSet::new(),
             file_downloads: HashSet::new(),
+            video_downloads: HashSet::new(),
+            background_media: HashSet::new(),
+            auto_media: false,
+            network_cost: crate::NetworkCost::Unknown,
             keychain_flush: false,
             ended_accounts: Vec::new(),
             helper_errors: HashMap::new(),
@@ -1648,6 +1663,7 @@ impl Snapshot {
                 self.note_delivery(before, &message);
                 self.observe_telegram_message(&message, None);
                 self.note_live_topic(&message);
+                self.auto_fetch(&message);
                 self.upsert_message(message);
             }
             AdapterEvent::MessageReplaced {
@@ -6189,6 +6205,12 @@ impl Snapshot {
         match state {
             AccountState::Linked => {
                 self.sessions.insert(protocol);
+                if uses_auto_download_command(protocol) {
+                    self.push(AdapterCommand::SetAutoDownload {
+                        protocol,
+                        on: self.auto_media,
+                    });
+                }
                 // The first linked account, or the linked one while nothing
                 // useful is selected: show it (shell plan 2).
                 if first_link || !self.protocol_linked(self.pane.protocol) {
@@ -6879,6 +6901,9 @@ impl Snapshot {
         // queued one, so the next sign-in can request that file again.
         self.photo_downloads.retain(|(owner, _)| *owner != protocol);
         self.file_downloads.retain(|(owner, _)| *owner != protocol);
+        self.video_downloads.retain(|(owner, _)| *owner != protocol);
+        self.background_media
+            .retain(|(owner, _)| *owner != protocol);
         self.pending.retain(|command| {
             !matches!(
                 command,
@@ -7523,7 +7548,12 @@ impl Snapshot {
             }
             (known, ready, secret)
         };
-        if !known || ready || !self.photo_downloads.insert((protocol, file_id)) {
+        if !known || ready {
+            return;
+        }
+        // A download that the app started is now a request of the user.
+        self.background_media.remove(&(protocol, file_id));
+        if !self.photo_downloads.insert((protocol, file_id)) {
             return;
         }
         self.queue(AdapterCommand::DownloadFile {
@@ -7613,6 +7643,7 @@ impl Snapshot {
             path.is_some() || bytes.is_some(),
             "PhotoFile always has a path or bytes"
         );
+        self.background_media.remove(&(protocol, file_id));
         self.photo_downloads.remove(&(protocol, file_id));
         for list in self.messages.values_mut() {
             for message in list.iter_mut() {
@@ -7684,6 +7715,10 @@ impl Snapshot {
 
     fn photo_failed(&mut self, protocol: ProtocolId, file_id: i32) {
         self.photo_downloads.remove(&(protocol, file_id));
+        if self.background_media.remove(&(protocol, file_id)) {
+            // The user did not ask for it: the row asks again when it shows.
+            return;
+        }
         for list in self.messages.values_mut() {
             for message in list.iter_mut() {
                 if message.protocol != protocol {
@@ -7797,6 +7832,8 @@ impl Snapshot {
     }
 
     fn video_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
+        self.video_downloads.remove(&(protocol, file_id));
+        self.background_media.remove(&(protocol, file_id));
         let videos = self.rows_of(protocol).filter_map(|row| row.video.as_mut());
         for video in videos.filter(|video| video.file_id() == file_id) {
             video.set_file(path.clone());
@@ -7804,6 +7841,11 @@ impl Snapshot {
     }
 
     fn video_failed(&mut self, protocol: ProtocolId, file_id: i32) {
+        self.video_downloads.remove(&(protocol, file_id));
+        if self.background_media.remove(&(protocol, file_id)) {
+            // The user did not ask for it: Play asks again.
+            return;
+        }
         let videos = self.rows_of(protocol).filter_map(|row| row.video.as_mut());
         for video in videos.filter(|video| video.file_id() == file_id) {
             video.mark_failed();
@@ -7840,8 +7882,116 @@ impl Snapshot {
             }
             video.clear_failed();
         }
+        // A download that the app started is now a request of the user: a
+        // failure shows on the row.
+        self.background_media.remove(&(protocol, file_id));
+        if !self.video_downloads.insert((protocol, file_id)) {
+            return;
+        }
         self.queue(AdapterCommand::DownloadVideo { protocol, file_id });
     }
+
+    // region: automatic media download
+
+    /// What the OS says about the cost of the network.
+    #[must_use]
+    pub fn network_cost(&self) -> crate::NetworkCost {
+        self.network_cost
+    }
+
+    pub(crate) fn set_network_cost(&mut self, cost: crate::NetworkCost) {
+        self.network_cost = cost;
+    }
+
+    /// Photos and videos download by themselves now.
+    #[must_use]
+    pub fn auto_media(&self) -> bool {
+        self.auto_media
+    }
+
+    /// Turn the automatic download on or off. Each linked helper account
+    /// hears the change. On, the loaded rows of the open thread download.
+    pub fn set_auto_media(&mut self, on: bool) {
+        if self.auto_media == on {
+            return;
+        }
+        self.auto_media = on;
+        let helpers: Vec<ProtocolId> = self
+            .accounts
+            .iter()
+            .filter(|row| row.linked() && uses_auto_download_command(row.caps.id))
+            .map(|row| row.caps.id)
+            .collect();
+        for protocol in helpers {
+            self.push(AdapterCommand::SetAutoDownload { protocol, on });
+        }
+        if on {
+            let open: Vec<ChatMessage> = self.selected_messages().to_vec();
+            for message in &open {
+                self.auto_fetch(message);
+            }
+        }
+    }
+
+    /// Download the video, and for Telegram the photo, of a message by
+    /// itself: a live message of any chat, or a row of the open thread. A
+    /// clip longer than [`crate::media_auto::AUTO_VIDEO_MAX_SECS`] waits for
+    /// Play. A secret photo waits for the chat.
+    fn auto_fetch(&mut self, message: &ChatMessage) {
+        if !self.auto_media || message.outbound {
+            return;
+        }
+        let open =
+            self.is_selected_thread(message.protocol, &message.conversation_id, message.topic);
+        if message.arrival != thinwire_protocol::Arrival::Live && !open {
+            return;
+        }
+        let protocol = message.protocol;
+        if let Some(video) = &message.video {
+            let short = video.duration_secs() <= crate::media_auto::AUTO_VIDEO_MAX_SECS;
+            let key = (protocol, video.file_id());
+            if short
+                && video.file().is_none()
+                && !video.failed()
+                && self.video_downloads.insert(key)
+            {
+                self.background_media.insert(key);
+                self.queue(AdapterCommand::DownloadVideo {
+                    protocol,
+                    file_id: key.1,
+                });
+            }
+        }
+        // Only Telegram photos download through the core. A helper fetches
+        // its own (`SetAutoDownload`), and Discord sends the image bytes.
+        if !protocol.is(ProtocolKind::Telegram) {
+            return;
+        }
+        let Some(photo) = message
+            .photo
+            .as_ref()
+            .filter(|photo| !photo.is_secret && !photo.failed)
+        else {
+            return;
+        };
+        let Some(size) = auto_photo_size(photo) else {
+            return;
+        };
+        let Some(file_id) = size.file_id.filter(|_| !size.ready()) else {
+            return;
+        };
+        let key = (protocol, file_id);
+        if self.photo_downloads.insert(key) {
+            self.background_media.insert(key);
+            self.queue(AdapterCommand::DownloadFile {
+                protocol,
+                file_id,
+                secret: false,
+            });
+        }
+    }
+
+    // endregion: automatic media download
 
     fn message_mut(
         &mut self,
@@ -8538,6 +8688,27 @@ pub mod test_support {
             })
             .collect()
     }
+}
+
+/// A helper account fetches its own photos, so it hears the choice of the
+/// automatic download (`SetAutoDownload`).
+fn uses_auto_download_command(protocol: ProtocolId) -> bool {
+    protocol.is(ProtocolKind::WhatsApp) || protocol.is(ProtocolKind::Signal)
+}
+
+/// The size of a photo that downloads by itself: the widest one that is not
+/// wider than [`crate::media_auto::AUTO_PHOTO_MAX_WIDTH`], else the
+/// smallest.
+fn auto_photo_size(
+    photo: &thinwire_protocol::MessagePhoto,
+) -> Option<&thinwire_protocol::PhotoSize> {
+    let max = crate::media_auto::AUTO_PHOTO_MAX_WIDTH;
+    photo
+        .sizes
+        .iter()
+        .filter(|size| size.width <= max)
+        .max_by_key(|size| size.width)
+        .or_else(|| photo.sizes.iter().min_by_key(|size| size.width))
 }
 
 #[cfg(test)]
@@ -10081,6 +10252,168 @@ mod tests {
             reply_to: None,
             edited: false,
         }
+    }
+
+    /// A live Telegram message in a chat that is not open, with a video and
+    /// a photo.
+    fn live_media_message(chat: i64, id: i64) -> ChatMessage {
+        use thinwire_protocol::{MessagePhoto, MessageVideo, PhotoSize};
+        let mut message = telegram_text(chat, id, "");
+        message.arrival = thinwire_protocol::Arrival::Live;
+        message.video = MessageVideo::new(30, 320, 240, 40 + i32::try_from(id).unwrap_or(0), None);
+        let size = |width: u32, file_id: i32| PhotoSize {
+            width,
+            height: width,
+            file_id: Some(file_id),
+            path: None,
+            bytes: None,
+        };
+        message.photo = Some(MessagePhoto {
+            width: 2560,
+            height: 2560,
+            mini: None,
+            sizes: vec![size(320, 11), size(1280, 12), size(2560, 13)],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        });
+        message
+    }
+
+    fn media_commands(commands: &[AdapterCommand]) -> Vec<(&'static str, i32)> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                AdapterCommand::DownloadVideo { file_id, .. } => Some(("video", *file_id)),
+                AdapterCommand::DownloadFile { file_id, .. } => Some(("photo", *file_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// With the automatic download on, a live message of a chat that is not
+    /// open downloads its video and the photo size of 1280 px. Off, nothing
+    /// downloads. A history row of a chat that is not open waits.
+    #[test]
+    fn auto_download_fetches_live_media_of_any_chat() {
+        let mut snapshot = telegram_chat_with_rows(&[]);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: live_media_message(2, 1),
+        });
+        assert!(media_commands(&snapshot.take_commands()).is_empty(), "off");
+
+        snapshot.set_auto_media(true);
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: live_media_message(2, 2),
+        });
+        assert_eq!(
+            media_commands(&snapshot.take_commands()),
+            vec![("video", 42), ("photo", 12)]
+        );
+        let mut history = live_media_message(2, 3);
+        history.arrival = thinwire_protocol::Arrival::History;
+        snapshot.apply(AdapterEvent::MessageReceived { message: history });
+        assert!(
+            media_commands(&snapshot.take_commands()).is_empty(),
+            "an old row of a closed chat waits"
+        );
+        let mut own = live_media_message(2, 4);
+        own.outbound = true;
+        snapshot.apply(AdapterEvent::MessageReceived { message: own });
+        assert!(
+            media_commands(&snapshot.take_commands()).is_empty(),
+            "own media"
+        );
+    }
+
+    /// A failed download that the app started leaves no mark on the row.
+    /// Play while it runs does not ask again, and after Play a failure shows.
+    #[test]
+    fn a_background_failure_leaves_no_mark_and_play_takes_over() {
+        let mut snapshot = telegram_chat_with_rows(&[]);
+        snapshot.set_auto_media(true);
+        let mut message = live_media_message(1, 5);
+        message.photo = None;
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        assert_eq!(
+            media_commands(&snapshot.take_commands()),
+            vec![("video", 45)]
+        );
+        snapshot.play_video(ProtocolId::Telegram, "telegram:1", "telegram:1:5", 45);
+        assert!(
+            media_commands(&snapshot.take_commands()).is_empty(),
+            "the download already runs"
+        );
+        snapshot.apply(AdapterEvent::VideoFailed {
+            protocol: ProtocolId::Telegram,
+            file_id: 45,
+        });
+        let failed = |snapshot: &Snapshot| {
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == "telegram:1:5")
+                .and_then(|row| row.video.as_ref())
+                .is_some_and(thinwire_protocol::MessageVideo::failed)
+        };
+        assert!(failed(&snapshot), "Play made it a request of the user");
+
+        let mut quiet = live_media_message(1, 6);
+        quiet.photo = None;
+        snapshot.apply(AdapterEvent::MessageReceived { message: quiet });
+        assert_eq!(
+            media_commands(&snapshot.take_commands()),
+            vec![("video", 46)]
+        );
+        snapshot.apply(AdapterEvent::VideoFailed {
+            protocol: ProtocolId::Telegram,
+            file_id: 46,
+        });
+        let row = snapshot
+            .selected_messages()
+            .iter()
+            .find(|row| row.id == "telegram:1:6")
+            .and_then(|row| row.video.clone())
+            .expect("video");
+        assert!(!row.failed(), "nobody asked for it");
+        snapshot.play_video(ProtocolId::Telegram, "telegram:1", "telegram:1:6", 46);
+        assert_eq!(
+            media_commands(&snapshot.take_commands()),
+            vec![("video", 46)],
+            "Play asks again"
+        );
+    }
+
+    /// A linked helper account hears the choice when it links and when it
+    /// changes. Telegram does not: the core fetches its media.
+    #[test]
+    fn a_helper_account_hears_the_auto_download_choice() {
+        let mut snapshot = telegram_chat_with_rows(&[]);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        let choices = |commands: Vec<AdapterCommand>| -> Vec<(ProtocolId, bool)> {
+            commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    AdapterCommand::SetAutoDownload { protocol, on } => Some((protocol, on)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            choices(snapshot.take_commands()),
+            vec![(ProtocolId::Signal, false)]
+        );
+        snapshot.set_auto_media(true);
+        assert_eq!(
+            choices(snapshot.take_commands()),
+            vec![(ProtocolId::Signal, true)]
+        );
+        snapshot.set_auto_media(true);
+        assert!(choices(snapshot.take_commands()).is_empty(), "no change");
     }
 
     #[test]

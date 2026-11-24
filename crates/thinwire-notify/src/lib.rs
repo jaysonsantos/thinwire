@@ -26,6 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use badge_count::BadgeCount;
+pub use network_cost::{NetworkWatch, cost_of_nm_metered};
 pub use pipe::{INBOX_LIMIT, MAX_DISMISS_TRIES, MAX_FAILURES_IN_A_ROW, RETRY_AFTER, RETRY_MAX};
 pub use thinwire_core::notify::{Notification, NotifyCommand, NotifyKey};
 
@@ -34,6 +35,7 @@ mod badge;
 mod badge_count;
 #[cfg(target_os = "macos")]
 mod macos;
+mod network_cost;
 mod pipe;
 #[cfg(any(windows, target_os = "macos", test))]
 mod tagged;

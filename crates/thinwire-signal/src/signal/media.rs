@@ -245,6 +245,11 @@ impl MediaBook {
         }
     }
 
+    /// The chats that have a photo download that waits.
+    pub(super) fn waiting_chats(&self) -> Vec<String> {
+        self.lock().waiting.keys().cloned().collect()
+    }
+
     /// The photo downloads of `conversation_id`. Each one is returned once.
     pub(super) fn take_jobs(&self, conversation_id: &str) -> Vec<PhotoJob> {
         self.lock()

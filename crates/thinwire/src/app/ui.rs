@@ -579,6 +579,54 @@ fn typing_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>)
     if each != before {
         out.push(Intent::SetPersonColors(each));
     }
+    media_download_control(ui, snapshot, out);
+}
+
+/// Settings choice: when photos and videos download with no click. An OS
+/// that cannot tell the cost of the network has no "On unmetered networks":
+/// there that value acts as Never, and the choice shows Never.
+fn media_download_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    use thinwire_core::{MediaDownload, NetworkCost};
+    let reads_cost = thinwire_notify::NetworkWatch::SUPPORTED;
+    let stored = snapshot.media_download();
+    let mut value = if !reads_cost && stored == MediaDownload::Unmetered {
+        MediaDownload::Never
+    } else {
+        stored
+    };
+    let before = value;
+    // One row: the Settings menu must fit a small window.
+    ui.horizontal(|ui| {
+        let label = ui.label(RichText::new("Download media").small());
+        let combo = egui::ComboBox::from_id_salt("media-download")
+            .selected_text(value.label())
+            .show_ui(ui, |ui| {
+                for choice in MediaDownload::ALL {
+                    if choice == MediaDownload::Unmetered && !reads_cost {
+                        continue;
+                    }
+                    ui.selectable_value(&mut value, choice, choice.label());
+                }
+            })
+            .response
+            .labelled_by(label.id);
+        if reads_cost && value == MediaDownload::Unmetered {
+            combo.on_hover_text(match snapshot.network_cost() {
+                NetworkCost::Unmetered => {
+                    "This network is unmetered: photos and videos download now."
+                }
+                NetworkCost::Metered => {
+                    "This network is metered: photos and videos wait for a click."
+                }
+                NetworkCost::Unknown => {
+                    "The cost of this network is unknown: photos and videos wait for a click."
+                }
+            });
+        }
+    });
+    if value != before {
+        out.push(Intent::SetMediaDownload(value));
+    }
 }
 
 fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {

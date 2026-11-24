@@ -143,6 +143,7 @@ pub(crate) fn command_to_wire(
         } => WireCommand::MarkRead {
             conversation_id: conversation_id.clone(),
         },
+        AdapterCommand::SetAutoDownload { on, .. } => WireCommand::SetAutoDownload { on: *on },
         AdapterCommand::WhatsAppAcknowledgeRisk | AdapterCommand::SignalAcknowledgeNotice => {
             WireCommand::AcknowledgeGate
         }
@@ -291,6 +292,7 @@ pub(crate) fn command_from_wire(
             protocol,
             conversation_id,
         },
+        WireCommand::SetAutoDownload { on } => AdapterCommand::SetAutoDownload { protocol, on },
         WireCommand::AcknowledgeGate => match protocol {
             ProtocolId::WhatsApp => AdapterCommand::WhatsAppAcknowledgeRisk,
             ProtocolId::Signal => AdapterCommand::SignalAcknowledgeNotice,
@@ -1776,6 +1778,7 @@ mod tests {
                 protocol,
                 conversation_id: CHAT.into(),
             },
+            AdapterCommand::SetAutoDownload { protocol, on: true },
             AdapterCommand::WhatsAppAcknowledgeRisk,
             AdapterCommand::WhatsAppBeginLink { generation: 6 },
             AdapterCommand::WhatsAppCancelLink,

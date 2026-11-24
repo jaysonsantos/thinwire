@@ -73,6 +73,12 @@ impl View<'_> {
         self.settings.recent_emoji()
     }
 
+    /// When photos and videos download with no click.
+    #[must_use]
+    pub fn media_download(&self) -> crate::MediaDownload {
+        self.settings.media_download()
+    }
+
     /// Settings switch: the other people of a chat see when the user types.
     #[must_use]
     pub fn send_typing(&self) -> bool {

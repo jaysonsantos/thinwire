@@ -354,7 +354,16 @@ impl Core {
         };
         core.restore_signal_notice();
         core.restore_whatsapp_gate();
+        core.sync_auto_media();
         core
+    }
+
+    /// Photos and videos download by themselves when the setting and the
+    /// network allow it (`media_auto::allows`).
+    fn sync_auto_media(&mut self) {
+        let on =
+            crate::media_auto::allows(self.settings.media_download(), self.state.network_cost());
+        self.state.set_auto_media(on);
     }
 
     // region: accounts
@@ -1100,6 +1109,14 @@ impl Core {
             }
             Intent::SetUnreadBadge(on) => self.settings.set_unread_badge(on),
             Intent::SetPersonColors(on) => self.settings.set_person_colors(on),
+            Intent::SetMediaDownload(value) => {
+                self.settings.set_media_download(value);
+                self.sync_auto_media();
+            }
+            Intent::SetNetworkCost(cost) => {
+                self.state.set_network_cost(cost);
+                self.sync_auto_media();
+            }
             Intent::UseEmoji(emoji) => self.settings.use_emoji(&emoji),
             Intent::SetChatMute {
                 protocol,
