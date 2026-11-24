@@ -55,6 +55,7 @@ const CAPS: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
+    mark_read: false,
 };
 
 /// Short waits, so a restart test takes milliseconds.

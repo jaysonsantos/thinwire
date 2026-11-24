@@ -116,6 +116,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: cfg!(feature = "discord-bot"),
     mentions: false,
     message_search: false,
+    mark_read: false,
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.

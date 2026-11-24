@@ -268,6 +268,10 @@ pub struct ProtocolCapabilities {
     /// The adapter answers `SearchMessages` with `MessagesFound` (#514). The
     /// chat list searches the text of messages only for such a protocol.
     pub message_search: bool,
+    /// The adapter answers `MarkRead`: the service marks every message of
+    /// the chat read. The menu of a chat row offers "Mark as read" only for
+    /// such a protocol.
+    pub mark_read: bool,
 }
 
 /// What a user can do with one message, by protocol. The message menu shows
@@ -803,6 +807,13 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// Mark every message of one chat read at the service, also when the
+    /// chat is not open. The adapter sends the new count in a
+    /// `ConversationUpsert`. Ids are not secrets.
+    MarkRead {
+        protocol: ProtocolId,
+        conversation_id: String,
+    },
     /// Search the text of the messages of the account (#514), or of one
     /// chat when `conversation_id` names it. The adapter always answers
     /// with one `MessagesFound` that has the same `request`, also when the
@@ -847,6 +858,7 @@ impl AdapterCommand {
             | Self::ForwardMessages { protocol, .. }
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
+            | Self::MarkRead { protocol, .. }
             | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
@@ -920,6 +932,7 @@ impl AdapterCommand {
             | Self::ForwardMessages { protocol, .. }
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
+            | Self::MarkRead { protocol, .. }
             | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;

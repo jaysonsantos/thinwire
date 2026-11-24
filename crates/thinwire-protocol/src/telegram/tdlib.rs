@@ -84,6 +84,10 @@ pub(super) enum TdlibCommand {
     LoadMembers {
         conversation_id: String,
     },
+    /// Mark every message of one chat read.
+    MarkRead {
+        conversation_id: String,
+    },
     /// Search the text of the messages of the account, or of one chat.
     SearchMessages {
         conversation_id: Option<String>,
@@ -182,6 +186,7 @@ impl TdlibCommand {
             Self::ForwardMessages { .. } => "forward_messages",
             Self::SetTyping { .. } => "set_typing",
             Self::LoadMembers { .. } => "load_members",
+            Self::MarkRead { .. } => "mark_read",
             Self::SearchMessages { .. } => "search_messages",
             Self::Resend { .. } => "resend",
             Self::LoadOlder { .. } => "load_older",
@@ -1211,6 +1216,16 @@ fn spawn_tdlib_worker(
                                     typing_target(&conversation_id, topic)
                             {
                                 tokio::spawn(send_typing(client_id, chat_id, topic, typing));
+                            }
+                        }
+                        TdlibCommand::MarkRead { conversation_id } => {
+                            // `getChat` and `viewMessages` are two round
+                            // trips: they do not wait in this loop.
+                            if live.linked()
+                                && let Some(chat_id) =
+                                    inbox::parse_telegram_chat_id(&conversation_id)
+                            {
+                                tokio::spawn(mark_chat_read(client_id, chat_id));
                             }
                         }
                         TdlibCommand::LoadMembers { conversation_id } => {
@@ -2323,6 +2338,38 @@ fn typing_target(
     match topic {
         None => Some((chat_id, None)),
         Some(topic) => Some((chat_id, Some(td_topic(topic)?))),
+    }
+}
+
+/// Mark every message of one chat read: `viewMessages` with `force_read` on
+/// the newest message moves the read point of the chat to the end. A chat
+/// that the user marked as unread loses that mark, and its mentions are
+/// read too. TDLib then sends the new count (`updateChatReadInbox`). No id
+/// goes to the log.
+async fn mark_chat_read(client_id: i32, chat_id: i64) {
+    let chat = match tdlib_rs::functions::get_chat(chat_id, client_id).await {
+        Ok(tdlib_rs::enums::Chat::Chat(chat)) => chat,
+        Err(error) => {
+            log_tdlib_error("getChat", &error);
+            return;
+        }
+    };
+    if let Some(newest) = chat.last_message.as_ref().map(|message| message.id)
+        && let Err(error) =
+            tdlib_rs::functions::view_messages(chat_id, vec![newest], None, true, client_id).await
+    {
+        log_tdlib_error("viewMessages", &error);
+    }
+    if chat.is_marked_as_unread
+        && let Err(error) =
+            tdlib_rs::functions::toggle_chat_is_marked_as_unread(chat_id, false, client_id).await
+    {
+        log_tdlib_error("toggleChatIsMarkedAsUnread", &error);
+    }
+    if chat.unread_mention_count > 0
+        && let Err(error) = tdlib_rs::functions::read_all_chat_mentions(chat_id, client_id).await
+    {
+        log_tdlib_error("readAllChatMentions", &error);
     }
 }
 

@@ -69,6 +69,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
+    mark_read: false,
 };
 
 const NOTICE_REQUIRED: &str =

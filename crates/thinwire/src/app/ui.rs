@@ -1864,7 +1864,15 @@ fn inbox(
             out,
         );
         let force_open = open_mute_menus && claim_menu_state(&mut menu_state_open, mute);
+        let mark_read = snapshot.can_mark_read(protocol, &id);
         let add_menu = |ui: &mut egui::Ui| {
+            if mark_read && ui.button("Mark as read").clicked() {
+                out.push(Intent::MarkChatRead {
+                    protocol,
+                    conversation_id: id.clone(),
+                });
+                ui.close();
+            }
             if let Some(intent) = mute_control(ui, protocol, &id, mute, "chat") {
                 out.push(intent);
                 ui.close();
@@ -3896,7 +3904,17 @@ fn bubble(
         meta: ink,
     } = bubble_ink(palette, emoji, message.outbound, person);
     let mut body_galley = None;
-    ui.with_layout(egui::Layout::top_down(align), |ui| {
+    // The whole line of the message is one target: a right click anywhere
+    // on it opens the menu, and a double click starts a reply. egui puts the
+    // sense of this `Ui` under its widgets, so the text, the links, the
+    // quote, and the media keep their own clicks.
+    let line = egui::UiBuilder::new()
+        .id_salt(("message-line", message.id))
+        .layout(egui::Layout::top_down(align))
+        .sense(egui::Sense::CLICK);
+    ui.scope_builder(line, |ui| {
+        ui.set_min_width(ui.available_width());
+        let line = ui.response();
         let frame = egui::Frame::new()
             .fill(fill)
             .corner_radius(bubble_radius(message.outbound, message.layout.run_end))
@@ -4107,7 +4125,14 @@ fn bubble(
             editable: message.editable,
             forwardable: message.forwardable,
         };
-        super::message_menu::attach(&frame, &target, message.actions, out);
+        super::message_menu::attach(&line, &target, message.actions, out);
+        if line.double_clicked() && message.actions.reply && !message.selecting {
+            out.push(Intent::ReplyTo {
+                protocol: message.protocol,
+                conversation_id: message.conversation_id.to_owned(),
+                message_id: message.id.to_owned(),
+            });
+        }
         super::message_menu::reactions(ui, &target, message.actions, out);
         if message.selecting && message.forwardable {
             select_on_click(ui, &frame, message, out);

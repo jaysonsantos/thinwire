@@ -160,6 +160,12 @@ pub enum Intent {
         conversation_id: String,
         muted: bool,
     },
+    /// Mark every message of one chat read, from the menu of its row. It
+    /// acts only when [`crate::Snapshot::can_mark_read`] allows it.
+    MarkChatRead {
+        protocol: ProtocolId,
+        conversation_id: String,
+    },
     /// Start the helper process of this protocol again (ADR 0013). It acts
     /// only while the account row shows "Helper stopped."
     RestartHelper(ProtocolId),

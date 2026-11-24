@@ -1113,6 +1113,10 @@ impl Core {
                     self.notify.dismiss_muted(protocol, &conversation_id);
                 }
             }
+            Intent::MarkChatRead {
+                protocol,
+                conversation_id,
+            } => self.state.mark_chat_read(protocol, &conversation_id),
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
             Intent::RetryStoreKey(protocol) => self.state.retry_store_key(protocol),
             Intent::ShowNotice(protocol) => self.state.open_notice_review(protocol),

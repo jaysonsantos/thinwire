@@ -53,6 +53,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
+    mark_read: false,
 };
 
 /// Longest wait at shutdown for the sends in flight, before the client

@@ -64,6 +64,7 @@ const fn caps(protocol: ProtocolId) -> ProtocolCapabilities {
         typing: false,
         mentions: false,
         message_search: false,
+        mark_read: false,
     }
 }
 

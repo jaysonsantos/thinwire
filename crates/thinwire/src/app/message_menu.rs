@@ -63,15 +63,16 @@ fn delete_choices(actions: MessageActions, outbound: bool) -> (bool, bool) {
     )
 }
 
-/// The menu opens on a right click anywhere in `bubble`. The text, the links,
-/// and the photo keep their own clicks.
+/// The menu opens on a right click anywhere in `line`: the bubble and the
+/// empty part of its line. The text, the links, and the photo keep their own
+/// clicks.
 pub(crate) fn attach(
-    bubble: &egui::Response,
+    line: &egui::Response,
     target: &Target<'_>,
     actions: MessageActions,
     out: &mut Vec<Intent>,
 ) {
-    bubble.container_context_menu(|ui| menu(ui, target, actions, out));
+    line.container_context_menu(|ui| menu(ui, target, actions, out));
 }
 
 fn menu(ui: &mut egui::Ui, target: &Target<'_>, actions: MessageActions, out: &mut Vec<Intent>) {
@@ -122,7 +123,6 @@ fn menu(ui: &mut egui::Ui, target: &Target<'_>, actions: MessageActions, out: &m
             conversation_id: target.conversation_id.to_owned(),
             message_id: target.message_id.to_owned(),
         });
-        ui.memory_mut(|memory| memory.request_focus(egui::Id::unique("thread-compose")));
         ui.close();
     }
     if !target.body.is_empty() && ui.button("Copy text").clicked() {

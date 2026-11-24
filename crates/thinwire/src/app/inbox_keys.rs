@@ -126,8 +126,21 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             | Intent::LinkAccount(_)
             | Intent::RemoveAccount(_)
             | Intent::UnlinkAccount(_)) => state.account_intents.push(intent),
+            Intent::ReplyTo {
+                protocol,
+                conversation_id,
+                message_id,
+            } => {
+                state
+                    .snapshot
+                    .begin_reply(protocol, &conversation_id, &message_id);
+                state.message_intents.push(Intent::ReplyTo {
+                    protocol,
+                    conversation_id,
+                    message_id,
+                });
+            }
             intent @ (Intent::React { .. }
-            | Intent::ReplyTo { .. }
             | Intent::DeleteMessage { .. }
             | Intent::EditMessage { .. }
             | Intent::CancelEdit
@@ -210,6 +223,10 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             } => state
                 .snapshot
                 .set_draft(protocol, &conversation_id, topic, text.into_inner()),
+            Intent::MarkChatRead {
+                protocol,
+                conversation_id,
+            } => state.snapshot.mark_chat_read(protocol, &conversation_id),
             Intent::SetChatMute {
                 protocol,
                 conversation_id,
@@ -906,6 +923,66 @@ fn the_header_button_mutes_and_unmutes_the_open_chat() {
     harness.get_by_role_and_label(egui::accesskit::Role::Button, "Mute");
 }
 
+/// A right click on a chat row with unread messages offers "Mark as read".
+/// It clears the count and asks the adapter. A chat with no unread message
+/// has no such item.
+#[test]
+fn the_row_menu_marks_a_chat_read() {
+    let mut state = InboxUi::ready();
+    let mut bob = telegram_chat(2, "Bob", 5);
+    bob.unread = 4;
+    state
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation: bob });
+    state.snapshot.take_commands();
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label_contains("Bob"),
+        )
+        .next()
+        .expect("the row of Bob")
+        .click_secondary();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Mark as read")
+        .click();
+    harness.run();
+    let state = harness.state_mut();
+    assert_eq!(
+        state
+            .snapshot
+            .conversation(ProtocolId::Telegram, "telegram:2")
+            .map(|row| row.unread),
+        Some(0)
+    );
+    assert!(state.snapshot.take_commands().contains(
+        &thinwire_protocol::AdapterCommand::MarkRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        }
+    ));
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label_contains("Bob"),
+        )
+        .next()
+        .expect("the row of Bob")
+        .click_secondary();
+    harness.run();
+    assert!(
+        harness.query_by_label("Mark as read").is_none(),
+        "nothing is unread now"
+    );
+}
+
 /// #153: a right click on a row mutes that chat. A chat muted in the
 /// protocol shows a disabled "Muted in Telegram": only Telegram unmutes it.
 #[test]
@@ -1473,6 +1550,89 @@ fn the_message_menu_offers_edit_for_an_own_text() {
                 conversation_id: "telegram:1".into(),
                 message_id: "telegram:1:9".into(),
             })
+    );
+}
+
+fn pointer_click(
+    harness: &mut Harness<'static, InboxUi>,
+    pos: egui::Pos2,
+    button: egui::PointerButton,
+) {
+    harness.hover_at(pos);
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+}
+
+/// A right click on the empty part of the line of a message, beside its
+/// bubble, opens the menu of that message. Reply gives the compose field
+/// the focus.
+#[test]
+fn a_right_click_beside_a_bubble_opens_its_menu_and_reply_focuses_compose() {
+    let mut state = InboxUi::ready();
+    state.apply_hints = true;
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message("telegram:1:9", "Short line", 1_790_300_000),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    let bubble = bubble_rect(&harness, "Short line");
+    // An inbound bubble is on the left: the right part of its line is empty.
+    let beside = egui::pos2(bubble.right() + 200.0, bubble.center().y);
+    pointer_click(&mut harness, beside, egui::PointerButton::Secondary);
+    harness.run();
+    harness.get_by_label("Reply").click();
+    harness.run();
+    assert!(harness.state().message_intents.contains(&Intent::ReplyTo {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+        message_id: "telegram:1:9".into(),
+    }));
+    let compose = egui::Id::unique("thread-compose");
+    assert!(
+        harness.ctx.memory(|memory| memory.has_focus(compose)),
+        "after Reply, the compose field has the focus"
+    );
+}
+
+/// A double click on the line of a message, beside its bubble, starts a
+/// reply to that message.
+#[test]
+fn a_double_click_beside_a_bubble_starts_a_reply() {
+    let mut state = InboxUi::ready();
+    state.apply_hints = true;
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message("telegram:1:9", "Short line", 1_790_300_000),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    let bubble = bubble_rect(&harness, "Short line");
+    let beside = egui::pos2(bubble.right() + 200.0, bubble.center().y);
+    // The harness gives each pointer event a frame of its own, so the two
+    // clicks are further apart than the double click time of egui.
+    harness
+        .ctx
+        .options_mut(|options| options.input_options.max_double_click_delay = 10.0);
+    pointer_click(&mut harness, beside, egui::PointerButton::Primary);
+    pointer_click(&mut harness, beside, egui::PointerButton::Primary);
+    harness.run();
+    assert_eq!(
+        harness
+            .state()
+            .snapshot
+            .reply_target()
+            .map(|message| message.id.as_str()),
+        Some("telegram:1:9")
+    );
+    let compose = egui::Id::unique("thread-compose");
+    assert!(
+        harness.ctx.memory(|memory| memory.has_focus(compose)),
+        "the reply gives the compose field the focus"
     );
 }
 

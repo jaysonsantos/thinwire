@@ -72,6 +72,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: true,
     mentions: true,
     message_search: true,
+    mark_read: true,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.
@@ -624,6 +625,10 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
             } => self.dispatch_live(events, LiveCall::LoadMembers { conversation_id }),
+            AdapterCommand::MarkRead {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+            } => self.dispatch_live(events, LiveCall::MarkRead { conversation_id }),
             AdapterCommand::SearchMessages {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -747,6 +752,9 @@ enum LiveCall {
         typing: bool,
     },
     LoadMembers {
+        conversation_id: String,
+    },
+    MarkRead {
         conversation_id: String,
     },
     SearchMessages {
@@ -985,6 +993,14 @@ impl TelegramAdapter {
                             topic,
                             typing,
                         },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::MarkRead { conversation_id } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::MarkRead { conversation_id },
                         secrets,
                         source,
                         events,
@@ -1733,6 +1749,28 @@ mod tests {
         let body = fn_body(src, "async fn send_typing");
         assert!(body.contains("ChatAction::Typing") && body.contains("ChatAction::Cancel"));
         assert!(body.contains("functions::send_chat_action("));
+    }
+
+    /// "Mark as read" does not wait in the worker loop, and a client that is
+    /// not linked sends nothing. It moves the read point to the newest
+    /// message and clears the unread mark and the mentions.
+    #[test]
+    fn mark_read_goes_out_off_the_worker_loop_and_only_when_linked() {
+        let src = include_str!("tdlib.rs");
+        let start = src
+            .find("TdlibCommand::MarkRead { conversation_id } => {")
+            .expect("worker arm");
+        let arm = &src[start..start + 600];
+        let linked = arm.find("live.linked()").expect("linked check");
+        let spawn = arm
+            .find("tokio::spawn(mark_chat_read(client_id, chat_id))")
+            .expect("spawned read");
+        assert!(linked < spawn);
+        let body = fn_body(src, "async fn mark_chat_read");
+        assert!(body.contains("functions::get_chat("));
+        assert!(body.contains("functions::view_messages(chat_id, vec![newest], None, true"));
+        assert!(body.contains("functions::toggle_chat_is_marked_as_unread(chat_id, false"));
+        assert!(body.contains("functions::read_all_chat_mentions("));
     }
 
     /// The member list does not wait in the worker loop, and a client that

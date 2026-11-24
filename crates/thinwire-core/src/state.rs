@@ -3278,6 +3278,39 @@ impl Snapshot {
             .any(|row| row.caps.id == protocol && row.linked() && row.caps.sends_media)
     }
 
+    /// The menu of this chat row offers "Mark as read": the protocol has
+    /// `mark_read`, and the chat has unread messages. A placeholder row has
+    /// no chat at the service. A chat with topics counts per topic, so it
+    /// has no such item.
+    #[must_use]
+    pub fn can_mark_read(&self, protocol: ProtocolId, conversation_id: &str) -> bool {
+        self.accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked() && row.caps.mark_read)
+            && self
+                .conversation(protocol, conversation_id)
+                .is_some_and(|row| row.unread > 0 && !row.placeholder && !row.has_topics)
+    }
+
+    /// Mark every message of one chat read. The row shows no count at once,
+    /// and the adapter sends the count of the service after it.
+    pub fn mark_chat_read(&mut self, protocol: ProtocolId, conversation_id: &str) {
+        if !self.can_mark_read(protocol, conversation_id) {
+            return;
+        }
+        if let Some(row) = self
+            .conversations
+            .get_mut(&protocol)
+            .and_then(|list| list.iter_mut().find(|row| row.id == conversation_id))
+        {
+            row.unread = 0;
+        }
+        self.push(AdapterCommand::MarkRead {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+        });
+    }
+
     /// An accepted send took these files: drop them from the tray, when the
     /// tray still holds them.
     fn clear_sent_files(
@@ -3334,12 +3367,9 @@ impl Snapshot {
     }
 
     /// The next send of the open thread replies to this message.
-    pub(crate) fn begin_reply(
-        &mut self,
-        protocol: ProtocolId,
-        conversation_id: &str,
-        message_id: &str,
-    ) {
+    /// Answer `message_id` with the next send of the open thread. The compose
+    /// field gets the focus, so the user types the answer at once.
+    pub fn begin_reply(&mut self, protocol: ProtocolId, conversation_id: &str, message_id: &str) {
         if !self.message_actions(protocol).reply
             || !self.is_selected_thread(protocol, conversation_id, self.pane.topic)
             || !self
@@ -3356,6 +3386,7 @@ impl Snapshot {
             topic: self.pane.topic,
             message_id: message_id.to_owned(),
         });
+        self.focus_compose = true;
     }
 
     /// The next send is a plain message again.
@@ -10414,14 +10445,62 @@ mod tests {
         snapshot
     }
 
+    /// "Mark as read" zeros the count of a chat that is not open and asks
+    /// the adapter once. A chat with no unread message and a chat with
+    /// topics get no command.
+    #[test]
+    fn mark_as_read_zeros_the_row_and_asks_the_adapter() {
+        let mut snapshot = telegram_chat_with_rows(&[]);
+        let mut bob = test_support::telegram_chat(2, "Bob", 1);
+        bob.unread = 4;
+        let mut forum = test_support::telegram_chat(3, "Forum", 1);
+        forum.unread = 2;
+        forum.has_topics = true;
+        for conversation in [bob, forum] {
+            snapshot.apply(AdapterEvent::ConversationUpsert { conversation });
+        }
+        snapshot.take_commands();
+        assert!(snapshot.can_mark_read(ProtocolId::Telegram, "telegram:2"));
+        assert!(!snapshot.can_mark_read(ProtocolId::Telegram, "telegram:3"));
+        assert!(!snapshot.can_mark_read(ProtocolId::Telegram, "telegram:1"));
+        snapshot.mark_chat_read(ProtocolId::Telegram, "telegram:3");
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "a forum counts per topic"
+        );
+
+        snapshot.mark_chat_read(ProtocolId::Telegram, "telegram:2");
+        assert_eq!(
+            snapshot
+                .conversation(ProtocolId::Telegram, "telegram:2")
+                .map(|row| row.unread),
+            Some(0)
+        );
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::MarkRead {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:2".into(),
+            }]
+        );
+        snapshot.mark_chat_read(ProtocolId::Telegram, "telegram:2");
+        assert!(snapshot.take_commands().is_empty(), "nothing is unread now");
+    }
+
     /// Reply binds the next text send of the same thread, once. Another
     /// open chat does not show it or use it.
     #[test]
     fn a_reply_goes_with_the_next_send_of_its_thread() {
         let mut snapshot = telegram_chat_with_rows(&[(5, false)]);
+        snapshot.take_focus_compose();
         snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:9");
         assert!(snapshot.reply_target().is_none(), "no such message");
+        assert!(!snapshot.wants_focus_compose(), "no reply, no focus");
         snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
+        assert!(
+            snapshot.take_focus_compose(),
+            "a reply gives the compose field the focus"
+        );
         assert_eq!(
             snapshot.reply_target().map(|message| message.id.as_str()),
             Some("telegram:1:5")

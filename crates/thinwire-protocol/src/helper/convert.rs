@@ -183,7 +183,10 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::SetTyping { .. }
         | AdapterCommand::LoadMembers { .. }
         // A helper searches no message text yet (#514).
-        | AdapterCommand::SearchMessages { .. } => return None,
+        | AdapterCommand::SearchMessages { .. }
+        // A helper has no "Mark as read" yet: the wire protocol has no
+        // command for it.
+        | AdapterCommand::MarkRead { .. } => return None,
     })
 }
 
