@@ -36,6 +36,8 @@ mod badge_count;
 #[cfg(target_os = "macos")]
 mod macos;
 mod network_cost;
+#[cfg(target_os = "macos")]
+mod network_macos;
 mod pipe;
 #[cfg(any(windows, target_os = "macos", test))]
 mod tagged;

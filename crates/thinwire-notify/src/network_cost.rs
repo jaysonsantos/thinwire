@@ -2,21 +2,25 @@
 //! videos.
 //!
 //! - Linux: the `Metered` value of NetworkManager on the system bus. One
-//!   thread reads it every [`POLL`] and sends a change. With no
+//!   thread reads it every 30 s and sends a change. With no
 //!   NetworkManager or no system bus, the cost is unknown.
-//! - macOS and Windows: not read yet. The cost stays unknown, and
-//!   [`NetworkWatch::SUPPORTED`] is `false`. macOS gives it only through
-//!   Network.framework, which needs `unsafe` code here, and the Windows call
-//!   is not checked on Windows.
+//! - macOS: a path monitor of Network.framework (module `network_macos`).
+//!   It sends each new path at once: a phone network, a hotspot, or Low
+//!   Data Mode is metered.
+//! - Windows: not read yet. The cost stays unknown, and
+//!   [`NetworkWatch::SUPPORTED`] is `false`: the Windows call is not checked
+//!   on Windows.
 //!
 //! An unknown cost counts as metered (`thinwire_core::media_auto`).
 
 use std::sync::mpsc::{self, Receiver};
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
 use thinwire_core::NetworkCost;
 
-/// How often the thread reads the cost.
+/// How often the thread reads the cost. macOS sends each change instead.
+#[cfg(not(target_os = "macos"))]
 pub const POLL: Duration = Duration::from_secs(30);
 
 /// The thread that reads the cost. It ends when the watch drops.
@@ -27,7 +31,7 @@ pub struct NetworkWatch {
 impl NetworkWatch {
     /// This OS tells the cost of the network. A frontend offers the choice
     /// "On unmetered networks" only when it does.
-    pub const SUPPORTED: bool = cfg!(target_os = "linux");
+    pub const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
     /// Start the thread. `wake` runs after each change, so the frontend
     /// reads it soon.
@@ -38,6 +42,33 @@ impl NetworkWatch {
             return Self { changes: None };
         }
         let (send, changes) = mpsc::channel();
+        Self::begin(send, changes, wake)
+    }
+
+    /// The path monitor of Network.framework sends each new cost.
+    #[cfg(target_os = "macos")]
+    fn begin(
+        send: mpsc::Sender<NetworkCost>,
+        changes: Receiver<NetworkCost>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
+        if crate::network_macos::start(send, wake) {
+            Self {
+                changes: Some(changes),
+            }
+        } else {
+            tracing::warn!("network path monitor did not start");
+            Self { changes: None }
+        }
+    }
+
+    /// The thread that reads the cost every `POLL` and sends a change.
+    #[cfg(not(target_os = "macos"))]
+    fn begin(
+        send: mpsc::Sender<NetworkCost>,
+        changes: Receiver<NetworkCost>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
         let spawned = std::thread::Builder::new()
             .name("thinwire-network".into())
             .spawn(move || {
@@ -138,11 +169,11 @@ impl Reader {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Default)]
 struct Reader;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Reader {
     fn read(&mut self) -> NetworkCost {
         NetworkCost::Unknown
@@ -164,7 +195,10 @@ mod tests {
     }
 
     #[test]
-    fn only_linux_reads_the_cost() {
-        assert_eq!(NetworkWatch::SUPPORTED, cfg!(target_os = "linux"));
+    fn linux_and_macos_read_the_cost() {
+        assert_eq!(
+            NetworkWatch::SUPPORTED,
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
     }
 }

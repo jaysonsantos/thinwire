@@ -19,8 +19,8 @@ publish = false
 repository = "https://github.com/jaysonsantos/thinwire"
 
 [workspace.lints.rust]
-# `deny`, not `forbid`: one module may allow it. `scripts/check-unsafe.sh`
-# names that module and fails on any other `unsafe` exception.
+# `deny`, not `forbid`: two modules may allow it. `scripts/check-unsafe.sh`
+# names them and fails on any other `unsafe` exception.
 unsafe_code = "deny"
 
 [workspace.lints.clippy]

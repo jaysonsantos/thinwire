@@ -57,6 +57,9 @@ objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 # The Dock badge with the unread count (#513), safe API. Same versions as
 # the AppKit bindings of the app in Cargo.lock: no second copy.
 objc2 = "0.6.4"
+# The handler block of the Network.framework path monitor: the cost of the
+# network. Same version as objc2 0.6 brings in Cargo.lock.
+block2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "std",
   "NSApplication",

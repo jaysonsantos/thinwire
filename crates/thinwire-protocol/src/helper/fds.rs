@@ -9,8 +9,9 @@
 //! close-on-exec, so exec closes them. A mark, not a close, keeps the pipe
 //! that the standard library uses to report an exec error.
 //!
-//! This is the one module of the workspace with `unsafe` code.
-//! `scripts/check-unsafe.sh` keeps it that way.
+//! This is one of the two modules of the workspace with `unsafe` code (the
+//! other is `thinwire_notify::network_macos`). `scripts/check-unsafe.sh`
+//! keeps it that way.
 
 #![allow(unsafe_code)]
 
