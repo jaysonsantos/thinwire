@@ -14,13 +14,13 @@
 //! An unknown cost counts as metered (`thinwire_core::media_auto`).
 
 use std::sync::mpsc::{self, Receiver};
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use thinwire_core::NetworkCost;
 
 /// How often the thread reads the cost. macOS sends each change instead.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub const POLL: Duration = Duration::from_secs(30);
 
 /// The thread that reads the cost. It ends when the watch drops.
@@ -63,7 +63,7 @@ impl NetworkWatch {
     }
 
     /// The thread that reads the cost every `POLL` and sends a change.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn begin(
         send: mpsc::Sender<NetworkCost>,
         changes: Receiver<NetworkCost>,
@@ -95,6 +95,17 @@ impl NetworkWatch {
                 Self { changes: None }
             }
         }
+    }
+
+    /// No reader on this OS: [`Self::SUPPORTED`] is `false`.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn begin(
+        send: mpsc::Sender<NetworkCost>,
+        changes: Receiver<NetworkCost>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
+        let _ = (send, changes, wake);
+        Self { changes: None }
     }
 
     /// The newest cost, when it changed since the last call.
@@ -166,17 +177,6 @@ impl Reader {
             },
             _ => None,
         }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-#[derive(Default)]
-struct Reader;
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-impl Reader {
-    fn read(&mut self) -> NetworkCost {
-        NetworkCost::Unknown
     }
 }
 
