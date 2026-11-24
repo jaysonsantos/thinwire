@@ -165,6 +165,9 @@ pub(super) enum WorkerJob {
     /// The user opened or left a chat. The id is the chat at enqueue time.
     /// Clear that chat's unread count.
     Viewed(Option<String>),
+    /// The user marked this chat read from the menu of its row. Clear its
+    /// unread count. The open chat does not change.
+    MarkRead(String),
     /// Download the audio of this handle for the player.
     Voice(i32),
     /// Download the video of this handle for the player.
@@ -451,6 +454,11 @@ impl Session {
     /// The job stores that id for the worker.
     pub(super) fn request_viewed(&self, conversation_id: Option<String>) -> bool {
         self.enqueue(WorkerJob::Viewed(conversation_id))
+    }
+
+    /// Queue a clear of the unread count of one chat.
+    pub(super) fn request_mark_read(&self, conversation_id: String) -> bool {
+        self.enqueue(WorkerJob::MarkRead(conversation_id))
     }
 
     #[cfg(test)]
@@ -1895,6 +1903,9 @@ async fn run_linked(
                     start_photo_downloads(&manager, &session, token, &events, id);
                 }
                 clear_viewed(&events, &mut unread, &mut rows, conversation_id);
+            }
+            Some(WorkerJob::MarkRead(conversation_id)) => {
+                clear_viewed(&events, &mut unread, &mut rows, Some(conversation_id));
             }
             Some(WorkerJob::React {
                 conversation_id,
@@ -9843,6 +9854,30 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         }
         assert_eq!(counts, vec![4, 4]);
         assert_eq!(rows.get(&id).expect("row").unread, 4);
+    }
+
+    /// "Mark as read" queues its own job: it clears the count of that
+    /// chat, and the viewed chat does not change.
+    #[test]
+    fn a_mark_read_job_clears_its_chat_and_keeps_the_viewed_chat() {
+        let session = Session::new();
+        let mut jobs = session.install_jobs_for_test();
+        session.set_viewed(Some("b".to_string()));
+        assert!(session.request_mark_read("a".to_string()));
+        let Ok(WorkerJob::MarkRead(id)) = jobs.try_recv() else {
+            panic!("the job carries the chat");
+        };
+        assert_eq!(id, "a");
+        assert_eq!(session.viewed().as_deref(), Some("b"));
+        let mut unread = HashMap::from([("a".to_string(), 3)]);
+        let mut rows = HashMap::from([("a".to_string(), inbox_row("a", 3))]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        clear_viewed(&tx, &mut unread, &mut rows, Some(id));
+        assert_eq!(unread.get("a"), Some(&0));
+        let Ok(AdapterEvent::ConversationUpsert { conversation }) = rx.try_recv() else {
+            panic!("the row goes out again");
+        };
+        assert_eq!(conversation.unread, 0);
     }
 
     #[test]

@@ -1584,6 +1584,17 @@ impl Inbox {
         }
     }
 
+    /// Mark every message of one chat read, from the menu of its row. The
+    /// open chat does not change. Returns the new row when the count changed.
+    pub(super) fn mark_chat_read(&mut self, jid: &str) -> Option<AdapterEvent> {
+        let record = self.chats.get_mut(jid)?;
+        if record.unread == 0 {
+            return None;
+        }
+        record.mark_read();
+        self.upsert_event(jid)
+    }
+
     #[must_use]
     pub(super) fn knows_chat(&self, jid: &str) -> bool {
         self.chats.contains_key(jid)

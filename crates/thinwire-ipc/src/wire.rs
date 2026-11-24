@@ -28,9 +28,9 @@ use crate::SecretText;
 /// Version 9 adds [`WireMessage::video`], [`WireCommand::DownloadVideo`],
 /// [`WireEvent::VideoReady`], and [`WireEvent::VideoFailed`]. Version 10 adds
 /// [`WireMessage::file`], [`WireCommand::DownloadDocument`],
-/// [`WireEvent::FileReady`], and [`WireEvent::FileFailed`]. An older peer
-/// cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// [`WireEvent::FileReady`], and [`WireEvent::FileFailed`]. Version 11 adds
+/// [`WireCommand::MarkRead`]. An older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// One unreadable stretch on a history page.
 ///
@@ -185,6 +185,11 @@ pub enum WireCommand {
     ViewChat {
         conversation_id: Option<String>,
     },
+    /// Mark every message of one chat read, also when it is not open. The
+    /// helper sends the new row of the chat.
+    MarkRead {
+        conversation_id: String,
+    },
     /// Download the audio `file_id` of [`WireMessage::audio`]. The helper
     /// answers [`WireEvent::VoiceReady`] or [`WireEvent::VoiceFailed`].
     DownloadVoice {
@@ -232,6 +237,7 @@ impl WireCommand {
             Self::ResendMessage { .. } => "resend_message",
             Self::SendMedia { .. } => "send_media",
             Self::ViewChat { .. } => "view_chat",
+            Self::MarkRead { .. } => "mark_read",
             Self::DownloadVoice { .. } => "download_voice",
             Self::DownloadVideo { .. } => "download_video",
             Self::DownloadDocument { .. } => "download_document",

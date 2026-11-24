@@ -722,7 +722,7 @@ impl Supervisor {
             WireCommand::Unlink => {
                 emit_command_failed(events, protocol, None, self.unlink_needs_helper());
             }
-            WireCommand::ViewChat { .. } => {}
+            WireCommand::ViewChat { .. } | WireCommand::MarkRead { .. } => {}
             WireCommand::DeleteMessage {
                 conversation_id, ..
             }

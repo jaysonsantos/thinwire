@@ -69,7 +69,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
-    mark_read: false,
+    mark_read: true,
 };
 
 const NOTICE_REQUIRED: &str =
@@ -809,6 +809,18 @@ impl ProtocolAdapter for SignalAdapter {
                 request,
                 ..
             } => self.send_media(&conversation_id, &caption, files, request, events),
+            AdapterCommand::MarkRead {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+            } => {
+                #[cfg(feature = "signal-local")]
+                if let Engine::Live(session) = &self.engine {
+                    session.request_mark_read(conversation_id);
+                }
+                #[cfg(not(feature = "signal-local"))]
+                let _ = conversation_id;
+                Ok(())
+            }
             AdapterCommand::DownloadVoice {
                 protocol: ProtocolId::Signal,
                 file_id,

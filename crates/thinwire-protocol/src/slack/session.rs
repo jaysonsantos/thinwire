@@ -523,6 +523,16 @@ where
                 protocol: ProtocolId::Slack,
                 file_id,
             } => self.download_video(file_id),
+            AdapterCommand::MarkRead {
+                protocol: ProtocolId::Slack,
+                conversation_id,
+            } => {
+                // The bot keeps the count of this app: Slack has no read
+                // state for a bot to move.
+                if let Some(channel) = channel_id(&conversation_id) {
+                    self.mark_channel_read(channel);
+                }
+            }
             _ => self.status(
                 AdapterStatus::Error,
                 "command is not handled by the Slack workspace app",

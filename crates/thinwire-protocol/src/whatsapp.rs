@@ -36,7 +36,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
-    mark_read: false,
+    mark_read: true,
 };
 
 /// File name of the WhatsApp helper program, without `.exe`.
@@ -69,7 +69,7 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
-    mark_read: false,
+    mark_read: true,
 };
 
 /// The WhatsApp adapter of a `whatsapp-web` build: it runs the AGPL client

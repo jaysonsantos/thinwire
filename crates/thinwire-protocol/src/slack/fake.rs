@@ -2532,6 +2532,43 @@ async fn opening_a_channel_clears_unread_marks() {
     assert_eq!(unread, Some(1));
 }
 
+/// "Mark as read" clears the count of a channel that is not open.
+#[tokio::test]
+async fn mark_read_clears_the_badge_of_a_channel_that_is_not_open() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000500.000100",
+        "U1",
+        "read me",
+    )));
+    h.until("badge", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 1
+        )
+    })
+    .await;
+    h.send(AdapterCommand::MarkRead {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("read", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 0
+        )
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_redelivered_slack_event_does_not_raise_unread_again() {
     let vault = installed_vault();

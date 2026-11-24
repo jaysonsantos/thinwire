@@ -53,7 +53,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
-    mark_read: false,
+    mark_read: true,
 };
 
 /// Longest wait at shutdown for the sends in flight, before the client
@@ -1065,6 +1065,19 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 file_id,
             } => {
                 self.session.download_document(file_id, events);
+                Ok(())
+            }
+            AdapterCommand::MarkRead {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id,
+            } => {
+                // The read point is local: the phone keeps its own.
+                let jid = inbox::parse_conversation_id(&conversation_id);
+                if let Some(jid) = jid
+                    && let Some(upsert) = self.session.with_inbox(|inbox| inbox.mark_chat_read(jid))
+                {
+                    let _ = events.send(upsert);
+                }
                 Ok(())
             }
             AdapterCommand::Disconnect {
@@ -3251,6 +3264,53 @@ mod tests {
         )));
         // A placeholder or foreign id is ignored.
         adapter.view_chat(Some(PLACEHOLDER_ID), &tx);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// "Mark as read" clears the count of a chat that is not open. The open
+    /// chat stays, so a later message of the marked chat counts again.
+    #[test]
+    fn mark_read_clears_a_chat_that_is_not_open() {
+        let (mut adapter, mut rx, tx) = connected(Arc::new(FakeSender::default()));
+        adapter.view_chat(None, &tx);
+        adapter.session.apply(
+            LinkEvent::Messages(vec![message(CHAT, "late", "late", 50)]),
+            1,
+            &tx,
+        );
+        drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::MarkRead {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: format!("whatsapp:{CHAT}"),
+                },
+                &tx,
+            )
+            .expect("handled");
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.unread == 0
+        )));
+        adapter.session.apply(
+            LinkEvent::Messages(vec![message(CHAT, "next", "next", 60)]),
+            1,
+            &tx,
+        );
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.unread == 1
+        )));
+        // A chat with no unread message sends no row.
+        adapter
+            .handle(
+                AdapterCommand::MarkRead {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:999@s.whatsapp.net".into(),
+                },
+                &tx,
+            )
+            .expect("handled");
         assert!(drain(&mut rx).is_empty());
     }
 

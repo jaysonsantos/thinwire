@@ -108,7 +108,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: false,
     mentions: false,
     message_search: false,
-    mark_read: false,
+    mark_read: true,
 };
 
 /// Official Slack path. Workspace install UI is out of scope for this spike.

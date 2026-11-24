@@ -116,7 +116,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     typing: cfg!(feature = "discord-bot"),
     mentions: false,
     message_search: false,
-    mark_read: false,
+    mark_read: true,
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.
@@ -880,6 +880,12 @@ impl ProtocolAdapter for DiscordAdapter {
                 message_id,
                 body,
             } => self.edit_message(conversation_id, &message_id, body),
+            // The bot keeps no unread count: every row shows 0, so there
+            // is nothing to clear.
+            AdapterCommand::MarkRead {
+                protocol: ProtocolId::Discord,
+                ..
+            } => Ok(()),
             // A typing state that does not go out is not an error.
             AdapterCommand::SetTyping {
                 protocol: ProtocolId::Discord,

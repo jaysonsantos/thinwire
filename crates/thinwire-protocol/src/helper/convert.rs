@@ -138,6 +138,11 @@ pub(crate) fn command_to_wire(
         } => WireCommand::ViewChat {
             conversation_id: conversation_id.clone(),
         },
+        AdapterCommand::MarkRead {
+            conversation_id, ..
+        } => WireCommand::MarkRead {
+            conversation_id: conversation_id.clone(),
+        },
         AdapterCommand::WhatsAppAcknowledgeRisk | AdapterCommand::SignalAcknowledgeNotice => {
             WireCommand::AcknowledgeGate
         }
@@ -183,10 +188,7 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::SetTyping { .. }
         | AdapterCommand::LoadMembers { .. }
         // A helper searches no message text yet (#514).
-        | AdapterCommand::SearchMessages { .. }
-        // A helper has no "Mark as read" yet: the wire protocol has no
-        // command for it.
-        | AdapterCommand::MarkRead { .. } => return None,
+        | AdapterCommand::SearchMessages { .. } => return None,
     })
 }
 
@@ -282,6 +284,10 @@ pub(crate) fn command_from_wire(
             request,
         },
         WireCommand::ViewChat { conversation_id } => AdapterCommand::ViewChat {
+            protocol,
+            conversation_id,
+        },
+        WireCommand::MarkRead { conversation_id } => AdapterCommand::MarkRead {
             protocol,
             conversation_id,
         },
@@ -1765,6 +1771,10 @@ mod tests {
             AdapterCommand::ViewChat {
                 protocol,
                 conversation_id: None,
+            },
+            AdapterCommand::MarkRead {
+                protocol,
+                conversation_id: CHAT.into(),
             },
             AdapterCommand::WhatsAppAcknowledgeRisk,
             AdapterCommand::WhatsAppBeginLink { generation: 6 },
