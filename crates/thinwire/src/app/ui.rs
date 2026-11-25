@@ -595,33 +595,32 @@ fn media_download_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<
         stored
     };
     let before = value;
-    // One row: the Settings menu must fit a small window.
+    // A caption and one row of choices, as for the theme: the Settings menu
+    // must fit a small window. A drop-down list does not work here, because
+    // its popup closes the Settings menu.
+    ui.label(RichText::new("Download media").small());
     ui.horizontal(|ui| {
-        let label = ui.label(RichText::new("Download media").small());
-        let combo = egui::ComboBox::from_id_salt("media-download")
-            .selected_text(value.label())
-            .show_ui(ui, |ui| {
-                for choice in MediaDownload::ALL {
-                    if choice == MediaDownload::Unmetered && !reads_cost {
-                        continue;
-                    }
-                    ui.selectable_value(&mut value, choice, choice.label());
-                }
-            })
-            .response
-            .labelled_by(label.id);
-        if reads_cost && value == MediaDownload::Unmetered {
-            combo.on_hover_text(match snapshot.network_cost() {
-                NetworkCost::Unmetered => {
-                    "This network is unmetered: photos and videos download now."
-                }
-                NetworkCost::Metered => {
-                    "This network is metered: photos and videos wait for a click."
-                }
-                NetworkCost::Unknown => {
-                    "The cost of this network is unknown: photos and videos wait for a click."
-                }
-            });
+        for choice in MediaDownload::ALL {
+            if choice == MediaDownload::Unmetered && !reads_cost {
+                continue;
+            }
+            let short = match choice {
+                MediaDownload::Never => "Never",
+                MediaDownload::Unmetered => "Unmetered",
+                MediaDownload::Always => "Always",
+            };
+            let item = ui.selectable_label(value == choice, short);
+            if item.clicked() {
+                value = choice;
+            }
+            if choice == MediaDownload::Unmetered {
+                let cost = match snapshot.network_cost() {
+                    NetworkCost::Unmetered => "This network is unmetered.",
+                    NetworkCost::Metered => "This network is metered.",
+                    NetworkCost::Unknown => "The cost of this network is unknown.",
+                };
+                item.on_hover_text(format!("{}. {cost}", choice.label()));
+            }
         }
     });
     if value != before {

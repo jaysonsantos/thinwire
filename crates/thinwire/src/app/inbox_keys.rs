@@ -180,6 +180,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::SetSendTyping(on) => state.settings.set_send_typing(on),
             Intent::SetUnreadBadge(on) => state.settings.set_unread_badge(on),
             Intent::SetPersonColors(on) => state.settings.set_person_colors(on),
+            Intent::SetMediaDownload(value) => state.settings.set_media_download(value),
             Intent::UseEmoji(emoji) => state.settings.use_emoji(&emoji),
             Intent::MoveAccount { account, up } => {
                 if state.snapshot.move_account(account, up) {
@@ -1753,6 +1754,16 @@ fn a_person_who_types_shows_over_the_compose_field() {
     harness.get_by_label("Me and others").click();
     harness.run();
     assert!(!harness.state().settings.person_colors());
+    // The same menu has "Download media": a row of choices, not a
+    // drop-down list, so a click does not close the menu first.
+    harness.get_by_label("Settings").click();
+    harness.run();
+    harness.get_by_label("Always").click();
+    harness.run();
+    assert_eq!(
+        harness.state().settings.media_download(),
+        thinwire_core::MediaDownload::Always
+    );
 }
 
 /// A click on the picture in the thread header shows the details of the
