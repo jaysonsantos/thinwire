@@ -28,10 +28,10 @@ use crate::adapter::{
     MessageTopic, OutgoingUpdate, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_delivery,
-    emit_message_edited, emit_message_links, emit_message_media, emit_message_replaced,
-    emit_messages_removed, emit_older_history_loaded, emit_outbox_read, emit_photo_failed,
-    emit_photo_ready, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
-    emit_telegram_session_ended, emit_topic, outgoing_delivery,
+    emit_message_edited, emit_message_keyboard, emit_message_links, emit_message_media,
+    emit_message_replaced, emit_messages_removed, emit_older_history_loaded, emit_outbox_read,
+    emit_photo_failed, emit_photo_ready, emit_send_accepted, emit_send_rejected, emit_status,
+    emit_stopped, emit_telegram_session_ended, emit_topic, outgoing_delivery,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -87,6 +87,12 @@ pub(super) enum TdlibCommand {
     /// Mark every message of one chat read.
     MarkRead {
         conversation_id: String,
+    },
+    /// Press a callback button of a bot keyboard.
+    PressButton {
+        conversation_id: String,
+        message_id: String,
+        data: String,
     },
     /// Search the text of the messages of the account, or of one chat.
     SearchMessages {
@@ -187,6 +193,7 @@ impl TdlibCommand {
             Self::SetTyping { .. } => "set_typing",
             Self::LoadMembers { .. } => "load_members",
             Self::MarkRead { .. } => "mark_read",
+            Self::PressButton { .. } => "press_button",
             Self::SearchMessages { .. } => "search_messages",
             Self::Resend { .. } => "resend",
             Self::LoadOlder { .. } => "load_older",
@@ -268,6 +275,9 @@ struct LiveInbox {
     unviewed: Arc<Mutex<HashMap<i64, i64>>>,
     /// Downloads this worker started.
     downloads: HashMap<i32, InFlight>,
+    /// The message whose reply keyboard each chat shows over the compose
+    /// field (`reply_markup_message_id`). A chat with none is not here.
+    reply_markups: HashMap<i64, i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -994,6 +1004,7 @@ fn spawn_tdlib_worker(
             viewed: view.viewed,
             unviewed: Arc::new(Mutex::new(HashMap::new())),
             downloads: HashMap::new(),
+            reply_markups: HashMap::new(),
         };
         let requested_view = view.requested;
         let mut commands = Some(cmd_rx);
@@ -1065,6 +1076,17 @@ fn spawn_tdlib_worker(
                             load_due_forum_topics(client_id, &mut live, &events).await;
                         }
                         TdlibCommand::OpenChat(conversation_id) => {
+                            if let Some(chat_id) = inbox::parse_telegram_chat_id(&conversation_id)
+                                && live.linked()
+                            {
+                                let markup = live.reply_markups.get(&chat_id).copied();
+                                tokio::spawn(load_reply_keyboard(
+                                    client_id,
+                                    chat_id,
+                                    markup.unwrap_or(0),
+                                    events.clone(),
+                                ));
+                            }
                             open_chat(client_id, &conversation_id, &mut live, &events).await;
                         }
                         TdlibCommand::OpenTopic {
@@ -1226,6 +1248,33 @@ fn spawn_tdlib_worker(
                                     inbox::parse_telegram_chat_id(&conversation_id)
                             {
                                 tokio::spawn(mark_chat_read(client_id, chat_id));
+                            }
+                        }
+                        TdlibCommand::PressButton {
+                            conversation_id,
+                            message_id,
+                            data,
+                        } => {
+                            // The bot can take seconds to answer, or never
+                            // answer: the request does not wait in this loop.
+                            let target = inbox::parse_message_id(&message_id)
+                                .filter(|_| live.linked());
+                            let press = ButtonPress {
+                                conversation_id,
+                                message_id,
+                                data,
+                            };
+                            match target {
+                                Some((chat_id, id)) => {
+                                    tokio::spawn(press_button(
+                                        client_id,
+                                        chat_id,
+                                        id,
+                                        press,
+                                        events.clone(),
+                                    ));
+                                }
+                                None => press.answer(&events, None),
                             }
                         }
                         TdlibCommand::LoadMembers { conversation_id } => {
@@ -1947,6 +1996,10 @@ async fn apply_chat_update(
     match update {
         tdlib_rs::enums::Update::NewChat(update) => {
             let chat_id = update.chat.id;
+            if update.chat.reply_markup_message_id != 0 {
+                live.reply_markups
+                    .insert(chat_id, update.chat.reply_markup_message_id);
+            }
             let effect = note_chat(&mut live.directory, &update.chat);
             live.publish(events, emit, effect);
             let changes = live
@@ -1961,6 +2014,22 @@ async fn apply_chat_update(
                     inbox::conversation_id(chat_id),
                     last_read,
                 );
+            }
+        }
+        tdlib_rs::enums::Update::ChatReplyMarkup(update) => {
+            if update.reply_markup_message_id == 0 {
+                live.reply_markups.remove(&update.chat_id);
+            } else {
+                live.reply_markups
+                    .insert(update.chat_id, update.reply_markup_message_id);
+            }
+            if emit {
+                tokio::spawn(load_reply_keyboard(
+                    client_id,
+                    update.chat_id,
+                    update.reply_markup_message_id,
+                    events.clone(),
+                ));
             }
         }
         tdlib_rs::enums::Update::ChatTitle(update) => {
@@ -2212,8 +2281,16 @@ async fn apply_chat_update(
             }
         }
         tdlib_rs::enums::Update::MessageEdited(update) => {
-            // The new text came in `updateMessageContent` just before.
+            // The new text came in `updateMessageContent` just before. The
+            // buttons come here: a bot often changes them after a press.
             if emit {
+                emit_message_keyboard(
+                    events,
+                    ProtocolId::Telegram,
+                    inbox::conversation_id(update.chat_id),
+                    inbox::message_id(update.chat_id, update.message_id),
+                    super::media_map::inline_keyboard(update.reply_markup.as_ref()),
+                );
                 emit_message_edited(
                     events,
                     ProtocolId::Telegram,
@@ -2346,6 +2423,80 @@ fn typing_target(
 /// that the user marked as unread loses that mark, and its mentions are
 /// read too. TDLib then sends the new count (`updateChatReadInbox`). No id
 /// goes to the log.
+/// Send the reply keyboard of a chat: the one of message `message_id`, or
+/// none for 0. `getMessage` is a local read for a message that TDLib knows.
+async fn load_reply_keyboard(client_id: i32, chat_id: i64, message_id: i64, events: EventTx) {
+    let keyboard = if message_id == 0 {
+        None
+    } else {
+        match tdlib_rs::functions::get_message(chat_id, message_id, client_id).await {
+            Ok(tdlib_rs::enums::Message::Message(message)) => super::media_map::reply_keyboard(
+                inbox::message_id(chat_id, message_id),
+                message.reply_markup.as_ref(),
+            ),
+            Err(error) => {
+                log_tdlib_error("getMessage", &error);
+                None
+            }
+        }
+    };
+    let _ = events.send(AdapterEvent::ChatKeyboard {
+        protocol: ProtocolId::Telegram,
+        conversation_id: inbox::conversation_id(chat_id),
+        keyboard,
+    });
+}
+
+/// One press of a callback button, and its answer to the core.
+struct ButtonPress {
+    conversation_id: String,
+    message_id: String,
+    data: String,
+}
+
+impl ButtonPress {
+    /// Send the answer. `None`: the bot gave none, or the call failed.
+    fn answer(self, events: &EventTx, answer: Option<tdlib_rs::types::CallbackQueryAnswer>) {
+        let answer = answer.unwrap_or_default();
+        let _ = events.send(crate::AdapterEvent::ButtonAnswer {
+            protocol: ProtocolId::Telegram,
+            conversation_id: self.conversation_id,
+            message_id: self.message_id,
+            text: answer.text,
+            alert: answer.show_alert,
+            url: Some(answer.url).filter(|url| !url.is_empty()),
+        });
+    }
+}
+
+/// `getCallbackQueryAnswer`. Telegram fails it when the bot does not
+/// answer in time, and many bots never answer: that is no error for the
+/// user, so the answer is then empty.
+async fn press_button(
+    client_id: i32,
+    chat_id: i64,
+    message_id: i64,
+    press: ButtonPress,
+    events: EventTx,
+) {
+    let payload =
+        tdlib_rs::enums::CallbackQueryPayload::Data(tdlib_rs::types::CallbackQueryPayloadData {
+            data: press.data.clone(),
+        });
+    let answer = match tdlib_rs::functions::get_callback_query_answer(
+        chat_id, message_id, payload, client_id,
+    )
+    .await
+    {
+        Ok(tdlib_rs::enums::CallbackQueryAnswer::CallbackQueryAnswer(answer)) => Some(answer),
+        Err(error) => {
+            log_tdlib_error("getCallbackQueryAnswer", &error);
+            None
+        }
+    };
+    press.answer(&events, answer);
+}
+
 async fn mark_chat_read(client_id: i32, chat_id: i64) {
     let chat = match tdlib_rs::functions::get_chat(chat_id, client_id).await {
         Ok(tdlib_rs::enums::Chat::Chat(chat)) => chat,
@@ -2867,6 +3018,7 @@ fn emit_mapped_message_as(
     mapped.reactions = super::media_map::reactions_of(message.interaction_info.as_ref());
     mapped.reply_to = super::media_map::reply_of(message);
     mapped.edited = message.edit_date != 0;
+    mapped.keyboard = super::media_map::inline_keyboard(message.reply_markup.as_ref());
     if media.scan {
         schedule_text_entities(
             client_id,
@@ -4959,6 +5111,7 @@ mod tests {
             viewed: runtime.viewed.clone(),
             unviewed: Arc::new(Mutex::new(HashMap::new())),
             downloads: HashMap::new(),
+            reply_markups: HashMap::new(),
         };
         // Disconnect or Shutdown has marked closing. The cell can still name
         // the chat until `stop_client` clears it.

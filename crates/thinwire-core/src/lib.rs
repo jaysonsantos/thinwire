@@ -49,7 +49,9 @@ pub use media_auto::{MediaDownload, NetworkCost};
 pub use message_search::SEARCH_MIN_CHARS;
 pub use secret_text::SecretText;
 pub use signal::{ChangeNotifier, ChangeSignal, change_channel};
-pub use state::{AuthKey, ForwardPicker, MessageHit, MessageSearchView, Pane, SplitSide};
+pub use state::{
+    AuthKey, ButtonNotice, ForwardPicker, MessageHit, MessageSearchView, Pane, SplitSide,
+};
 pub use store_key::{
     CreateStoreKeyError, LoadStoreKey, SIGNAL_STORE_KEY_ACCOUNT, SessionKey, StoreKey,
     StoreKeyAction, StoreKeyPolicy, StoreProtectFail, WHATSAPP_STORE_KEY_ACCOUNT, create_store_key,

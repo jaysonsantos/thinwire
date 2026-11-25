@@ -4,6 +4,7 @@ mod a11y;
 mod attach;
 mod audio;
 mod auth;
+mod bot_keyboard;
 mod chat_details;
 mod dock;
 mod emoji_picker;
@@ -754,6 +755,9 @@ impl eframe::App for ThinwireApp {
         self.run_menu_commands(ctx);
         self.handle_close(ctx, frame);
         self.update_badge();
+        if let Some(url) = self.core.take_open_url() {
+            links::open_url(&url);
+        }
         if let Some(cost) = self.network.changed() {
             self.core.dispatch(Intent::SetNetworkCost(cost));
         }

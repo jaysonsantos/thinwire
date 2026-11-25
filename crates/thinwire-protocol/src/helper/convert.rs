@@ -189,6 +189,7 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::SetTyping { .. }
         | AdapterCommand::LoadMembers { .. }
         // A helper searches no message text yet (#514).
+        | AdapterCommand::PressButton { .. }
         | AdapterCommand::SearchMessages { .. } => return None,
     })
 }
@@ -1108,6 +1109,7 @@ fn message_from_wire(protocol: ProtocolId, message: Box<WireMessage>) -> ChatMes
         reactions: reactions_from_wire(message.reactions),
         reply_to: message.reply_to,
         edited: false,
+        keyboard: None,
     }
 }
 
@@ -1209,6 +1211,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         }
     }
 

@@ -186,6 +186,7 @@ impl SlackAdapter {
     reactions: Vec::new(),
     reply_to: None,
     edited: false,
+    keyboard: None,
 },
         );
     }

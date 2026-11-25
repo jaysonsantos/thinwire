@@ -34,6 +34,26 @@ pub const fn tdlib_compiled() -> bool {
 }
 
 #[must_use]
+/// A callback button that waits for the answer of its bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ButtonPress {
+    protocol: ProtocolId,
+    message_id: String,
+    data: String,
+}
+
+/// The answer of a bot to a press of a button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ButtonNotice {
+    pub protocol: ProtocolId,
+    pub conversation_id: String,
+    pub text: String,
+    /// The bot asks for a box that the user closes.
+    pub alert: bool,
+    /// A new number for each answer, so the frontend can time each one.
+    pub serial: u64,
+}
+
 pub fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
     if snapshot.telegram_ready() {
         return None;
@@ -816,6 +836,15 @@ pub struct Snapshot {
     /// A Telegram session end drops them.
     rejected_bodies: HashMap<(ProtocolId, String), RejectedBody>,
     focus_compose: bool,
+    /// The keyboard that a bot shows over the compose field of each chat.
+    chat_keyboards: HashMap<(ProtocolId, String), thinwire_protocol::ReplyKeyboard>,
+    /// The callback button that waits for the answer of its bot.
+    button_press: Option<ButtonPress>,
+    /// The last answer of a bot to a press, until the user closes it or the
+    /// frontend lets it go.
+    button_notice: Option<ButtonNotice>,
+    /// An address that a bot answer asks the frontend to open, once.
+    open_url: Option<String>,
     /// Protocols that answered `Shutdown` with `Stopped`.
     stopped: HashSet<ProtocolId>,
     /// Sends and retries in flight, one per (protocol, chat). The text stays
@@ -1241,6 +1270,10 @@ impl Snapshot {
             attachment_note: None,
             rejected_bodies: HashMap::new(),
             focus_compose: false,
+            chat_keyboards: HashMap::new(),
+            button_press: None,
+            button_notice: None,
+            open_url: None,
             stopped: HashSet::new(),
             sends: SendTracker::default(),
             #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
@@ -1694,6 +1727,35 @@ impl Snapshot {
                 conversation_id,
                 message_id,
             } => self.mark_edited(protocol, &conversation_id, &message_id),
+            AdapterEvent::MessageKeyboard {
+                protocol,
+                conversation_id,
+                message_id,
+                keyboard,
+            } => {
+                if let Some(message) = self.message_mut(protocol, &conversation_id, &message_id) {
+                    message.keyboard = keyboard;
+                }
+            }
+            AdapterEvent::ButtonAnswer {
+                protocol,
+                conversation_id,
+                message_id,
+                text,
+                alert,
+                url,
+            } => self.button_answer(protocol, &conversation_id, &message_id, text, alert, url),
+            AdapterEvent::ChatKeyboard {
+                protocol,
+                conversation_id,
+                keyboard,
+            } => {
+                let key = (protocol, conversation_id);
+                match keyboard {
+                    Some(keyboard) => self.chat_keyboards.insert(key, keyboard),
+                    None => self.chat_keyboards.remove(&key),
+                };
+            }
             AdapterEvent::ChatStatus {
                 protocol,
                 conversation_id,
@@ -3818,6 +3880,168 @@ impl Snapshot {
 
     pub fn take_focus_compose(&mut self) -> bool {
         std::mem::take(&mut self.focus_compose)
+    }
+
+    /// An address that a bot answer asks the frontend to open, once. It
+    /// passed the link rules ([`thinwire_protocol::openable_url`]).
+    pub fn take_open_url(&mut self) -> Option<String> {
+        self.open_url.take()
+    }
+
+    /// The keyboard that the bot shows over the compose field of the open
+    /// chat. An edit, a topic list, and the selection mode show none.
+    #[must_use]
+    pub fn reply_keyboard(&self) -> Option<&thinwire_protocol::ReplyKeyboard> {
+        if self.pane.editing.is_some() || self.selecting() {
+            return None;
+        }
+        let conversation = self.pane.conversation.clone()?;
+        self.chat_keyboards.get(&(self.pane.protocol, conversation))
+    }
+
+    /// The callback button that waits for its bot: the message and the
+    /// data of the button.
+    #[must_use]
+    pub fn pressed_button(&self) -> Option<(&str, &str)> {
+        self.button_press
+            .as_ref()
+            .map(|press| (press.message_id.as_str(), press.data.as_str()))
+    }
+
+    /// The last answer of a bot, while it shows.
+    #[must_use]
+    pub const fn button_notice(&self) -> Option<&ButtonNotice> {
+        self.button_notice.as_ref()
+    }
+
+    /// Press a callback button of a message in the open thread. A second
+    /// press waits for no answer: the bot gets it too.
+    pub fn press_button(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        data: String,
+    ) {
+        if !self.is_selected_thread(protocol, conversation_id, self.pane.topic)
+            || self
+                .message_bucket(protocol, conversation_id, message_id)
+                .is_none()
+        {
+            return;
+        }
+        self.button_notice = None;
+        self.button_press = Some(ButtonPress {
+            protocol,
+            message_id: message_id.to_owned(),
+            data: data.clone(),
+        });
+        self.push(AdapterCommand::PressButton {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
+            data,
+        });
+    }
+
+    /// Send the label of a reply keyboard button as a message of the open
+    /// thread. The draft stays. A keyboard for one use goes away.
+    pub fn send_keyboard_text(&mut self, protocol: ProtocolId, conversation_id: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty()
+            || !self.is_selected_thread(protocol, conversation_id, self.pane.topic)
+            || self.pane.editing.is_some()
+        {
+            return;
+        }
+        let writable = self
+            .conversations
+            .get(&protocol)
+            .and_then(|list| list.iter().find(|row| row.id == conversation_id))
+            .is_some_and(|row| row.writable);
+        if !writable {
+            return;
+        }
+        let topic = self.pane.topic;
+        let Some(request) = self.sends.begin_send_files(
+            protocol,
+            conversation_id,
+            text,
+            topic,
+            Vec::new(),
+            Instant::now(),
+        ) else {
+            return;
+        };
+        let key = (protocol, conversation_id.to_owned());
+        if self
+            .chat_keyboards
+            .get(&key)
+            .is_some_and(|keyboard| keyboard.one_time)
+        {
+            self.chat_keyboards.remove(&key);
+        }
+        let body = text.to_owned();
+        match topic {
+            Some(topic) => self.push(AdapterCommand::SendTopicText {
+                protocol,
+                conversation_id: conversation_id.to_owned(),
+                topic,
+                body,
+                request,
+                reply_to: None,
+            }),
+            None => self.push(AdapterCommand::SendText {
+                protocol,
+                conversation_id: conversation_id.to_owned(),
+                body,
+                request,
+                reply_to: None,
+            }),
+        }
+    }
+
+    /// Close the answer of a bot.
+    pub fn close_button_notice(&mut self) {
+        self.button_notice = None;
+    }
+
+    /// The bot answered a press, or the press failed. A text shows over the
+    /// thread. An address opens when it passes the link rules.
+    fn button_answer(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        text: String,
+        alert: bool,
+        url: Option<String>,
+    ) {
+        let waited = self
+            .button_press
+            .as_ref()
+            .is_some_and(|press| press.protocol == protocol && press.message_id == message_id);
+        if waited {
+            self.button_press = None;
+        }
+        let text = text.trim().to_owned();
+        if !text.is_empty() {
+            let serial = self
+                .button_notice
+                .as_ref()
+                .map_or(0, |notice| notice.serial)
+                + 1;
+            self.button_notice = Some(ButtonNotice {
+                protocol,
+                conversation_id: conversation_id.to_owned(),
+                text,
+                alert,
+                serial,
+            });
+        }
+        if let Some(url) = url.as_deref().and_then(thinwire_protocol::openable_url) {
+            self.open_url = Some(url);
+        }
     }
 
     /// Send is possible (shell plan 5): the selected protocol is linked and
@@ -6879,6 +7103,15 @@ impl Snapshot {
         }
         // A new session asks for the people of a chat again.
         self.chat_members.retain(|(owner, _), _| *owner != protocol);
+        self.chat_keyboards
+            .retain(|(owner, _), _| *owner != protocol);
+        if self
+            .button_press
+            .as_ref()
+            .is_some_and(|press| press.protocol == protocol)
+        {
+            self.button_press = None;
+        }
         self.members_asked.retain(|(owner, _)| *owner != protocol);
         // The files of an ended session do not go to a new one.
         self.attachments
@@ -7039,6 +7272,7 @@ impl Snapshot {
         self.topics.remove(&(protocol, id.to_owned()));
         self.chat_status.remove(&(protocol, id.to_owned()));
         self.chat_members.remove(&(protocol, id.to_owned()));
+        self.chat_keyboards.remove(&(protocol, id.to_owned()));
         self.members_asked.remove(&(protocol, id.to_owned()));
         // Every removed chat loses its draft, selected or not (#43).
         self.drafts
@@ -10251,6 +10485,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         }
     }
 
@@ -10776,6 +11011,96 @@ mod tests {
         }
         snapshot.take_commands();
         snapshot
+    }
+
+    /// A press of a bot button waits for the answer. The answer clears the
+    /// wait, shows its text, and opens only an address that the link rules
+    /// allow. A press in a chat that is not open sends nothing.
+    #[test]
+    fn a_bot_answer_clears_the_press_and_opens_only_a_safe_address() {
+        let mut snapshot = telegram_chat_with_rows(&[(9, false)]);
+        snapshot.press_button(
+            ProtocolId::Telegram,
+            "telegram:2",
+            "telegram:2:1",
+            "x".into(),
+        );
+        assert!(snapshot.take_commands().is_empty(), "not the open chat");
+        snapshot.press_button(
+            ProtocolId::Telegram,
+            "telegram:1",
+            "telegram:1:9",
+            "go".into(),
+        );
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::PressButton {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:1:9".into(),
+                data: "go".into(),
+            }]
+        );
+        assert_eq!(snapshot.pressed_button(), Some(("telegram:1:9", "go")));
+        let answer = |text: &str, url: Option<&str>| AdapterEvent::ButtonAnswer {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:9".into(),
+            text: text.into(),
+            alert: false,
+            url: url.map(str::to_owned),
+        };
+        snapshot.apply(answer("  ", Some("javascript:alert(1)")));
+        assert_eq!(snapshot.pressed_button(), None);
+        assert_eq!(snapshot.button_notice(), None, "no text, no notice");
+        assert_eq!(snapshot.take_open_url(), None);
+        snapshot.apply(answer("Done", Some("https://example.com/a")));
+        assert_eq!(
+            snapshot.button_notice().map(|notice| notice.text.as_str()),
+            Some("Done")
+        );
+        assert_eq!(
+            snapshot.take_open_url().as_deref(),
+            Some("https://example.com/a")
+        );
+        snapshot.close_button_notice();
+        assert_eq!(snapshot.button_notice(), None);
+    }
+
+    /// The bot changes the buttons of a message, and a session end drops
+    /// the reply keyboards of that account.
+    #[test]
+    fn a_bot_changes_the_buttons_and_a_session_end_drops_the_keyboard() {
+        use thinwire_protocol::{ButtonAction, KeyboardButton, MessageKeyboard, ReplyKeyboard};
+        let mut snapshot = telegram_chat_with_rows(&[(9, false)]);
+        let keyboard = MessageKeyboard {
+            rows: vec![vec![KeyboardButton {
+                text: "Again".into(),
+                action: ButtonAction::Callback { data: "a".into() },
+            }]],
+        };
+        snapshot.apply(AdapterEvent::MessageKeyboard {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:9".into(),
+            keyboard: Some(keyboard.clone()),
+        });
+        assert_eq!(
+            snapshot.selected_messages()[0].keyboard.as_ref(),
+            Some(&keyboard)
+        );
+        snapshot.apply(AdapterEvent::ChatKeyboard {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            keyboard: Some(ReplyKeyboard {
+                message_id: "telegram:1:9".into(),
+                keyboard,
+                one_time: false,
+            }),
+        });
+        assert!(snapshot.reply_keyboard().is_some());
+        snapshot.end_session(ProtocolId::Telegram);
+        assert!(snapshot.reply_keyboard().is_none());
     }
 
     /// "Mark as read" zeros the count of a chat that is not open and asks
@@ -13085,6 +13410,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         }
     }
 
@@ -13772,6 +14098,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -13813,6 +14140,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -15172,6 +15500,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -15292,6 +15621,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -15393,6 +15723,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: conversation.clone(),
@@ -15498,6 +15829,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: previous,
@@ -15562,6 +15894,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
 
@@ -15759,6 +16092,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.pane.protocol = ProtocolId::Signal;
@@ -15814,6 +16148,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         let pages = [
             [(base + 4, "e"), (base + 5, "f")],
@@ -15933,6 +16268,7 @@ mod tests {
                     reactions: Vec::new(),
                     reply_to: None,
                     edited: false,
+                    keyboard: None,
                 },
             });
         }
@@ -15981,6 +16317,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.pane.protocol = ProtocolId::Signal;
@@ -16066,6 +16403,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -16209,6 +16547,7 @@ mod tests {
                     reactions: Vec::new(),
                     reply_to: None,
                     edited: false,
+                    keyboard: None,
                 },
             });
             snapshot.apply(AdapterEvent::Status {
@@ -16328,6 +16667,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -16511,6 +16851,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -17430,6 +17771,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         assert_eq!(
@@ -17751,6 +18093,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17773,6 +18116,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -17795,6 +18139,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -17826,6 +18171,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -17872,6 +18218,7 @@ mod tests {
                     reactions: Vec::new(),
                     reply_to: None,
                     edited: false,
+                    keyboard: None,
                 },
             });
         }
@@ -17936,6 +18283,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         let _ = snapshot.take_commands();
@@ -18129,6 +18477,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -18414,6 +18763,7 @@ mod tests {
                     reactions: Vec::new(),
                     reply_to: None,
                     edited: false,
+                    keyboard: None,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -18499,6 +18849,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -19454,6 +19805,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.take_commands();
@@ -19506,6 +19858,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.take_commands();
@@ -20054,6 +20407,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -20129,6 +20483,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -21296,6 +21651,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         snapshot.retry_send("slack:C1:m1");
@@ -21385,6 +21741,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         }
     }
 

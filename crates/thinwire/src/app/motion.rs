@@ -42,6 +42,14 @@ pub(crate) fn busy_spinner(ui: &mut egui::Ui, size: f32, color: Color32) {
     paint_spinner(ui, Some((size, color)));
 }
 
+/// A spinner in `rect` over a widget, as a bot button that waits for its
+/// answer. With motion off it paints nothing: the widget is off already.
+pub(crate) fn spinner_at(ui: &egui::Ui, rect: egui::Rect) {
+    if enabled(ui.ctx()) {
+        sized_spinner(rect.height()).paint_at(ui, rect);
+    }
+}
+
 fn paint_spinner(ui: &mut egui::Ui, look: Option<(f32, Color32)>) {
     if !enabled(ui.ctx()) {
         ui.label(egui::RichText::new(WORKING).weak());
@@ -49,12 +57,17 @@ fn paint_spinner(ui: &mut egui::Ui, look: Option<(f32, Color32)>) {
     }
     match look {
         Some((size, color)) => {
-            ui.add(egui::Spinner::new().size(size).color(color));
+            ui.add(sized_spinner(size).color(color));
         }
         None => {
             ui.spinner();
         }
     }
+}
+
+/// The one place that makes a spinner widget.
+fn sized_spinner(size: f32) -> egui::Spinner {
+    egui::Spinner::new().size(size)
 }
 
 /// Seconds for one egui transition. `0` when the OS asks for less motion.

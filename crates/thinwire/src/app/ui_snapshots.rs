@@ -470,6 +470,124 @@ mod emoji_picker {
     }
 }
 
+/// Bot buttons: an inline keyboard under a message, the answer of the bot,
+/// and a reply keyboard over the compose field.
+mod bot_buttons {
+    use super::*;
+    use thinwire_protocol::{
+        AdapterEvent, Arrival, ButtonAction, ChatMessage, Delivery, KeyboardButton,
+        MessageKeyboard, ReplyKeyboard,
+    };
+
+    fn button(text: &str, action: ButtonAction) -> KeyboardButton {
+        KeyboardButton {
+            text: text.into(),
+            action,
+        }
+    }
+
+    fn callback(text: &str) -> KeyboardButton {
+        button(
+            text,
+            ButtonAction::Callback {
+                data: text.to_lowercase(),
+            },
+        )
+    }
+
+    fn shoot_open(theme: ThemeMode) {
+        let name = format!("bot_buttons-{}-1100x720", theme_slug(theme));
+        let (runtime, mut built) = scene(Scenario::LongChat, theme);
+        let (protocol, conversation_id) = {
+            let view = built.core.view();
+            let last = view.selected_messages().last().expect("a message");
+            (last.protocol, last.conversation_id.clone())
+        };
+        let message_id = format!("{conversation_id}:bot");
+        built.core.apply_event(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol,
+                conversation_id: conversation_id.clone(),
+                id: message_id.clone(),
+                sender: "Ada".into(),
+                body: "Which language do you want?".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 1_772_445_600,
+                arrival: Arrival::History,
+                topic: None,
+                links: Vec::new(),
+                photo: None,
+                audio: None,
+                video: None,
+                file: None,
+                reactions: Vec::new(),
+                reply_to: None,
+                edited: false,
+                keyboard: Some(MessageKeyboard {
+                    rows: vec![
+                        vec![callback("German"), callback("English")],
+                        vec![callback("Spanish"), callback("French")],
+                        vec![
+                            button(
+                                "Help",
+                                ButtonAction::Url {
+                                    url: "https://example.com/help".into(),
+                                },
+                            ),
+                            button("Open app", ButtonAction::Unsupported),
+                        ],
+                    ],
+                }),
+            },
+        });
+        built.core.apply_event(AdapterEvent::ChatKeyboard {
+            protocol,
+            conversation_id: conversation_id.clone(),
+            keyboard: Some(ReplyKeyboard {
+                message_id: message_id.clone(),
+                keyboard: MessageKeyboard {
+                    rows: vec![vec![
+                        button("Start over", ButtonAction::SendText),
+                        button("Settings", ButtonAction::SendText),
+                    ]],
+                },
+                one_time: false,
+            }),
+        });
+        built.core.apply_event(AdapterEvent::ButtonAnswer {
+            protocol,
+            conversation_id,
+            message_id,
+            text: "Translating to German.".into(),
+            alert: false,
+            url: None,
+        });
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 720.0])
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        settle_images(&mut harness);
+        harness.get_by_role_and_label(Role::Button, "German");
+        harness.get_by_role_and_label(Role::Button, "Start over");
+        harness.get_by_label("Translating to German.");
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot_open(ThemeMode::Light);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot_open(ThemeMode::Dark);
+    }
+}
+
 /// The list of names after "@", open over the compose field of a group.
 mod mention_list {
     use super::*;
@@ -1059,6 +1177,7 @@ mod signal_removed {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         });
         core.dispatch(Intent::SelectConversation {

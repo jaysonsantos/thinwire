@@ -2912,6 +2912,11 @@ fn thread(
             editable: thinwire_core::state::can_edit(message),
             forwardable: actions.forward && thinwire_core::state::can_forward(message),
             edited: message.edited,
+            keyboard: message.keyboard.as_ref(),
+            pressed: snapshot
+                .pressed_button()
+                .filter(|(id, _)| *id == message.id)
+                .map(|(_, data)| data),
             selecting,
             selected: selection.contains(&message.id),
             delivery: message.delivery,
@@ -2935,6 +2940,7 @@ fn thread(
             + super::message_menu::reply_bar_height(ui, snapshot)
             + super::forward::selection_bar_height(ui, snapshot)
             + super::typing::line_height(ui, snapshot)
+            + super::bot_keyboard::bar_height(ui)
     };
 
     let state = snapshot.thread_state();
@@ -3447,6 +3453,10 @@ struct Bubble<'a> {
     forwardable: bool,
     /// The text changed after the send.
     edited: bool,
+    /// The buttons that a bot put under the message.
+    keyboard: Option<&'a thinwire_protocol::MessageKeyboard>,
+    /// The data of the button of this message that waits for its bot.
+    pressed: Option<&'a str>,
     /// The thread is in selection mode: a click selects the message.
     selecting: bool,
     /// The message is in the selection to forward.
@@ -4180,6 +4190,16 @@ fn bubble(
                 message_id: message.id.to_owned(),
             });
         }
+        if let Some(keyboard) = message.keyboard {
+            let owner = super::bot_keyboard::Owner {
+                protocol: message.protocol,
+                conversation_id: message.conversation_id,
+                message_id: message.id,
+                pressed: message.pressed,
+                selecting: message.selecting,
+            };
+            super::bot_keyboard::inline(ui, keyboard, frame.rect.width(), max_width, &owner, out);
+        }
         super::message_menu::reactions(ui, &target, message.actions, out);
         if message.selecting && message.forwardable {
             select_on_click(ui, &frame, message, out);
@@ -4654,6 +4674,7 @@ fn compose(
         .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::M as i8))
         .show(ui, |ui| {
             super::typing::line(ui, snapshot);
+            super::bot_keyboard::bar(ui, snapshot, out);
             super::forward::selection_bar(ui, snapshot, out);
             super::message_menu::reply_bar(ui, snapshot, out);
             if let Some(thread) = chat.as_ref() {

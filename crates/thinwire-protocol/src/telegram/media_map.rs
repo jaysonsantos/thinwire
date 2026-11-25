@@ -312,6 +312,82 @@ pub(super) fn reply_of(message: &tdlib_rs::types::Message) -> Option<String> {
     }
 }
 
+/// The inline keyboard of a message: the buttons under it. `None` for no
+/// markup, a reply keyboard, or a keyboard with no button.
+pub(super) fn inline_keyboard(
+    markup: Option<&tdlib_rs::enums::ReplyMarkup>,
+) -> Option<crate::MessageKeyboard> {
+    let tdlib_rs::enums::ReplyMarkup::InlineKeyboard(inline) = markup? else {
+        return None;
+    };
+    let rows = inline
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|button| crate::KeyboardButton {
+                    text: button.text.clone(),
+                    action: inline_action(&button.r#type),
+                })
+                .collect()
+        })
+        .collect();
+    Some(crate::MessageKeyboard { rows }).filter(|keyboard| !keyboard.is_empty())
+}
+
+/// What the app does for one inline button. A URL that the link rules do
+/// not allow, and every kind that needs a Telegram client (a web app, a
+/// login, a payment, a game, an inline query, a password), is off.
+fn inline_action(kind: &tdlib_rs::enums::InlineKeyboardButtonType) -> crate::ButtonAction {
+    use tdlib_rs::enums::InlineKeyboardButtonType as Kind;
+    match kind {
+        Kind::Callback(callback) => crate::ButtonAction::Callback {
+            data: callback.data.clone(),
+        },
+        Kind::Url(url) => crate::openable_url(&url.url)
+            .map_or(crate::ButtonAction::Unsupported, |url| {
+                crate::ButtonAction::Url { url }
+            }),
+        Kind::CopyText(copy) => crate::ButtonAction::CopyText {
+            text: copy.text.clone(),
+        },
+        _ => crate::ButtonAction::Unsupported,
+    }
+}
+
+/// The reply keyboard of a message: the buttons over the compose field.
+/// A text button sends its label. A button that asks for a phone number,
+/// a place, a poll, a user, a chat, or a web app is off.
+pub(super) fn reply_keyboard(
+    message_id: String,
+    markup: Option<&tdlib_rs::enums::ReplyMarkup>,
+) -> Option<crate::ReplyKeyboard> {
+    let tdlib_rs::enums::ReplyMarkup::ShowKeyboard(show) = markup? else {
+        return None;
+    };
+    let rows = show
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|button| crate::KeyboardButton {
+                    text: button.text.clone(),
+                    action: match button.r#type {
+                        tdlib_rs::enums::KeyboardButtonType::Text => crate::ButtonAction::SendText,
+                        _ => crate::ButtonAction::Unsupported,
+                    },
+                })
+                .collect()
+        })
+        .collect();
+    let keyboard = crate::MessageKeyboard { rows };
+    (!keyboard.is_empty()).then_some(crate::ReplyKeyboard {
+        message_id,
+        keyboard,
+        one_time: show.one_time,
+    })
+}
+
 /// The parts of a video, an animation, or a video note.
 struct Clip<'a> {
     label: &'static str,
@@ -565,7 +641,149 @@ fn local_path(file: &tdlib_rs::types::File, secret: bool) -> Option<ImagePath> {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_content, thumbnail_bytes};
+    use super::{inline_keyboard, map_content, reply_keyboard, thumbnail_bytes};
+
+    fn inline_button(
+        text: &str,
+        kind: tdlib_rs::enums::InlineKeyboardButtonType,
+    ) -> tdlib_rs::types::InlineKeyboardButton {
+        tdlib_rs::types::InlineKeyboardButton {
+            text: text.into(),
+            icon_custom_emoji_id: 0,
+            style: tdlib_rs::enums::ButtonStyle::Default,
+            r#type: kind,
+        }
+    }
+
+    /// Each kind of inline button maps to what the app can do. A URL that
+    /// the link rules refuse, and a web app, are off.
+    #[test]
+    fn inline_buttons_map_to_their_actions() {
+        use crate::ButtonAction;
+        use tdlib_rs::enums::InlineKeyboardButtonType as Kind;
+        let markup = tdlib_rs::enums::ReplyMarkup::InlineKeyboard(
+            tdlib_rs::types::ReplyMarkupInlineKeyboard {
+                rows: vec![
+                    vec![
+                        inline_button(
+                            "German",
+                            Kind::Callback(tdlib_rs::types::InlineKeyboardButtonTypeCallback {
+                                data: "ZGU=".into(),
+                            }),
+                        ),
+                        inline_button(
+                            "Site",
+                            Kind::Url(tdlib_rs::types::InlineKeyboardButtonTypeUrl {
+                                url: "https://example.com".into(),
+                            }),
+                        ),
+                    ],
+                    vec![
+                        inline_button(
+                            "Bad",
+                            Kind::Url(tdlib_rs::types::InlineKeyboardButtonTypeUrl {
+                                url: "javascript:alert(1)".into(),
+                            }),
+                        ),
+                        inline_button(
+                            "Copy",
+                            Kind::CopyText(tdlib_rs::types::InlineKeyboardButtonTypeCopyText {
+                                text: "code 42".into(),
+                            }),
+                        ),
+                        inline_button(
+                            "App",
+                            Kind::WebApp(tdlib_rs::types::InlineKeyboardButtonTypeWebApp {
+                                url: "https://example.com/app".into(),
+                            }),
+                        ),
+                    ],
+                ],
+            },
+        );
+        let keyboard = inline_keyboard(Some(&markup)).expect("a keyboard");
+        let actions: Vec<Vec<ButtonAction>> = keyboard
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|button| button.action.clone()).collect())
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                vec![
+                    ButtonAction::Callback {
+                        data: "ZGU=".into()
+                    },
+                    ButtonAction::Url {
+                        url: "https://example.com".into()
+                    },
+                ],
+                vec![
+                    ButtonAction::Unsupported,
+                    ButtonAction::CopyText {
+                        text: "code 42".into()
+                    },
+                    ButtonAction::Unsupported,
+                ],
+            ]
+        );
+        assert_eq!(keyboard.rows[0][0].text, "German");
+        assert_eq!(inline_keyboard(None), None);
+        let empty = tdlib_rs::enums::ReplyMarkup::InlineKeyboard(
+            tdlib_rs::types::ReplyMarkupInlineKeyboard { rows: vec![vec![]] },
+        );
+        assert_eq!(inline_keyboard(Some(&empty)), None);
+    }
+
+    /// A reply keyboard sends the label of a text button. A button that
+    /// asks for a phone number is off. An inline keyboard is no reply
+    /// keyboard.
+    #[test]
+    fn a_reply_keyboard_sends_text_buttons_only() {
+        let button = |text: &str, kind| tdlib_rs::types::KeyboardButton {
+            text: text.into(),
+            icon_custom_emoji_id: 0,
+            style: tdlib_rs::enums::ButtonStyle::Default,
+            r#type: kind,
+        };
+        let markup =
+            tdlib_rs::enums::ReplyMarkup::ShowKeyboard(tdlib_rs::types::ReplyMarkupShowKeyboard {
+                rows: vec![vec![
+                    button("Yes", tdlib_rs::enums::KeyboardButtonType::Text),
+                    button(
+                        "Phone",
+                        tdlib_rs::enums::KeyboardButtonType::RequestPhoneNumber,
+                    ),
+                ]],
+                is_persistent: false,
+                resize_keyboard: true,
+                one_time: true,
+                is_personal: false,
+                input_field_placeholder: String::new(),
+            });
+        let reply = reply_keyboard("telegram:1:9".into(), Some(&markup)).expect("a keyboard");
+        assert!(reply.one_time);
+        assert_eq!(reply.message_id, "telegram:1:9");
+        assert_eq!(
+            reply.keyboard.rows[0]
+                .iter()
+                .map(|button| button.action.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::ButtonAction::SendText,
+                crate::ButtonAction::Unsupported
+            ]
+        );
+        let inline = tdlib_rs::enums::ReplyMarkup::InlineKeyboard(
+            tdlib_rs::types::ReplyMarkupInlineKeyboard {
+                rows: vec![vec![inline_button(
+                    "x",
+                    tdlib_rs::enums::InlineKeyboardButtonType::Buy,
+                )]],
+            },
+        );
+        assert_eq!(reply_keyboard("telegram:1:9".into(), Some(&inline)), None);
+    }
 
     #[test]
     fn a_minithumbnail_is_base64_jpeg_bytes() {

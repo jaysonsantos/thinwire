@@ -290,6 +290,7 @@ pub(crate) fn chat_message(
             .reply_to
             .map(|id| format!("{CONVERSATION_PREFIX}{id}")),
         edited: message.edited,
+        keyboard: None,
     }
 }
 

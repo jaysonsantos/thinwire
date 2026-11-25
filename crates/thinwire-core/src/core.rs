@@ -1134,6 +1134,22 @@ impl Core {
                 protocol,
                 conversation_id,
             } => self.state.mark_chat_read(protocol, &conversation_id),
+            Intent::PressButton {
+                protocol,
+                conversation_id,
+                message_id,
+                data,
+            } => self
+                .state
+                .press_button(protocol, &conversation_id, &message_id, data),
+            Intent::SendKeyboardText {
+                protocol,
+                conversation_id,
+                text,
+            } => self
+                .state
+                .send_keyboard_text(protocol, &conversation_id, &text),
+            Intent::CloseButtonNotice => self.state.close_button_notice(),
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
             Intent::RetryStoreKey(protocol) => self.state.retry_store_key(protocol),
             Intent::ShowNotice(protocol) => self.state.open_notice_review(protocol),
@@ -1278,6 +1294,13 @@ impl Core {
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn take_focus_compose(&mut self) -> bool {
         self.state.take_focus_compose()
+    }
+
+    /// An address that a bot answer asks the frontend to open, once.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
+    pub fn take_open_url(&mut self) -> Option<String> {
+        self.state.take_open_url()
     }
 
     /// The selected row moved; scroll it into view, once.
@@ -3407,6 +3430,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         });
         assert!(
             matches!(&core.take_notify()[..], [NotifyCommand::Show(note)] if note.title == "Bob"),
@@ -3449,6 +3473,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         core.notify_message(&live);
         assert!(
@@ -3506,6 +3531,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         // Chat 1 is open and the window has focus: nothing.
         core.notify_message(&live(1, "seen"));
@@ -3598,6 +3624,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         core.notify_message(&live(1, 3, "secret"));
         assert!(
@@ -3685,6 +3712,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -3803,6 +3831,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -3955,6 +3984,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         let general = |muted: bool| ChatTopic {
             protocol: ProtocolId::Telegram,
@@ -4244,6 +4274,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
@@ -4573,6 +4604,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         core.notify_message(&live(2));
         assert_eq!(core.take_notify().len(), 1);
@@ -4644,6 +4676,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         });
         assert_eq!(
             core.take_notify().len(),
@@ -5501,6 +5534,7 @@ mod tests {
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
+                keyboard: None,
             },
         };
         events_tx.send(row(Delivery::Pending)).expect("queue");

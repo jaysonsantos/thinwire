@@ -3779,6 +3779,7 @@ fn row_and_message(
         reactions: Vec::new(),
         reply_to: quote_of(content),
         edited: false,
+        keyboard: None,
     };
     if let Some(media) = media
         && !view_once
@@ -3896,6 +3897,7 @@ async fn send_text(
             reactions: Vec::new(),
             reply_to: outbound.reply_to.clone(),
             edited: false,
+            keyboard: None,
         },
     );
     // A media row keeps no files, so it cannot be sent again.

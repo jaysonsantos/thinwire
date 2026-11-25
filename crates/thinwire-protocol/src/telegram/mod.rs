@@ -629,6 +629,19 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
             } => self.dispatch_live(events, LiveCall::MarkRead { conversation_id }),
+            AdapterCommand::PressButton {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                message_id,
+                data,
+            } => self.dispatch_live(
+                events,
+                LiveCall::PressButton {
+                    conversation_id,
+                    message_id,
+                    data,
+                },
+            ),
             AdapterCommand::SearchMessages {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -756,6 +769,11 @@ enum LiveCall {
     },
     MarkRead {
         conversation_id: String,
+    },
+    PressButton {
+        conversation_id: String,
+        message_id: String,
+        data: String,
     },
     SearchMessages {
         conversation_id: Option<String>,
@@ -1001,6 +1019,22 @@ impl TelegramAdapter {
                 LiveCall::MarkRead { conversation_id } => {
                     self.tdlib.enqueue_message_action(
                         tdlib::TdlibCommand::MarkRead { conversation_id },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::PressButton {
+                    conversation_id,
+                    message_id,
+                    data,
+                } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::PressButton {
+                            conversation_id,
+                            message_id,
+                            data,
+                        },
                         secrets,
                         source,
                         events,

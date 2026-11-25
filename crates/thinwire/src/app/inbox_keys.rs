@@ -228,6 +228,22 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 protocol,
                 conversation_id,
             } => state.snapshot.mark_chat_read(protocol, &conversation_id),
+            Intent::PressButton {
+                protocol,
+                conversation_id,
+                message_id,
+                data,
+            } => state
+                .snapshot
+                .press_button(protocol, &conversation_id, &message_id, data),
+            Intent::SendKeyboardText {
+                protocol,
+                conversation_id,
+                text,
+            } => state
+                .snapshot
+                .send_keyboard_text(protocol, &conversation_id, &text),
+            Intent::CloseButtonNotice => state.snapshot.close_button_notice(),
             Intent::SetChatMute {
                 protocol,
                 conversation_id,
@@ -1220,6 +1236,7 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         reactions: Vec::new(),
         reply_to: None,
         edited: false,
+        keyboard: None,
     }
 }
 
@@ -3228,4 +3245,157 @@ fn a_search_text_lists_the_found_messages_and_a_click_opens_the_chat() {
         .sync_message_search(std::time::Instant::now());
     harness.run();
     assert!(harness.query_by_label("Messages").is_none());
+}
+
+fn keyboard_button(
+    text: &str,
+    action: thinwire_protocol::ButtonAction,
+) -> thinwire_protocol::KeyboardButton {
+    thinwire_protocol::KeyboardButton {
+        text: text.into(),
+        action,
+    }
+}
+
+/// A bot message with buttons: a callback button sends its data, the
+/// answer of the bot shows over the compose field, and a double click on a
+/// button does not start a reply.
+#[test]
+fn a_bot_button_under_a_message_asks_the_bot_and_shows_its_answer() {
+    use thinwire_protocol::ButtonAction;
+    let mut state = InboxUi::ready();
+    let mut message = chat_message("telegram:1:9", "Which language?", 1_790_300_000);
+    message.keyboard = Some(thinwire_protocol::MessageKeyboard {
+        rows: vec![
+            vec![
+                keyboard_button(
+                    "German",
+                    ButtonAction::Callback {
+                        data: "lang:de".into(),
+                    },
+                ),
+                keyboard_button(
+                    "English",
+                    ButtonAction::Callback {
+                        data: "lang:en".into(),
+                    },
+                ),
+            ],
+            vec![keyboard_button("Pay", ButtonAction::Unsupported)],
+        ],
+    });
+    state
+        .snapshot
+        .apply(AdapterEvent::MessageReceived { message });
+    state.snapshot.take_commands();
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .ctx
+        .options_mut(|options| options.input_options.max_double_click_delay = 10.0);
+    let german = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "German")
+        .rect();
+    pointer_click(&mut harness, german.center(), egui::PointerButton::Primary);
+    // The pressed button shows a spinner, which repaints each frame.
+    harness.run_steps(2);
+    let press = thinwire_protocol::AdapterCommand::PressButton {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+        message_id: "telegram:1:9".into(),
+        data: "lang:de".into(),
+    };
+    assert_eq!(harness.state_mut().snapshot.take_commands(), vec![press]);
+    assert_eq!(
+        harness.state().snapshot.pressed_button(),
+        Some(("telegram:1:9", "lang:de"))
+    );
+    // A second click on the same spot makes no double click on the line.
+    pointer_click(&mut harness, german.center(), egui::PointerButton::Primary);
+    harness.run_steps(2);
+    assert!(harness.state().snapshot.reply_target().is_none());
+    // A button that the app cannot do is off.
+    assert!(
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Pay")
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::ButtonAnswer {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:9".into(),
+            text: "Now in German".into(),
+            alert: false,
+            url: None,
+        });
+    harness.run();
+    assert_eq!(harness.state().snapshot.pressed_button(), None);
+    harness.get_by_label("Now in German");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Close")
+        .click();
+    harness.run();
+    assert!(harness.query_by_label("Now in German").is_none());
+    // The bot takes the buttons away.
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::MessageKeyboard {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:9".into(),
+            keyboard: None,
+        });
+    harness.run();
+    assert!(harness.query_by_label("German").is_none());
+}
+
+/// The reply keyboard of a bot shows over the compose field. A press sends
+/// the label, the draft stays, and a keyboard for one use goes away.
+#[test]
+fn a_reply_keyboard_sends_the_label_of_its_button() {
+    use thinwire_protocol::ButtonAction;
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::ChatKeyboard {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+        keyboard: Some(thinwire_protocol::ReplyKeyboard {
+            message_id: "telegram:1:9".into(),
+            keyboard: thinwire_protocol::MessageKeyboard {
+                rows: vec![vec![
+                    keyboard_button("Yes please", ButtonAction::SendText),
+                    keyboard_button("Share phone", ButtonAction::Unsupported),
+                ]],
+            },
+            one_time: true,
+        }),
+    });
+    state
+        .snapshot
+        .set_draft(ProtocolId::Telegram, "telegram:1", None, "my draft".into());
+    state.snapshot.take_commands();
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Yes please")
+        .click();
+    // The send in flight shows a spinner, which repaints each frame.
+    harness.run_steps(2);
+    let sent: Vec<String> = harness
+        .state_mut()
+        .snapshot
+        .take_commands()
+        .into_iter()
+        .filter_map(|command| match command {
+            thinwire_protocol::AdapterCommand::SendText { body, .. } => Some(body),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, ["Yes please"]);
+    assert_eq!(harness.state().snapshot.pane.compose, "my draft");
+    assert!(harness.query_by_label("Yes please").is_none(), "one use");
 }

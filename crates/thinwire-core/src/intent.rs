@@ -172,6 +172,22 @@ pub enum Intent {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// Press a callback button that a bot put under a message of the open
+    /// thread. `data` is the data of that button.
+    PressButton {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        data: String,
+    },
+    /// Send the label of a button of the reply keyboard of the open chat.
+    SendKeyboardText {
+        protocol: ProtocolId,
+        conversation_id: String,
+        text: String,
+    },
+    /// Close the answer of a bot to a press.
+    CloseButtonNotice,
     /// Start the helper process of this protocol again (ADR 0013). It acts
     /// only while the account row shows "Helper stopped."
     RestartHelper(ProtocolId),

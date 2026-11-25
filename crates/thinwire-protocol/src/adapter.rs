@@ -814,6 +814,16 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// Press a callback button of a bot keyboard under a message. `data` is
+    /// the data of that button, so a keyboard that changed in the meantime
+    /// cannot make the press hit another button. The adapter answers with
+    /// one `ButtonAnswer`, also when the bot does not answer.
+    PressButton {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        data: String,
+    },
     /// Photos download by themselves also for a chat that is not open
     /// (`on`), or only for the open chat. The core sends it to a helper
     /// account when the value changes and when the account links. The app
@@ -867,6 +877,7 @@ impl AdapterCommand {
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
             | Self::MarkRead { protocol, .. }
+            | Self::PressButton { protocol, .. }
             | Self::SetAutoDownload { protocol, .. }
             | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => protocol,
@@ -942,6 +953,7 @@ impl AdapterCommand {
             | Self::SetTyping { protocol, .. }
             | Self::LoadMembers { protocol, .. }
             | Self::MarkRead { protocol, .. }
+            | Self::PressButton { protocol, .. }
             | Self::SetAutoDownload { protocol, .. }
             | Self::SearchMessages { protocol, .. }
             | Self::React { protocol, .. } => {
@@ -1091,6 +1103,32 @@ pub enum AdapterEvent {
         audio: Option<crate::media::MessageAudio>,
         video: Option<crate::media::MessageVideo>,
         file: Option<crate::media::MessageFile>,
+    },
+    /// The bot changed the buttons under a message, or removed them
+    /// (`None`).
+    MessageKeyboard {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        keyboard: Option<crate::keyboard::MessageKeyboard>,
+    },
+    /// The answer of a bot to `PressButton`. `text` is empty when the bot
+    /// gave no text or did not answer. `alert`: the bot asks for a box that
+    /// the user closes. `url`: the bot asks the app to open it.
+    ButtonAnswer {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        text: String,
+        alert: bool,
+        url: Option<String>,
+    },
+    /// The keyboard that the bot shows over the compose field of a chat
+    /// (`None`: no keyboard).
+    ChatKeyboard {
+        protocol: ProtocolId,
+        conversation_id: String,
+        keyboard: Option<crate::keyboard::ReplyKeyboard>,
     },
     /// Links found after the message was shown. Does not change the body.
     MessageLinks {
@@ -1355,6 +1393,9 @@ impl AdapterEvent {
             | Self::MessageEdited { protocol, .. }
             | Self::MessageMedia { protocol, .. }
             | Self::MessageLinks { protocol, .. }
+            | Self::MessageKeyboard { protocol, .. }
+            | Self::ButtonAnswer { protocol, .. }
+            | Self::ChatKeyboard { protocol, .. }
             | Self::PhotoReady { protocol, .. }
             | Self::PhotoFailed { protocol, .. }
             | Self::VoiceReady { protocol, .. }
@@ -1440,6 +1481,9 @@ impl AdapterEvent {
             | Self::MessageEdited { protocol, .. }
             | Self::MessageMedia { protocol, .. }
             | Self::MessageLinks { protocol, .. }
+            | Self::MessageKeyboard { protocol, .. }
+            | Self::ButtonAnswer { protocol, .. }
+            | Self::ChatKeyboard { protocol, .. }
             | Self::PhotoReady { protocol, .. }
             | Self::PhotoFailed { protocol, .. }
             | Self::VoiceReady { protocol, .. }
@@ -1895,6 +1939,8 @@ pub struct ChatMessage {
     pub reply_to: Option<String>,
     /// The sender changed the text after the send.
     pub edited: bool,
+    /// The buttons that a bot put under the message.
+    pub keyboard: Option<crate::keyboard::MessageKeyboard>,
 }
 
 /// How a message reached the app.
@@ -2112,6 +2158,22 @@ pub(crate) fn emit_message_links(
         conversation_id: conversation_id.into(),
         message_id: message_id.into(),
         links,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_keyboard(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_id: impl Into<String>,
+    keyboard: Option<crate::keyboard::MessageKeyboard>,
+) {
+    let _ = events.send(AdapterEvent::MessageKeyboard {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_id: message_id.into(),
+        keyboard,
     });
 }
 
@@ -2474,6 +2536,7 @@ mod account_tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         let AdapterEvent::MessageReplaced {
             protocol, message, ..

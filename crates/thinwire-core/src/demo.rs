@@ -821,6 +821,7 @@ fn message(chat: &str, index: usize, sender: &str, body: &str, sent_at: i64) -> 
         reactions: Vec::new(),
         reply_to: None,
         edited: false,
+        keyboard: None,
     }
 }
 

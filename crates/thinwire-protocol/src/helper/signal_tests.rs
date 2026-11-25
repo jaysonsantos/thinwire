@@ -262,6 +262,7 @@ impl ProtocolAdapter for FakeClient {
                         reactions: Vec::new(),
                         reply_to: None,
                         edited: false,
+                        keyboard: None,
                     },
                 );
                 emit_send_accepted(events, protocol, conversation_id, request);

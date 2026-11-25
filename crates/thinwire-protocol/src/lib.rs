@@ -9,6 +9,7 @@ mod discord;
 mod fake;
 pub mod helper;
 mod host;
+pub mod keyboard;
 mod log_id;
 mod media;
 #[cfg(any(test, feature = "photo-resize"))]
@@ -44,6 +45,7 @@ pub use discord::{
 pub use fake::FakeAdapter;
 pub use helper::{HelperAdapter, HelperLauncher, HelperSpec, ProcessLauncher};
 pub use host::{AccountAdapter, AccountFactory, AdapterHost, HostSender};
+pub use keyboard::{ButtonAction, KeyboardButton, MessageKeyboard, ReplyKeyboard};
 pub use log_id::LogChatId;
 pub use media::{
     AudioPath, ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, LinkTarget,

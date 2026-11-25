@@ -114,6 +114,7 @@ impl ProtocolAdapter for FakeAdapter {
                         reactions: Vec::new(),
                         reply_to: None,
                         edited: false,
+                        keyboard: None,
                     },
                 );
                 Ok(())

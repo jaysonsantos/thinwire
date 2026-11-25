@@ -165,6 +165,7 @@ mod tests {
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
+            keyboard: None,
         };
         let commands = [
             AdapterCommand::Connect { protocol },
