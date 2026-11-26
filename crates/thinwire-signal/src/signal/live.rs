@@ -1629,6 +1629,8 @@ async fn run_linked(
     .await;
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
     let mut unread = std::collections::HashMap::<String, u32>::new();
+    // The unread live messages of each chat, for a read on another device.
+    let mut read_book = super::read_sync::ReadBook::default();
     let (mut known, mut group_titles) =
         match publish_chats(&manager, session.as_ref(), &events, &mut rows, &unread).await {
             Ok(published) => published,
@@ -1776,6 +1778,18 @@ async fn run_linked(
                                     .await;
                                     let viewed = session.viewed();
                                     emit_reaction(&events, &session, content.as_ref());
+                                    apply_read_sync(
+                                        &events,
+                                        content.as_ref(),
+                                        &mut read_book,
+                                        &mut unread,
+                                        &mut rows,
+                                    );
+                                    let chat = live_chat_id(content.as_ref());
+                                    let before = chat
+                                        .as_deref()
+                                        .and_then(|chat| unread.get(chat).copied())
+                                        .unwrap_or(0);
                                     emit_incoming(
                                         &events,
                                         content.as_ref(),
@@ -1787,6 +1801,15 @@ async fn run_linked(
                                         &mut rows,
                                         Some(session.media()),
                                     );
+                                    if let Some(chat) = chat.as_deref() {
+                                        note_unread(
+                                            &mut read_book,
+                                            content.as_ref(),
+                                            chat,
+                                            before,
+                                            unread.get(chat).copied().unwrap_or(0),
+                                        );
+                                    }
                                     start_sender_lookup(
                                         &manager,
                                         &session,
@@ -1922,9 +1945,13 @@ async fn run_linked(
                 if let Some(id) = conversation_id.as_deref() {
                     start_photo_downloads(&manager, &session, token, &events, id);
                 }
+                if let Some(id) = conversation_id.as_deref() {
+                    read_book.clear(id);
+                }
                 clear_viewed(&events, &mut unread, &mut rows, conversation_id);
             }
             Some(WorkerJob::MarkRead(conversation_id)) => {
+                read_book.clear(&conversation_id);
                 clear_viewed(&events, &mut unread, &mut rows, Some(conversation_id));
             }
             Some(WorkerJob::React {
@@ -3480,6 +3507,76 @@ fn clear_viewed(
     }
 }
 
+/// The chat of a live message: the person, or the group.
+fn live_chat_id(content: &Content) -> Option<String> {
+    match Thread::try_from(content).ok()? {
+        Thread::Contact(id) => Some(contact_id(&id)),
+        Thread::Group(key) => Some(super::group::group_id(&key)),
+    }
+}
+
+/// Keep the read book in step with the unread count of `chat` after a live
+/// message. A message that added one to the count goes into the book. A
+/// count of 0 (an own message, or the open chat) empties the chat.
+fn note_unread(
+    book: &mut super::read_sync::ReadBook,
+    content: &Content,
+    chat: &str,
+    before: u32,
+    after: u32,
+) {
+    if after == 0 {
+        book.clear(chat);
+        return;
+    }
+    if after > before && matches!(content.body, ContentBody::DataMessage(_)) {
+        let sender = content.metadata.sender.raw_uuid().to_string();
+        let millis =
+            u64::try_from(content.metadata.client_timestamp.timestamp_millis()).unwrap_or(0);
+        book.note(chat, &sender, millis);
+    }
+}
+
+/// The sender of a read item: the ACI as text, or as 16 bytes.
+fn read_sender(read: &presage::libsignal_service::proto::sync_message::Read) -> Option<String> {
+    if let Some(text) = read.sender_aci.as_deref() {
+        return Uuid::parse_str(text).ok().map(|uuid| uuid.to_string());
+    }
+    let bytes = read.sender_aci_binary.as_deref()?;
+    Uuid::from_slice(bytes).ok().map(|uuid| uuid.to_string())
+}
+
+/// Another device of the account read messages (a read sync message). The
+/// count of each chat goes down to its messages that stay unread, and the
+/// row goes out again.
+fn apply_read_sync(
+    events: &EventTx,
+    content: &Content,
+    book: &mut super::read_sync::ReadBook,
+    unread: &mut HashMap<String, u32>,
+    rows: &mut HashMap<String, Conversation>,
+) {
+    let ContentBody::SynchronizeMessage(sync) = &content.body else {
+        return;
+    };
+    for read in &sync.read {
+        let (Some(sender), Some(millis)) = (read_sender(read), read.timestamp) else {
+            continue;
+        };
+        let Some((chat, left)) = book.read(&sender, millis) else {
+            continue;
+        };
+        let count = unread.get(&chat).copied().unwrap_or(0).min(left);
+        unread.insert(chat.clone(), count);
+        if let Some(row) = rows.get_mut(&chat)
+            && row.unread != count
+        {
+            row.unread = count;
+            emit_conversation(events, row.clone());
+        }
+    }
+}
+
 fn remember_row(rows: &mut HashMap<String, Conversation>, conversation: &Conversation) {
     rows.insert(conversation.id.clone(), conversation.clone());
 }
@@ -4619,6 +4716,98 @@ mod tests {
             job.find("refresh_chat_list(") < job.find("Some(WorkerJob::Viewed"),
             "the refresh job uses the same code"
         );
+    }
+
+    /// A read on the phone lowers the count of the chat to the messages that
+    /// stay unread. The sender comes as text or as 16 bytes.
+    #[test]
+    fn a_read_on_the_phone_lowers_the_unread_count() {
+        use presage::libsignal_service::proto::SyncMessage;
+        use presage::libsignal_service::proto::sync_message::Read;
+
+        let ada = Uuid::from_u128(0x7777);
+        let id = ada.to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut unread = HashMap::new();
+        let mut rows = HashMap::new();
+        let mut known = HashSet::new();
+        let mut book = super::super::read_sync::ReadBook::default();
+        for millis in [1_000, 2_000, 3_000] {
+            let content = envelope_at(ada, "hi", millis);
+            let chat = live_chat_id(&content).expect("chat");
+            let before = unread.get(&chat).copied().unwrap_or(0);
+            emit_incoming(
+                &tx,
+                &content,
+                &HashMap::new(),
+                &HashMap::new(),
+                &mut known,
+                &mut unread,
+                None,
+                &mut rows,
+                None,
+            );
+            let after = unread.get(&chat).copied().unwrap_or(0);
+            note_unread(&mut book, &content, &chat, before, after);
+        }
+        assert_eq!(unread.get(&id), Some(&3));
+        while rx.try_recv().is_ok() {}
+
+        let sync = |read: Read| {
+            let mut content = envelope_at(Uuid::nil(), "x", 9_000);
+            content.body = ContentBody::SynchronizeMessage(SyncMessage {
+                read: vec![read],
+                ..SyncMessage::default()
+            });
+            content
+        };
+        let count = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>| {
+            let mut counts = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let AdapterEvent::ConversationUpsert { conversation } = event {
+                    assert_eq!(conversation.id, id);
+                    counts.push(conversation.unread);
+                }
+            }
+            counts
+        };
+        apply_read_sync(
+            &tx,
+            &sync(Read {
+                sender_aci: Some(id.clone()),
+                timestamp: Some(2_000),
+                sender_aci_binary: None,
+            }),
+            &mut book,
+            &mut unread,
+            &mut rows,
+        );
+        assert_eq!(count(&mut rx), vec![1], "the newest message stays unread");
+        apply_read_sync(
+            &tx,
+            &sync(Read {
+                sender_aci: None,
+                timestamp: Some(3_000),
+                sender_aci_binary: Some(ada.as_bytes().to_vec()),
+            }),
+            &mut book,
+            &mut unread,
+            &mut rows,
+        );
+        assert_eq!(count(&mut rx), vec![0]);
+        assert_eq!(unread.get(&id), Some(&0));
+        apply_read_sync(
+            &tx,
+            &sync(Read {
+                sender_aci: Some(id.clone()),
+                timestamp: Some(3_000),
+                sender_aci_binary: None,
+            }),
+            &mut book,
+            &mut unread,
+            &mut rows,
+        );
+        assert!(count(&mut rx).is_empty(), "a second read changes nothing");
     }
 
     /// Only a storage manifest fetch asks for a new group list.

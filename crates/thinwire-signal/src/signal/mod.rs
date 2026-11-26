@@ -16,6 +16,7 @@ pub use path::{
     SessionLock, SessionLockError, clear_voice_files, lock_session, set_account, set_session_dir,
 };
 mod react;
+mod read_sync;
 mod reconnect;
 mod time;
 mod wake;
