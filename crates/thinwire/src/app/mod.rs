@@ -22,6 +22,7 @@ mod menu_bar;
 mod message_menu;
 mod message_search;
 mod motion;
+mod os_theme;
 #[cfg(any(feature = "signal-local", feature = "whatsapp-web"))]
 mod pairing_qr;
 mod photos;

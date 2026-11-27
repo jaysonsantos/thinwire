@@ -188,7 +188,7 @@ mod windows_motion {
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(super) mod linux {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, mpsc};
@@ -253,7 +253,7 @@ mod linux {
         }
     }
 
-    fn portal(connection: &Connection) -> zbus::Result<Proxy<'static>> {
+    pub(in crate::app) fn portal(connection: &Connection) -> zbus::Result<Proxy<'static>> {
         Proxy::new(connection, PORTAL_DEST, PORTAL_PATH, PORTAL_IFACE)
     }
 
@@ -283,7 +283,11 @@ mod linux {
     }
 
     /// `ReadOne` on a current portal, then the older `Read`.
-    fn read_setting(proxy: &Proxy<'_>, namespace: &str, key: &str) -> Option<OwnedValue> {
+    pub(in crate::app) fn read_setting(
+        proxy: &Proxy<'_>,
+        namespace: &str,
+        key: &str,
+    ) -> Option<OwnedValue> {
         call_value(proxy, "ReadOne", namespace, key)
             .or_else(|| call_value(proxy, "Read", namespace, key))
     }
@@ -315,7 +319,7 @@ mod linux {
         }
     }
 
-    fn portal_u32(value: &OwnedValue) -> Option<u32> {
+    pub(in crate::app) fn portal_u32(value: &OwnedValue) -> Option<u32> {
         match peel(value) {
             Value::U8(n) => Some(u32::from(*n)),
             Value::U16(n) => Some(u32::from(*n)),

@@ -26,7 +26,8 @@ use eframe::egui;
 use thinwire_core::instance::{InstanceLock, LockError, RETRY_STEP, ShowListener, ShowReply, ask};
 
 use super::{
-    SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD, motion, reduce_motion, theme,
+    SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD, motion, os_theme, reduce_motion,
+    theme,
 };
 
 /// Slack past the old process's worst-case exit. Covers the time from the
@@ -305,6 +306,8 @@ pub struct Shell {
     settings: Option<Settings>,
     /// OS reduce-motion. One watch for the whole window (#247).
     os_motion: reduce_motion::OsReduceMotion,
+    /// The light or dark choice of the Linux desktop (ADR 0005).
+    os_theme: os_theme::OsTheme,
     /// Last value applied to egui, so a change repaints at once.
     last_reduce_motion: Option<bool>,
 }
@@ -313,6 +316,7 @@ impl Shell {
     #[must_use]
     pub fn new(startup: Startup, settings: Settings, ctx: &egui::Context) -> Self {
         let os_motion = reduce_motion::OsReduceMotion::start(ctx.clone());
+        let os_theme = os_theme::OsTheme::start(ctx.clone());
         let mut last_reduce_motion = None;
         motion::follow(ctx, &mut last_reduce_motion, os_motion.reduced());
         match startup {
@@ -320,12 +324,14 @@ impl Shell {
                 stage: Stage::Running(Box::new(ThinwireApp::new(settings, ctx))),
                 settings: None,
                 os_motion,
+                os_theme,
                 last_reduce_motion,
             },
             Startup::Waiting { path, deadline } => Self {
                 stage: Stage::Waiting(Wait::spawn(path, deadline, ctx)),
                 settings: Some(settings),
                 os_motion,
+                os_theme,
                 last_reduce_motion,
             },
         }
@@ -390,6 +396,7 @@ impl eframe::App for Shell {
     /// eframe calls the hook of this wrapper only, so give it to the main
     /// app. Without it, the Edit items of the macOS menu bar do nothing.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.os_theme.fill(raw_input);
         if let Stage::Running(app) = &mut self.stage {
             app.raw_input_hook(ctx, raw_input);
         }
