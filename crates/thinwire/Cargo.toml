@@ -99,17 +99,17 @@ tracing-subscriber.workspace = true
 # QR for the Signal provisioning URI and the WhatsApp pairing payload.
 # Features `signal-local` and `whatsapp-web` only. No new crate: `qrcode`
 # is already on the Signal feature (ADR 0013 license list is unchanged).
-qrcode = { version = "0.14", optional = true, default-features = false }
+qrcode = { version = "0.15", optional = true, default-features = false }
 ed25519-dalek = "3"
 # The update check reads the release JSON of the GitHub API. thinwire-ipc
 # already links both crates, so the app gets no new crate.
 serde.workspace = true
 serde_json.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 # The update check reads the nightly release on every OS. Only macOS
 # downloads and installs an update.
 ureq = { version = "2", default-features = false, features = ["tls"] }
-quick-xml = "0.38"
+quick-xml = "0.42"
 tar = "0.4"
 flate2 = { version = "1.1.11", default-features = false, features = [
   "rust_backend",
@@ -141,7 +141,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSWorkspace",
 ] }
 # The native menu bar of the app. No GTK: macOS only.
-muda = { version = "0.21", default-features = false }
+muda = { version = "0.22", default-features = false }
 
 [dev-dependencies]
 # A zone with daylight saving time for the layout tests (#122).
